@@ -1,0 +1,249 @@
+From d9c0fa0fa94cbdaa74a7c36cdf1bd2f094edce62 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 16:32:02 +0530
+Subject: [PATCH 30/51] Exit Session relaunches the dashboard into its network
+ test
+
+createprofile's Exit Session -> Yes (90102AD8 -> 90102088) sets launch
+data (0x3FC bytes, +4 = 2, +8 = user index) and calls
+XamLoaderLaunchTitleEx(NULL, NULL, NULL, 0). The Guide now does the same.
+The 2858 dash reads it and opens Test Xbox Live Connection.
+
+Handoff: a NULL path boots the disc only with flag 0x2 (xam 818C3228:
+request type 1; the disc tile passes 0x12), otherwise it is the dashboard
+(type 8). Launch data is carried to the next Xenia in
+dashboard_launch_data.bin and read when xam starts. LoadLoaderData now
+reports whether launch_data.bin was there, so that data does not start
+Xenia's own title restart.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc     | 44 ++++++++++++++++++++++++++----
+ src/xenia/app/xenia_main.cc        |  4 +--
+ src/xenia/kernel/xam/xam_info.cc   | 25 ++++++++++++++---
+ src/xenia/kernel/xam/xam_module.cc | 22 +++++++++++++--
+ src/xenia/kernel/xam/xam_module.h  |  7 ++++-
+ 5 files changed, 86 insertions(+), 16 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 8a4109c68..631a85755 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -40,6 +40,7 @@
+ #include "xenia/kernel/xam/xam_ui.h"
+ #include "xenia/kernel/title_id_utils.h"
+ #include "xenia/kernel/xam/user_tracker.h"
++#include "xenia/kernel/xam/xam_module.h"
+ #include "xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h"
+ #include "xenia/ui/imgui_dialog.h"
+ #include "xenia/ui/imgui_drawer.h"
+@@ -854,6 +855,18 @@ void GuideOverlay::HandOff(const std::string& request) {
+     fwrite(request.data(), 1, request.size(), file);
+     fclose(file);
+   }
++  // XamLoaderSetLaunchData's data goes to the next title
++  auto xam =
++      emulator_->kernel_state()->GetKernelModule<kernel::xam::XamModule>(
++          "xam.xex");
++  const auto& launch_data = xam->loader_data().launch_data;
++  if (!launch_data.empty()) {
++    if (FILE* file = xe::filesystem::OpenFile(
++            kernel::xam::kHandoffLaunchDataFileName, "wb")) {
++      fwrite(launch_data.data(), 1, launch_data.size(), file);
++      fclose(file);
++    }
++  }
+   // Let the select sound play briefly, then leave like a title exit.
+   // Keep what was changed while running, e.g. the profile signed in on
+   // the dashboard, as closing the window normally would.
+@@ -2677,11 +2690,32 @@ void GuideOverlay::JoinXboxLive(uint64_t run) {
+                   back(e);
+                   return;
+                 }
+-                // 90102AD8: the dashboard again with launch data 2 (its
+-                // network test), which is not available here.
+-                XELOGW(
+-                    "Guide: the dashboard's connection test is not available");
+-                EndCreateProfile();
++                // 90102AD8 -> 90102088: XamLoaderSetLaunchData (0x3FC bytes:
++                // +4 = 2, +8 = the user index), then XamLoaderLaunchTitleEx
++                // (NULL, NULL, NULL, 0): the dashboard again (xam request
++                // type 8), for its network test.
++                std::vector<uint8_t> data(0x3FC, 0);
++                uint32_t user_index;
++                {
++                  std::lock_guard<std::mutex> lock(mutex_);
++                  user_index = create_user_index_;
++                }
++                xe::store_and_swap<uint32_t>(data.data() + 4, 2);
++                xe::store_and_swap<uint32_t>(data.data() + 8, user_index);
++                auto xam = emulator_->kernel_state()
++                                ->GetKernelModule<kernel::xam::XamModule>(
++                                    "xam.xex");
++                xam->loader_data().launch_data = std::move(data);
++                xam->loader_data().launch_data_present = true;
++                // The disc stays in the drive when it is the dashboard
++                // relaunching (the launcher only empties it after a game).
++                std::string request;
++                auto disc = emulator_->disc_path();
++                if (DashboardIsRunning() && !disc.empty()) {
++                  request = "|" + xe::path_to_utf8(disc);
++                }
++                XELOGI("Guide: Exit Session, the dashboard with launch data 2");
++                HandOff(request);
+               },
+               false);
+         });
+diff --git a/src/xenia/app/xenia_main.cc b/src/xenia/app/xenia_main.cc
+index 868c66a50..c8b5fa5b4 100644
+--- a/src/xenia/app/xenia_main.cc
++++ b/src/xenia/app/xenia_main.cc
+@@ -751,9 +751,7 @@ void EmulatorApp::EmulatorThread() {
+       "xam.xex");
+ 
+   if (xam) {
+-    xam->LoadLoaderData();
+-
+-    if (xam->loader_data().launch_data_present) {
++    if (xam->LoadLoaderData()) {
+       const std::filesystem::path host_path = xam->loader_data().host_path;
+       app_context().CallInUIThread([this, host_path]() {
+         return emulator_window_->RunTitle(host_path);
+diff --git a/src/xenia/kernel/xam/xam_info.cc b/src/xenia/kernel/xam/xam_info.cc
+index 70f280c22..c82e4cf1b 100644
+--- a/src/xenia/kernel/xam/xam_info.cc
++++ b/src/xenia/kernel/xam/xam_info.cc
+@@ -450,6 +450,8 @@ dword_result_t XamLoaderGetLaunchData_entry(lpvoid_t buffer_ptr,
+ 
+   uint32_t copy_size =
+       std::min(uint32_t(loader_data.launch_data.size()), uint32_t(buffer_size));
++  XELOGI("XamLoaderGetLaunchData: {} of {} bytes", copy_size,
++         loader_data.launch_data.size());
+   std::memcpy(buffer_ptr, loader_data.launch_data.data(), copy_size);
+   return X_ERROR_SUCCESS;
+ }
+@@ -460,6 +462,16 @@ DECLARE_XAM_EXPORT1(XamLoaderGetLaunchData, kNone, kSketchy);
+ // Xenia exits. Does not return.
+ [[noreturn]] static void HandOffLaunch(const std::string& launch_path) {
+   XELOGI("Launch handoff: \"{}\"", launch_path);
++  // XamLoaderSetLaunchData's data goes to the next title
++  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
++  const auto& launch_data = xam->loader_data().launch_data;
++  if (!launch_data.empty()) {
++    if (FILE* file =
++            xe::filesystem::OpenFile(kHandoffLaunchDataFileName, "wb")) {
++      fwrite(launch_data.data(), 1, launch_data.size(), file);
++      fclose(file);
++    }
++  }
+   if (FILE* file = xe::filesystem::OpenFile("dashboard_launch.txt", "wb")) {
+     fwrite(launch_path.data(), 1, launch_path.size(), file);
+     fclose(file);
+@@ -519,12 +531,17 @@ void XamLoaderLaunchTitleEx_entry(lpstring_t launch_path, lpstring_t mount_path,
+          static_cast<uint32_t>(flags));
+ 
+   if (cvars::dashboard_handoff) {
+-    // The dashboard's disc tile passes no path: boot whatever is in the drive,
+-    // telling the launcher which disc image that is ("<path>|<image>").
++    // No path (xam 818C3228): flag 0x2 boots the disc in the drive (request
++    // type 1; the dashboard's disc tile passes 0x12), otherwise the
++    // dashboard itself (type 8; e.g. createprofile's Exit Session, 90102088).
++    // The launcher is told which disc image is in the drive ("<path>|<image>")
++    // so it stays in for the dashboard too.
++    const bool disc_boot = path.empty() && (flags & 0x2);
+     std::string request =
+-        path.empty() ? std::string("\\Device\\Cdrom0\\default.xex") : path;
++        disc_boot ? std::string("\\Device\\Cdrom0\\default.xex") : path;
+     auto disc = kernel_state()->emulator()->disc_path();
+-    if (!disc.empty() && request.find("Cdrom0") != std::string::npos) {
++    if (!disc.empty() &&
++        (request.empty() || request.find("Cdrom0") != std::string::npos)) {
+       request += "|" + xe::path_to_utf8(disc);
+     }
+     HandOffLaunch(request);
+diff --git a/src/xenia/kernel/xam/xam_module.cc b/src/xenia/kernel/xam/xam_module.cc
+index 7d9cca515..7f9649483 100644
+--- a/src/xenia/kernel/xam/xam_module.cc
++++ b/src/xenia/kernel/xam/xam_module.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "xenia/kernel/xam/xam_module.h"
+ 
++#include "xenia/base/logging.h"
+ #include "xenia/base/math.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/xam/xam_private.h"
+@@ -26,6 +27,21 @@ XamModule::XamModule(Emulator* emulator, KernelState* kernel_state)
+   Register##n##Exports(export_resolver_, kernel_state_);
+ #include "xam_module_export_groups.inc"
+ #undef XE_MODULE_EXPORT_GROUP
++
++  // The launch data the previous title handed to this one (dashboard_handoff).
++  if (FILE* file =
++          xe::filesystem::OpenFile(kHandoffLaunchDataFileName, "rb")) {
++    std::vector<uint8_t> data(0x400);
++    data.resize(fread(data.data(), 1, data.size(), file));
++    fclose(file);
++    std::filesystem::remove(kHandoffLaunchDataFileName);
++    if (!data.empty()) {
++      loader_data_.launch_data_present = true;
++      loader_data_.launch_data = std::move(data);
++      XELOGI("Launch data from the previous title: {} bytes",
++             loader_data_.launch_data.size());
++    }
++  }
+ }
+ 
+ static auto& get_xam_exports() {
+@@ -62,12 +78,11 @@ void XamModule::RegisterExportTable(xe::cpu::ExportResolver* export_resolver) {
+ 
+ XamModule::~XamModule() {}
+ 
+-void XamModule::LoadLoaderData() {
++bool XamModule::LoadLoaderData() {
+   FILE* file = xe::filesystem::OpenFile(kXamModuleLoaderDataFileName, "rb");
+ 
+   if (!file) {
+-    loader_data_.launch_data_present = false;
+-    return;
++    return false;  // keeps the handoff launch data read at start
+   }
+ 
+   loader_data_.launch_data_present = true;
+@@ -98,6 +113,7 @@ void XamModule::LoadLoaderData() {
+   fclose(file);
+   // We read launch data. Let's remove it till next request.
+   std::filesystem::remove(kXamModuleLoaderDataFileName);
++  return true;
+ }
+ 
+ void XamModule::SaveLoaderData() {
+diff --git a/src/xenia/kernel/xam/xam_module.h b/src/xenia/kernel/xam/xam_module.h
+index bfc106ec8..5c0ff950a 100644
+--- a/src/xenia/kernel/xam/xam_module.h
++++ b/src/xenia/kernel/xam/xam_module.h
+@@ -22,6 +22,10 @@ namespace xam {
+ 
+ static constexpr std::string_view kXamModuleLoaderDataFileName =
+     "launch_data.bin";
++// dashboard_handoff: the launch data (XamLoaderSetLaunchData) of a title
++// launched through the launcher, read by the next Xenia at start.
++static constexpr std::string_view kHandoffLaunchDataFileName =
++    "dashboard_launch_data.bin";
+ 
+ class XamModule : public KernelModule {
+  public:
+@@ -40,7 +44,8 @@ class XamModule : public KernelModule {
+     std::vector<uint8_t> launch_data;
+   };
+ 
+-  void LoadLoaderData();
++  // true: launch_data.bin was there (Xenia's own restart of a title)
++  bool LoadLoaderData();
+   void SaveLoaderData();
+ 
+   const LoaderData& loader_data() const { return loader_data_; }
+-- 
+2.55.0.windows.3
+

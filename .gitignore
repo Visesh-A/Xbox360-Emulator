@@ -1,0 +1,41 @@
+# Whitelist: everything is ignored except the project's own files below. The
+# Microsoft system files, games, art made from them, builds' data and personal
+# profiles/saves never go into the repository (Setup-Xbox360.ps1 rebuilds them).
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/Setup-Xbox360.ps1
+!/Setup-Xbox360.cmd
+!/Start-Xbox360.ps1
+!/Start-Xbox360.cmd
+!/Start-Xbox360-2K.cmd
+
+!/Tools/
+/Tools/*
+!/Tools/Extract-Stfs.ps1
+
+!/setup/
+/setup/*
+!/setup/*.py
+!/setup/requirements.txt
+!/setup/config/
+!/setup/manifests/
+!/setup/downloads/
+/setup/downloads/*
+!/setup/downloads/README.txt
+
+!/src/
+/src/*
+!/src/re/
+/src/re/*
+!/src/re/*.py
+!/src/re/NOTES.md
+
+!/xenia-patches/
+
+!/xenia-dash/
+/xenia-dash/*
+!/xenia-dash/xenia_canary.exe
+!/xenia-dash/LICENSE
+!/xenia-dash/gamecontrollerdb.txt

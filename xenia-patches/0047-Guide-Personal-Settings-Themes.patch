@@ -1,0 +1,1018 @@
+From 6e418563d840375ab5c4f200edb9da400983b671 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 18:35:44 +0530
+Subject: [PATCH 47/51] Guide: Personal Settings > Themes
+
+hud.xex's SkinSelect / OptionsPersonalization / DashStyleSelect /
+TileSelect / ColorSelect scenes as half-width Guide pages: built-in
+themes (DashStyle file, Guide background, ThematicSkin removed,
+notification 0x8000000F), dashboard trims, Guide Background tiles and
+Custom Color sliders (10-255). The background is kept in the dashboard
+GPD (record section 6, id 0x8003, as xam 818D6058 passes it).
+
+The Guide's images for a chosen background are rendered in the
+background (guide_look_python / guide_look_script) and the Guide
+switches to them once ready; the console changes at once.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/app/guide_options.cc        | 528 +++++++++++++++++++++++++-
+ src/xenia/app/guide_overlay.cc        |  43 ++-
+ src/xenia/app/guide_overlay.h         |  48 ++-
+ src/xenia/kernel/xam/user_tracker.cc  |  33 ++
+ src/xenia/kernel/xam/user_tracker.h   |   6 +
+ src/xenia/kernel/xam/xdbf/gpd_info.cc |  22 ++
+ src/xenia/kernel/xam/xdbf/gpd_info.h  |   5 +
+ 7 files changed, 661 insertions(+), 24 deletions(-)
+
+diff --git a/src/xenia/app/guide_options.cc b/src/xenia/app/guide_options.cc
+index 5c5636e8c..411162c69 100644
+--- a/src/xenia/app/guide_options.cc
++++ b/src/xenia/app/guide_options.cc
+@@ -11,14 +11,20 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <filesystem>
+ #include <fstream>
++#include <iterator>
+ #include <optional>
+ #include <sstream>
+ #include <thread>
++#include <vector>
+ 
+ #include "xenia/app/guide_overlay.h"
+ #include "xenia/base/cvar.h"
++#include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
++#include "xenia/base/platform_win.h"
++#include "xenia/base/string.h"
+ #include "xenia/config.h"
+ #include "xenia/emulator.h"
+ #include "xenia/kernel/kernel_state.h"
+@@ -32,6 +38,8 @@
+ // XCONFIG_USER_RETAIL_FLAGS: 0x10 set = notifications hidden, 0x20 set = no
+ // sound (read at start-up, 818DACE8; both on when unset).
+ DECLARE_uint32(retail_flags);
++DECLARE_string(guide_look_python);
++DECLARE_string(guide_look_script);
+ 
+ namespace xe {
+ namespace app {
+@@ -95,6 +103,16 @@ const char* GuideOverlay::OptKey(Page page) {
+       return "mus576";
+     case Page::kMusPlay:
+       return "musplay";
++    case Page::kOptSkin:
++      return "optskin";
++    case Page::kOptCust:
++      return "optcust";
++    case Page::kOptTrim:
++      return "opttrim";
++    case Page::kOptTile:
++      return "opttile";
++    case Page::kOptColor:
++      return "optcolor";
+     default:
+       return nullptr;
+   }
+@@ -127,10 +145,50 @@ void GuideOverlay::LoadOptionsLayout(const char* file) {
+       p.ctrls.push_back(c);
+     } else if (kind == "layer") {
+       std::string id, state;
+-      int x, y;
++      float x, y;
+       ls >> id >> state >> x >> y;
+       p.layers[id + "_" + state] = {x, y};
++    } else if (kind == "row") {
++      std::string list;
++      ls >> list >> p.rows >> p.visible;
++    } else if (kind == "rect") {
++      std::string name;
++      std::array<float, 4> r;
++      ls >> name >> r[0] >> r[1] >> r[2] >> r[3];
++      p.rects[name] = r;
++    } else if (kind == "text") {
++      std::string name, color;
++      MessageBoxItem item;
++      item.is_text = true;
++      ls >> name >> item.x >> item.y >> item.w >> item.h >> item.size >>
++          item.ascent >> item.line_h >> item.style >> color;
++      item.color = uint32_t(std::stoul(color, nullptr, 16));
++      p.texts[name] = item;
++    } else if (kind == "sliderpos") {
++      std::string id;
++      float y;
++      ls >> id >> y;
++      p.slider_y[id] = y;
++    }
++  }
++  if (std::string(file) == "themes.txt" && opt_pages_.count("optcolor")) {
++    // the colour sliders' bars: rendered once on sliderRed, placed under
++    // sliderGreen / sliderBlue by their value texts' offset (canvas units)
++    OptPage& p = opt_pages_["optcolor"];
++    const auto red = p.texts.find("val_sliderRed");
++    std::map<std::string, std::array<float, 2>> extra;
++    for (const char* s : {"sliderGreen", "sliderBlue"}) {
++      auto t = p.texts.find(std::string("val_") + s);
++      if (red == p.texts.end() || t == p.texts.end()) continue;
++      const float dy = (t->second.y - red->second.y) * layout_.scale;
++      for (const auto& [name, origin] : p.layers) {
++        if (name.rfind("bar_", 0) != 0) continue;
++        const std::string copy = std::string("bar") + s + name.substr(3);
++        extra[copy] = {origin[0], origin[1] + dy};
++        p.layer_file[copy] = name;
++      }
+     }
++    p.layers.insert(extra.begin(), extra.end());
+   }
+   if (std::string(file) != "options.txt") return;
+   opt_ready_ = true;
+@@ -152,18 +210,27 @@ void GuideOverlay::PrepareOptionsLayers(float ppu, float f) {
+   const double rx = double(full_w) / out_w, ry = double(full_h) / out_h;
+   std::map<std::string, OptLayer> layers;
+   for (const auto& [key, page] : opt_pages_) {
++    std::map<std::string, Pixels> crops;
+     for (const auto& [name, origin] : page.layers) {
+-      Pixels crop;
+-      if (!Decode(key + "_" + name, crop)) continue;
++      auto file = page.layer_file.find(name);
++      const std::string src = file != page.layer_file.end() ? file->second : name;
++      if (!crops.count(src)) {
++        Pixels decoded;
++        if (!Decode(key + "_" + src, decoded)) continue;
++        crops[src] = std::move(decoded);
++      }
++      const Pixels& crop = crops[src];
+       OptLayer layer;
+       if (f >= 1.0f) {
+-        layer.pixels = std::move(crop);
+-        layer.x = origin[0];
+-        layer.y = origin[1];
++        layer.pixels = crop;
++        layer.x = int(std::lround(origin[0]));
++        layer.y = int(std::lround(origin[1]));
+         layers[key + "_" + name] = std::move(layer);
+         continue;
+       }
+-      const int x0 = origin[0], y0 = origin[1];
++      // the crop's top left in the full image's pixels (fractional for a
++      // layer placed by an offset)
++      const double x0 = origin[0], y0 = origin[1];
+       const int ox0 = int(std::floor(x0 / rx));
+       const int oy0 = int(std::floor(y0 / ry));
+       const int ox1 = std::min(out_w, int(std::ceil((x0 + crop.width) / rx)));
+@@ -177,15 +244,16 @@ void GuideOverlay::PrepareOptionsLayers(float ppu, float f) {
+         for (int ox = ox0; ox < ox1; ++ox) {
+           const double sx0 = ox * rx, sx1 = std::min(double(full_w), sx0 + rx);
+           double sum[4] = {};
+-          for (int sy = int(sy0); sy < sy1; ++sy) {
+-            const int cy = sy - y0;
+-            if (cy < 0 || cy >= crop.height) continue;
+-            const double wy = std::min(sy1, sy + 1.0) - std::max(sy0, double(sy));
+-            for (int sx = int(sx0); sx < sx1; ++sx) {
+-              const int cx = sx - x0;
+-              if (cx < 0 || cx >= crop.width) continue;
++          // the crop's pixels overlapping this output pixel's span
++          for (int cy = std::max(0, int(std::floor(sy0 - y0)));
++               cy < crop.height && y0 + cy < sy1; ++cy) {
++            const double wy = std::min(sy1, y0 + cy + 1.0) - std::max(sy0, y0 + cy);
++            if (wy <= 0) continue;
++            for (int cx = std::max(0, int(std::floor(sx0 - x0)));
++                 cx < crop.width && x0 + cx < sx1; ++cx) {
+               const double w =
+-                  wy * (std::min(sx1, sx + 1.0) - std::max(sx0, double(sx)));
++                  wy * (std::min(sx1, x0 + cx + 1.0) - std::max(sx0, x0 + cx));
++              if (w <= 0) continue;
+               const uint8_t* c = &crop.rgba[(size_t(cy) * crop.width + cx) * 4];
+               const double a = c[3] / 255.0 * w;
+               sum[0] += c[0] / 255.0 * a;
+@@ -251,6 +319,8 @@ bool GuideOverlay::ComposeOptionsPage(Page page, float ppu, Pixels& out) {
+             volume = opt_volume_;
+   std::map<std::string, bool> enabled;
+   for (const auto& c : opt_pages_[key].ctrls) enabled[c.id] = OptEnabled(c.id);
++  const ThemeList list = th_list_[key];
++  const int color[3] = {th_color_[0], th_color_[1], th_color_[2]};
+   lock.unlock();
+   const bool show = !(cvars::retail_flags & 0x10),
+              sound = !(cvars::retail_flags & 0x20);
+@@ -300,6 +370,66 @@ bool GuideOverlay::ComposeOptionsPage(Page page, float ppu, Pixels& out) {
+       }
+     }
+   }
++  auto draw = [&](const std::string& name) {
++    auto it = opt_layers_.find(std::string(key) + "_" + name);
++    if (it == opt_layers_.end()) return;
++    const OptLayer& layer = it->second;
++    for (int y = 0; y < layer.pixels.height; ++y) {
++      const int oy = layer.y + y;
++      if (oy < 0 || oy >= out.height) continue;
++      for (int x = 0; x < layer.pixels.width; ++x) {
++        const int ox = layer.x + x;
++        if (ox < 0 || ox >= out.width) continue;
++        Blend(&out.rgba[(size_t(oy) * out.width + ox) * 4],
++              &layer.pixels.rgba[(size_t(y) * layer.pixels.width + x) * 4]);
++      }
++    }
++  };
++  const OptPage& p = opt_pages_[key];
++  if (p.rows > 0) {
++    // a list's rows in their slots, the focused one in Focus; its scroll
++    // ends while rows are above / below
++    for (int r = list.top; r < p.rows && r < list.top + p.visible; ++r) {
++      draw(fmt::format("row{}s{}_{}", r, r - list.top, r == list.sel ? "f" : "n"));
++    }
++    if (list.top > 0) draw("control_ScrollUp_n");
++    if (list.top + p.visible < p.rows) draw("control_ScrollDown_n");
++    if (page == Page::kOptTile && list.sel >= 1) {
++      draw(fmt::format("preview{}_n", list.sel));  // TileList 9144DD38
++    }
++  }
++  if (page == Page::kOptColor) {
++    // ColorSelect: each slider's look, its bar at the value's frame (xam's
++    // XuiSlider: Normal 0-100 / Focus 101-201 in proportion to the value in
++    // 10-255) and the value as text; the preview filled with the colour
++    static const char* const kSliders[] = {"sliderRed", "sliderGreen",
++                                           "sliderBlue"};
++    for (int i = 0; i < 3; ++i) {
++      const bool f = focus == kSliders[i];
++      draw(std::string(kSliders[i]) + (f ? "_f" : "_n"));
++      const int frame = (color[i] - 10) * 100 / 245;
++      draw(fmt::format("bar{}_{}{}", i == 0 ? "" : kSliders[i], f ? "f" : "n",
++                       frame));
++      auto t = p.texts.find(std::string("val_") + kSliders[i]);
++      if (t != p.texts.end()) {
++        RenderText(out, t->second, xe::to_utf16(std::to_string(color[i])), ppu);
++      }
++    }
++    auto r = p.rects.find("cpreview");
++    if (r != p.rects.end()) {
++      const int x0 = int(std::lround(r->second[0] * ppu));
++      const int y0 = int(std::lround(r->second[1] * ppu));
++      const int x1 = int(std::lround((r->second[0] + r->second[2]) * ppu));
++      const int y1 = int(std::lround((r->second[1] + r->second[3]) * ppu));
++      const uint8_t c[4] = {uint8_t(color[0]), uint8_t(color[1]),
++                            uint8_t(color[2]), 255};
++      for (int y = std::max(0, y0); y < std::min(out.height, y1); ++y) {
++        for (int x = std::max(0, x0); x < std::min(out.width, x1); ++x) {
++          Blend(&out.rgba[(size_t(y) * out.width + x) * 4], c);
++        }
++      }
++    }
++  }
+   return true;
+ }
+ 
+@@ -318,6 +448,35 @@ void GuideOverlay::OptOpen() {
+   OptGoTo(Page::kOpt);
+ }
+ 
++namespace {
++// TileList's built-in tiles, sorted by name (9144D500): name, hud resource
++constexpr std::pair<const char*, const char*> kTiles[] = {
++    {"Bubblegum", "Bubbles.png"}, {"Dew", "H2O.png"},     {"Pearl", "Pearl.png"},
++    {"Smoke", "Carbon.png"},      {"Stone", "Sahara.png"}, {"Tangerine", "Fiber.png"},
++    {"Wood", "Wood.png"}};
++// the Guide background in the dashboard's GPD (xam 818D6058 -> 818C09C0(6,
++// FFFE07D1, 0x8003, user, data, size): a tile's file bytes or a 4-byte
++// colour; none = the default). Record section 6 / id 0x8003 (larger than a
++// setting can hold).
++constexpr uint16_t kGuideBackgroundSection = 6;
++constexpr uint64_t kGuideBackgroundId = 0x8003;
++
++std::vector<uint8_t> ReadFileBytes(const std::filesystem::path& path) {
++  std::ifstream in(path, std::ios::binary);
++  return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
++                              std::istreambuf_iterator<char>());
++}
++std::wstring Wide(const std::string& s) {
++  return std::filesystem::path(xe::to_utf16(s)).wstring();
++}
++}  // namespace
++
++bool GuideOverlay::IsThemePage(Page page) {
++  return page == Page::kOptSkin || page == Page::kOptCust ||
++         page == Page::kOptTrim || page == Page::kOptTile ||
++         page == Page::kOptColor;
++}
++
+ void GuideOverlay::OptGoTo(Page page) {
+   // the outgoing scene's image fades out (trans_FadeOut) while this one
+   // waits, then fades in (trans_FadeIn)
+@@ -337,6 +496,16 @@ void GuideOverlay::OptGoTo(Page page) {
+   }
+   page_ = page;
+   opt_focus_ = OptFirstFocus(page);
++  if (IsThemePage(page)) {
++    // a list scene's init: its first row; ColorSelect's sliders at the
++    // default colour 0xFF708499 (9144E1C8)
++    th_list_[OptKey(page)] = {};
++    if (page == Page::kOptColor) {
++      th_color_[0] = 0x70;
++      th_color_[1] = 0x84;
++      th_color_[2] = 0x99;
++    }
++  }
+   opt_fading_ = true;
+   opt_fade_start_ = std::chrono::steady_clock::now();
+   ++page_version_;
+@@ -371,6 +540,10 @@ void GuideOverlay::OptNavigateBack() {
+ void GuideOverlay::OptMove(Direction direction) {
+   const char* key = OptKey(page_);
+   if (!key || opt_fading_) return;
++  if (IsThemePage(page_)) {
++    ThemesMove(direction);
++    return;
++  }
+   const OptPage& p = opt_pages_[key];
+   auto find = [&](const std::string& id) -> const OptCtrl* {
+     for (const auto& c : p.ctrls) {
+@@ -421,6 +594,11 @@ void GuideOverlay::OptActivate() {
+   if (opt_fading_) return;
+   const Page page = page_;
+   const std::string focus = opt_focus_;
++  if (IsThemePage(page)) {
++    lock.unlock();
++    ThemesActivate();
++    return;
++  }
+   if (page == Page::kOpt) {
+     static const std::pair<const char*, Page> kPress[] = {
+         {"btnOnlineStatus", Page::kOptOnl},
+@@ -453,10 +631,12 @@ void GuideOverlay::OptActivate() {
+       PlaySfx("btn_Select");
+       return;
+     }
+-    // Themes (SkinSelect.xur): not built
+-    lock.unlock();
+-    PlaySfx("btn_Select");
+-    XELOGW("Guide: Personal Settings {} is not available", focus);
++    if (focus == "btnPersonalization") {
++      // Themes: hud's SkinSelect.xur
++      OptGoTo(Page::kOptSkin);
++      lock.unlock();
++      PlaySfx("btn_Select");
++    }
+     return;
+   }
+   if (page == Page::kMus579) {
+@@ -698,5 +878,315 @@ void GuideOverlay::OptY() {
+   MusicPlayEmpty();
+ }
+ 
++// ------------------------------------------------------------------ Themes
++
++
++void GuideOverlay::ThemesMove(Direction direction) {
++  const char* key = OptKey(page_);
++  if (!key || opt_fading_) return;
++  if (page_ == Page::kOptColor) {
++    static const char* const kSliders[] = {"sliderRed", "sliderGreen",
++                                           "sliderBlue"};
++    int i = 0;
++    while (i < 3 && opt_focus_ != kSliders[i]) ++i;
++    if (i == 3) i = 0;
++    if (direction == kUp || direction == kDown) {
++      const int next = i + (direction == kDown ? 1 : -1);
++      if (next < 0 || next > 2) return;
++      opt_focus_ = kSliders[next];
++      ++page_version_;
++      PlaySfx("btn_Focus");
++      return;
++    }
++    // XuiSlider: a step toward the end, within RangeMin 10 / RangeMax 255;
++    // the preview follows (ColorSelect 9144E1C8 -> 9144D670)
++    const int value = std::clamp(th_color_[i] + (direction == kRight ? 1 : -1),
++                                 10, 255);
++    if (value == th_color_[i]) return;
++    th_color_[i] = value;
++    ++page_version_;
++    return;
++  }
++  const OptPage& p = opt_pages_[key];
++  if (p.rows <= 0 || (direction != kUp && direction != kDown)) return;
++  ThemeList& list = th_list_[key];
++  const int next = list.sel + (direction == kDown ? 1 : -1);
++  if (next < 0 || next >= p.rows) return;
++  list.sel = next;
++  if (list.sel < list.top) list.top = list.sel;
++  if (list.sel >= list.top + p.visible) list.top = list.sel - p.visible + 1;
++  ++page_version_;
++  PlaySfx("btn_Focus");
++}
++
++void GuideOverlay::ThemesActivate() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  if (opt_fading_) return;
++  const Page page = page_;
++  const int sel = th_list_[OptKey(page)].sel;
++  if (page == Page::kOptColor) {
++    // A "Apply" (9144E168 -> 9144D6D0): the colour as the Guide background
++    const uint32_t color = 0xFF000000u | (uint32_t(th_color_[0]) << 16) |
++                           (uint32_t(th_color_[1]) << 8) | uint32_t(th_color_[2]);
++    lock.unlock();
++    SetGuideBackground(1, color, "");
++    return;
++  }
++  // a row's Press (its XuiButton visual: btn_Select)
++  if (page == Page::kOptSkin) {
++    // SkinsList 9144CC40: Customize -> OptionsPersonalization.xur; the
++    // built-in themes (Xbox 360 (Default), Carbon, Glass) -> 9144C7F0
++    if (sel == 0) {
++      OptGoTo(Page::kOptCust);
++      lock.unlock();
++      PlaySfx("btn_Select");
++      return;
++    }
++    lock.unlock();
++    PlaySfx("btn_Select");
++    ApplyBuiltinTheme(sel - 1);
++    return;
++  }
++  if (page == Page::kOptCust) {
++    // CustomizeList 9144D118: table 0x914540A4 (DashStyleSelect,
++    // TileSelect; Camera Effect removed without a camera)
++    OptGoTo(sel == 0 ? Page::kOptTrim : Page::kOptTile);
++    lock.unlock();
++    PlaySfx("btn_Select");
++    return;
++  }
++  if (page == Page::kOptTrim) {
++    // StyleList 9144D090: the built-in trims -> 9144C7F0 (DashStyle only)
++    lock.unlock();
++    PlaySfx("btn_Select");
++    SetDashStyle(sel);
++    return;
++  }
++  if (page == Page::kOptTile) {
++    // TileList 9144D360: Custom Color -> ColorSelect.xur; Default -> the
++    // default background; a tile -> its image (hud resource)
++    if (sel == 0) {
++      OptGoTo(Page::kOptColor);
++      lock.unlock();
++      PlaySfx("btn_Select");
++      return;
++    }
++    lock.unlock();
++    PlaySfx("btn_Select");
++    if (sel == 1) {
++      SetGuideBackground(0, 0, "");
++    } else if (sel - 2 < int(std::size(kTiles))) {
++      SetGuideBackground(2, 0, kTiles[sel - 2].second);
++    }
++  }
++}
++
++void GuideOverlay::SetGuideBackground(int kind, uint32_t color,
++                                      const std::string& tile) {
++  auto* state = emulator_->kernel_state()->xam_state();
++  uint32_t user_index;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    user_index = opt_user_;
++  }
++  auto* user = state->GetUserProfile(user_index);
++  if (!user) return;
++  std::vector<uint8_t> data;
++  if (kind == 1) {
++    data = {uint8_t(color >> 24), uint8_t(color >> 16), uint8_t(color >> 8),
++            uint8_t(color)};
++  } else if (kind == 2) {
++    data = ReadFileBytes(asset_dir_ / tile);
++  }
++  state->user_tracker()->SetRecord(user->xuid(), kernel::kDashboardID,
++                                   kGuideBackgroundSection, kGuideBackgroundId,
++                                   data);
++  XELOGI("Guide: Guide background {}",
++         kind == 0 ? std::string("default")
++         : kind == 1 ? fmt::format("colour {:08X}", color)
++                     : tile);
++  UpdateGuideLook(user_index);
++}
++
++// 9144C7F0 with flag 2: the profile's DashStyle file (deleted for the
++// default trim), then XNotifyBroadcast(0x8000000F) for the dashboard.
++void GuideOverlay::SetDashStyle(int style) {
++  auto* state = emulator_->kernel_state()->xam_state();
++  uint32_t user_index;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    user_index = opt_user_;
++  }
++  auto* user = state->GetUserProfile(user_index);
++  if (!user) return;
++  const auto path =
++      state->profile_manager()->GetProfilePath(user->xuid()) / "DashStyle";
++  std::error_code ec;
++  if (style == 0) {
++    std::filesystem::remove(path, ec);
++  } else {
++    std::ofstream out(path, std::ios::binary);
++    const uint8_t data[4] = {0, 0, 0, uint8_t(style)};
++    out.write(reinterpret_cast<const char*>(data), 4);
++  }
++  emulator_->kernel_state()->BroadcastNotification(0x8000000F, 1u << user_index);
++  XELOGI("Guide: dashboard trim {}", style);
++}
++
++// SkinsList's built-in themes (9144CD68): 9144C7F0(index, 3) writes the trim
++// and sets the Guide background (Carbon: Carbon.png, Glass: Pearl.png, the
++// default: none), then ThematicSkin (an installed theme) is deleted.
++void GuideOverlay::ApplyBuiltinTheme(int index) {
++  SetDashStyle(index);
++  if (index == 1) {
++    SetGuideBackground(2, 0, "Carbon.png");
++  } else if (index == 2) {
++    SetGuideBackground(2, 0, "Pearl.png");
++  } else {
++    SetGuideBackground(0, 0, "");
++  }
++  auto* state = emulator_->kernel_state()->xam_state();
++  uint32_t user_index;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    user_index = opt_user_;
++  }
++  if (auto* user = state->GetUserProfile(user_index)) {
++    std::error_code ec;
++    std::filesystem::remove(
++        state->profile_manager()->GetProfilePath(user->xuid()) / "ThematicSkin",
++        ec);
++  }
++  emulator_->kernel_state()->BroadcastNotification(0x8000000F, 1u << user_index);
++}
++
++std::string GuideOverlay::LookForUser(uint32_t user_index) {
++  auto* state = emulator_->kernel_state()->xam_state();
++  auto* user = state->GetUserProfile(user_index);
++  if (!user) return "";
++  const std::vector<uint8_t> data = state->user_tracker()->GetRecord(
++      user->xuid(), kernel::kDashboardID, kGuideBackgroundSection,
++      kGuideBackgroundId);
++  if (data.empty()) return "";
++  if (data.size() == 4) {
++    const uint32_t color = (uint32_t(data[0]) << 24) |
++                           (uint32_t(data[1]) << 16) |
++                           (uint32_t(data[2]) << 8) | uint32_t(data[3]);
++    return fmt::format("color:{:08X}", color);
++  }
++  for (const auto& [name, file] : kTiles) {
++    if (ReadFileBytes(asset_dir_ / file) == data) {
++      return std::string("image:") + file;
++    }
++  }
++  return "";
++}
++
++// The Guide drawn with the user's background: its images rendered for that
++// look (render_guide_look.py, in the background, the first time; the console
++// changes it at once). Draw switches to them once rendered (SwitchGuideLook).
++void GuideOverlay::UpdateGuideLook(uint32_t user_index) {
++  const std::string look = LookForUser(user_index);
++  std::filesystem::path dir = asset_dir_;
++  if (!look.empty()) {
++    std::string folder = look;
++    std::replace(folder.begin(), folder.end(), ':', '_');
++    dir = asset_dir_.parent_path() / "guide_looks" / folder;
++  }
++  bool start = false;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (look == current_look_ && dir == look_wanted_dir_) return;
++    current_look_ = look;
++    look_wanted_dir_ = dir;
++    look_checked_ = {};
++    if (!look.empty() && !std::filesystem::exists(dir / "ready")) {
++      start = !rendering_looks_[look];
++      rendering_looks_[look] = true;
++    }
++  }
++  if (!start) return;
++  if (cvars::guide_look_python.empty() || cvars::guide_look_script.empty()) {
++    XELOGW("Guide: guide_look_python / guide_look_script not set; the Guide "
++           "look {} is not rendered",
++           look);
++    return;
++  }
++  const std::wstring cmd = L"\"" + Wide(cvars::guide_look_python) +
++                           L"\" \"" +
++                           Wide(cvars::guide_look_script) +
++                           L"\" \"" + Wide(look) + L"\" \"" +
++                           dir.wstring() + L"\"";
++  std::vector<wchar_t> line(cmd.begin(), cmd.end());
++  line.push_back(0);
++  STARTUPINFOW si = {sizeof(si)};
++  PROCESS_INFORMATION pi = {};
++  if (CreateProcessW(nullptr, line.data(), nullptr, nullptr, FALSE,
++                     CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr,
++                     nullptr, &si, &pi)) {
++    CloseHandle(pi.hThread);
++    CloseHandle(pi.hProcess);
++    XELOGI("Guide: rendering the Guide look {} in the background", look);
++  } else {
++    XELOGW("Guide: could not start {} ({})", cvars::guide_look_script,
++           GetLastError());
++  }
++}
++
++// UI thread (Draw): once the wanted look's images exist and no image job is
++// running, the images are prepared again from its folder; the ones on screen
++// stay until their replacements are ready (look_gen_).
++void GuideOverlay::SwitchGuideLook() {
++  std::filesystem::path wanted;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    wanted = look_wanted_dir_;
++    if (wanted.empty()) return;
++    const auto now = Clock::now();
++    if (now - look_checked_ < std::chrono::milliseconds(500)) return;
++    look_checked_ = now;
++  }
++  {
++    std::lock_guard<std::mutex> lock(look_mutex_);
++    if (wanted == image_dir_) return;
++  }
++  if (wanted != asset_dir_ && !std::filesystem::exists(wanted / "ready")) {
++    return;
++  }
++  if (prepare_busy_ || look_scaling_ ||
++      (create_profile_ready_ && !scaled_ready_)) {
++    return;
++  }
++  if (prepare_thread_.joinable()) prepare_thread_.join();
++  if (scale_thread_.joinable()) scale_thread_.join();
++  {
++    std::lock_guard<std::mutex> lock(look_mutex_);
++    image_dir_ = wanted;
++  }
++  XELOGI("Guide: images from {}", xe::path_to_utf8(wanted));
++  float ppu;
++  {
++    std::lock_guard<std::mutex> lock(prepare_mutex_);
++    ppu = prepare_for_;
++    prepared_.clear();
++    ++look_gen_;
++    if (ppu > 0) {
++      prepare_busy_ = true;
++      prepare_thread_ = std::thread([this, ppu]() { PrepareImages(ppu); });
++    }
++  }
++  const float scale_ppu = scaling_for_;
++  if (create_profile_ready_ && scale_ppu > 0) {
++    // scaled_ is swapped whole when done: the old look meanwhile
++    look_scaling_ = true;
++    scale_thread_ = std::thread([this, scale_ppu]() {
++      PrepareCreateProfileImages(scale_ppu);
++      look_scaling_ = false;
++      std::lock_guard<std::mutex> lock(mutex_);
++      ++page_version_;  // the composed pages again, from the new images
++    });
++  }
++}
++
+ }  // namespace app
+ }  // namespace xe
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index aa106373e..914798f45 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -56,6 +56,12 @@ DEFINE_string(blades_guide_test, "",
+               "Debug: open the Guide by itself, \"<delay ms>[,<menu item 0-4>"
+               "|exit|off[,yes]]\", for screenshots.",
+               "HID");
++DEFINE_string(guide_look_python, "",
++              "The Python that renders the Guide's images for a Guide "
++              "background chosen in Themes (render_guide_look.py).",
++              "HID");
++DEFINE_string(guide_look_script, "",
++              "render_guide_look.py, for guide_look_python.", "HID");
+ 
+ namespace xe {
+ namespace app {
+@@ -139,6 +145,7 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+       imgui_drawer_(imgui_drawer),
+       app_context_(app_context),
+       asset_dir_(xe::filesystem::GetExecutableFolder() / "guide") {
++  image_dir_ = asset_dir_;
+   LoadLayout();
+   LoadMessageBoxLayout();
+   LoadCreateProfileLayout();
+@@ -150,6 +157,7 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadSignInLayout();
+   LoadOptionsLayout();
+   LoadOptionsLayout("music.txt");
++  LoadOptionsLayout("themes.txt");
+   LoadHudKeys();
+   {
+     std::ifstream in(asset_dir_ / "gamertag.txt");
+@@ -644,6 +652,7 @@ void GuideOverlay::Open(Page page) {
+     }
+   }
+   PlaySfx("HUD_open");
++  UpdateGuideLook(hud_user_);  // its Guide background
+   app_context_.CallInUIThread([this]() {
+     std::lock_guard<std::mutex> lock(mutex_);
+     if (!dialog_) {
+@@ -1263,7 +1272,12 @@ const char* const kImages[] = {
+     "error_exit_yes", "error_off_no",    "error_off_yes"};
+ 
+ bool GuideOverlay::Decode(const std::string& name, Pixels& out) const {
+-  std::ifstream file(asset_dir_ / (name + ".png"), std::ios::binary);
++  std::filesystem::path dir;
++  {
++    std::lock_guard<std::mutex> lock(look_mutex_);
++    dir = image_dir_;
++  }
++  std::ifstream file(dir / (name + ".png"), std::ios::binary);
+   std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+   int channels;
+@@ -1337,7 +1351,11 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+       names.push_back(name);
+     }
+     for (const auto& [key, page] : opt_pages_) {
+-      if (key[0] != 'm') continue;
++      // Select Music's and Themes' scenes: their own legends
++      if (key[0] != 'm' && key != "optskin" && key != "optcust" &&
++          key != "opttrim" && key != "opttile" && key != "optcolor") {
++        continue;
++      }
+       for (const char* part : {"_legends_a", "_legends_b", "_legends_xy"}) {
+         names.push_back(key + part);
+       }
+@@ -1413,7 +1431,9 @@ const GuideOverlay::Image* GuideOverlay::Texture(const std::string& name,
+     }
+     return image.texture ? &image : nullptr;
+   }
+-  if (image.texture && image.pixels_per_unit == pixels_per_unit) {
++  const int gen = look_gen_;
++  if (image.texture && image.pixels_per_unit == pixels_per_unit &&
++      image.gen == gen) {
+     return &image;
+   }
+   Pixels pixels;
+@@ -1433,6 +1453,9 @@ const GuideOverlay::Image* GuideOverlay::Texture(const std::string& name,
+     if (it != prepared_.end() && prepare_for_ == pixels_per_unit) {
+       pixels = std::move(it->second);
+       prepared_.erase(it);
++    } else if (image.texture && image.pixels_per_unit == pixels_per_unit &&
++               !prepare_busy_) {
++      image.gen = gen;  // the look switched: none of this one coming
+     }
+   }
+   if (pixels.rgba.empty()) {
+@@ -1443,6 +1466,7 @@ const GuideOverlay::Image* GuideOverlay::Texture(const std::string& name,
+       imgui_drawer_->CreateImGuiTexture(pixels.width, pixels.height,
+                                         pixels.rgba.data());
+   image.pixels_per_unit = pixels_per_unit;
++  image.gen = gen;
+   image.width = pixels.width;
+   image.height = pixels.height;
+   image.units_w = pixels.units_w;
+@@ -1451,6 +1475,7 @@ const GuideOverlay::Image* GuideOverlay::Texture(const std::string& name,
+ }
+ 
+ void GuideOverlay::Draw(float display_w, float display_h) {
++  SwitchGuideLook();
+   View view = Snapshot();
+   const Layout& l = layout_;
+   static Mode last_mode = Mode::kClosed;
+@@ -1484,6 +1509,12 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+         return "opt";
+       case Page::kOptDl:
+         return "dl";
++      case Page::kOptSkin:
++      case Page::kOptCust:
++      case Page::kOptTrim:
++      case Page::kOptTile:
++      case Page::kOptColor:
++        return OptKey(page);  // <page>_legends_*
+       case Page::kAddXboxLive:
+         return "axl";
+       case Page::kGamerTag:
+@@ -1812,6 +1843,11 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kOptOnl:
+       case Page::kOptVoice:
+       case Page::kOptDl:
++      case Page::kOptSkin:
++      case Page::kOptCust:
++      case Page::kOptTrim:
++      case Page::kOptTile:
++      case Page::kOptColor:
+       case Page::kMus579:
+       case Page::kMus570:
+       case Page::kMus572Al:
+@@ -2338,6 +2374,7 @@ bool GuideOverlay::ShowTitleMessageBox(const kernel::xam::TitleMessageBox& box,
+     anim_start_ = Clock::now();
+   }
+   PlaySfx("HUD_open");
++  UpdateGuideLook(hud_user_);
+   app_context_.CallInUIThread([this]() {
+     std::lock_guard<std::mutex> lock(mutex_);
+     if (!dialog_) {
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 94831b406..9ecff69bd 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -144,7 +144,14 @@ class GuideOverlay {
+     kMus572Pl,
+     kMus572Ge,
+     kMus576,
+-    kMusPlay
++    kMusPlay,
++    // Personal Settings > Themes: SkinSelect, OptionsPersonalization
++    // (Customize), DashStyleSelect, TileSelect, ColorSelect
++    kOptSkin,
++    kOptCust,
++    kOptTrim,
++    kOptTile,
++    kOptColor
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+@@ -245,6 +252,10 @@ class GuideOverlay {
+   ui::ImGuiDrawer* imgui_drawer_;
+   ui::WindowedAppContext& app_context_;
+   std::filesystem::path asset_dir_;
++  // where the images come from: asset_dir_, or a Guide look rendered for the
++  // user's Guide background (guide_looks\<look>, render_guide_look.py)
++  std::filesystem::path image_dir_;  // under look_mutex_
++  mutable std::mutex look_mutex_;
+   Layout layout_;
+ 
+   std::mutex mutex_;
+@@ -274,6 +285,7 @@ class GuideOverlay {
+     int width = 0, height = 0;  // of `texture`
+     float units_w = 0, units_h = 0;  // canvas units covered by the image
+     std::unique_ptr<ui::ImmediateTexture> texture;
++    int gen = 0;  // look_gen_ of its pixels
+   };
+   std::map<std::string, Image> images_;  // UI thread
+ 
+@@ -478,7 +490,14 @@ class GuideOverlay {
+     std::string default_focus;
+     std::vector<std::string> order;  // the scene's child order
+     std::vector<OptCtrl> ctrls;
+-    std::map<std::string, std::array<int, 2>> layers;  // "<id>_<state>"
++    std::map<std::string, std::array<float, 2>> layers;  // "<id>_<state>"
++    // a layer drawn from another layer's image (the colour sliders' bars)
++    std::map<std::string, std::string> layer_file;
++    // a list's rows (themes.txt): its count and how many show at once
++    int rows = 0, visible = 0;
++    std::map<std::string, std::array<float, 4>> rects;
++    std::map<std::string, MessageBoxItem> texts;
++    std::map<std::string, float> slider_y;
+   };
+   struct OptLayer {
+     Pixels pixels;
+@@ -491,11 +510,36 @@ class GuideOverlay {
+   static const char* OptKey(Page page);
+   void LoadOptionsLayout(const char* file = "options.txt");
+   static bool IsMusicPage(Page page);
++  static bool IsThemePage(Page page);
+   void MusicOpen();   // the menu's Select Music; mutex_ held
+   void MusicClose();  // the app unloads: back to the Guide menu; mutex_ held
+   void OptX();
+   void OptY();
+   void MusicPlayEmpty();  // BeginPlayback with nothing to play
++  // Themes (guide_options.cc). Under mutex_: each list page's selection and
++  // first shown row, the Custom Color sliders (10-255).
++  struct ThemeList {
++    int sel = 0, top = 0;
++  };
++  std::map<std::string, ThemeList> th_list_;
++  int th_color_[3] = {112, 132, 153};
++  void ThemesMove(Direction direction);  // mutex_ held
++  void ThemesActivate();
++  // the user's Guide background (the dashboard GPD's record 0x8003):
++  // kind 0 the default, 1 a colour, 2 a tile image
++  void SetGuideBackground(int kind, uint32_t color, const std::string& tile);
++  void SetDashStyle(int style);  // the profile's DashStyle file
++  void ApplyBuiltinTheme(int index);  // 9144C7F0: 0 default, 1 Carbon, 2 Glass
++  std::string LookForUser(uint32_t user_index);  // "" = the default look
++  void UpdateGuideLook(uint32_t user_index);  // the look wanted / rendered
++  void SwitchGuideLook();  // Draw: to the wanted look's images once they exist
++  // Under mutex_:
++  std::string current_look_;
++  std::filesystem::path look_wanted_dir_;
++  std::chrono::steady_clock::time_point look_checked_;
++  std::map<std::string, bool> rendering_looks_;
++  std::atomic<int> look_gen_{0};  // Image::gen: images from the current look
++  std::atomic<bool> look_scaling_{false};
+   void PrepareOptionsLayers(float ppu, float f);  // the scale thread
+   bool ComposeOptionsPage(Page page, float ppu, Pixels& out);
+   bool OptEnabled(const std::string& id) const;  // mutex_ held
+diff --git a/src/xenia/kernel/xam/user_tracker.cc b/src/xenia/kernel/xam/user_tracker.cc
+index e9f3588ed..bc01e0e00 100644
+--- a/src/xenia/kernel/xam/user_tracker.cc
++++ b/src/xenia/kernel/xam/user_tracker.cc
+@@ -746,6 +746,39 @@ void UserTracker::UpsertSetting(uint64_t xuid, uint32_t title_id,
+   FlushUserData(xuid);
+ }
+ 
++void UserTracker::SetRecord(uint64_t xuid, uint32_t title_id,
++                            uint16_t section, uint64_t id,
++                            std::span<const uint8_t> data) {
++  if (!IsUserTracked(xuid)) {
++    return;
++  }
++  auto user = kernel_state()->xam_state()->GetUserProfile(xuid);
++  if (!user) {
++    return;
++  }
++  GpdInfo* info = user->GetGpd(title_id);
++  if (!info) {
++    return;
++  }
++  info->SetRecord(section, id, data);
++  FlushUserData(xuid);
++}
++
++std::vector<uint8_t> UserTracker::GetRecord(uint64_t xuid, uint32_t title_id,
++                                            uint16_t section,
++                                            uint64_t id) const {
++  auto user = kernel_state()->xam_state()->GetUserProfile(xuid);
++  if (!user) {
++    return {};
++  }
++  const GpdInfo* info = user->GetGpd(title_id);
++  if (!info) {
++    return {};
++  }
++  auto data = info->GetRecord(section, id);
++  return {data.begin(), data.end()};
++}
++
+ bool UserTracker::UpdateUserIcon(uint64_t xuid,
+                                  std::span<const uint8_t> icon_data) {
+   auto user = kernel_state()->xam_state()->GetUserProfile(xuid);
+diff --git a/src/xenia/kernel/xam/user_tracker.h b/src/xenia/kernel/xam/user_tracker.h
+index c3e972bf4..10d05e536 100644
+--- a/src/xenia/kernel/xam/user_tracker.h
++++ b/src/xenia/kernel/xam/user_tracker.h
+@@ -79,6 +79,12 @@ class UserTracker {
+   std::optional<UserSetting> GetSetting(UserProfile* user, uint32_t title_id,
+                                         uint32_t setting_id) const;
+ 
++  // A title GPD's record by section and id (empty data removes it).
++  void SetRecord(uint64_t xuid, uint32_t title_id, uint16_t section,
++                 uint64_t id, std::span<const uint8_t> data);
++  std::vector<uint8_t> GetRecord(uint64_t xuid, uint32_t title_id,
++                                 uint16_t section, uint64_t id) const;
++
+   bool GetUserSetting(uint64_t xuid, uint32_t title_id, uint32_t setting_id,
+                       X_USER_PROFILE_SETTING* setting_ptr,
+                       uint32_t& extended_data_address) const;
+diff --git a/src/xenia/kernel/xam/xdbf/gpd_info.cc b/src/xenia/kernel/xam/xdbf/gpd_info.cc
+index 20118cdad..75f11a7a7 100644
+--- a/src/xenia/kernel/xam/xdbf/gpd_info.cc
++++ b/src/xenia/kernel/xam/xdbf/gpd_info.cc
+@@ -57,6 +57,28 @@ void GpdInfo::AddImage(uint32_t id, std::span<const uint8_t> image_data) {
+   UpsertEntry(&new_entry);
+ }
+ 
++std::span<const uint8_t> GpdInfo::GetRecord(uint16_t section,
++                                            uint64_t id) const {
++  const Entry* entry = GetEntry(section, id);
++  if (!entry) {
++    return {};
++  }
++  return {entry->data.data(), entry->data.size()};
++}
++
++void GpdInfo::SetRecord(uint16_t section, uint64_t id,
++                        std::span<const uint8_t> data) {
++  if (data.empty()) {
++    if (const Entry* entry = GetEntry(section, id)) {
++      DeleteEntry(entry);
++    }
++    return;
++  }
++  Entry new_entry(id, section, static_cast<uint32_t>(data.size()));
++  memcpy(new_entry.data.data(), data.data(), data.size());
++  UpsertEntry(&new_entry);
++}
++
+ X_XDBF_GPD_SETTING_HEADER* GpdInfo::GetSetting(uint32_t id) {
+   Entry* entry = GetEntry(static_cast<uint16_t>(GpdSection::kSetting), id);
+ 
+diff --git a/src/xenia/kernel/xam/xdbf/gpd_info.h b/src/xenia/kernel/xam/xdbf/gpd_info.h
+index 2d23ff6c3..fee9ec675 100644
+--- a/src/xenia/kernel/xam/xdbf/gpd_info.h
++++ b/src/xenia/kernel/xam/xdbf/gpd_info.h
+@@ -170,6 +170,11 @@ class GpdInfo : public XdbfFile {
+   std::u16string GetString(uint32_t id) const;
+   void AddString(uint32_t id, std::u16string string_data);
+ 
++  // any record by section and id (empty data removes it)
++  std::span<const uint8_t> GetRecord(uint16_t section, uint64_t id) const;
++  void SetRecord(uint16_t section, uint64_t id,
++                 std::span<const uint8_t> data);
++
+   std::vector<uint8_t> Serialize() const;
+ 
+  protected:
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,799 @@
+From 99962c9624fcd602ee3c402477704e49e208eea2 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 16:14:08 +0530
+Subject: [PATCH 29/51] Guide: gamerprofile screens (gamer card, Edit Gamer
+ Profile/Picture)
+
+XamShowGamerCardUI for your own card now shows gamerprofile.xex's scenes
+in the Guide instead of the ImGui dialog: GamerCardScene (offline
+buttons, Enable/Disable Auto Sign-In), 808 Edit Gamer Profile, 807 Edit
+Gamer Picture (Download -> not-on-Live message box), and 809 Change Gamer
+Picture (12 dashboard pictures, focus previews on the card, A writes the
+picture and goes back). B walks back through the scene stack.
+
+Auto Sign-In writes XCONFIG_USER_DEFAULT_PROFILE, now backed by the saved
+default_profile_xuid cvar. Guide test mode logs pressed buttons.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc                | 457 +++++++++++++++++-
+ src/xenia/app/guide_overlay.h                 |  41 +-
+ src/xenia/kernel/xam/xam_ui.cc                |   6 +
+ src/xenia/kernel/xam/xam_ui.h                 |   2 +
+ src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc |  22 +
+ src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h  |   2 +
+ 6 files changed, 504 insertions(+), 26 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 4823e89a9..8a4109c68 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -38,6 +38,8 @@
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/xam/xam_state.h"
+ #include "xenia/kernel/xam/xam_ui.h"
++#include "xenia/kernel/title_id_utils.h"
++#include "xenia/kernel/xam/user_tracker.h"
+ #include "xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h"
+ #include "xenia/ui/imgui_dialog.h"
+ #include "xenia/ui/imgui_drawer.h"
+@@ -48,6 +50,7 @@
+ DECLARE_bool(blades_guide);
+ DECLARE_bool(dashboard_handoff);
+ DECLARE_uint32(retail_flags);
++DECLARE_uint64(default_profile_xuid);
+ DECLARE_int32(draw_resolution_scale_y);
+ DEFINE_string(blades_guide_test, "",
+               "Debug: open the Guide by itself, \"<delay ms>[,<menu item 0-4>"
+@@ -131,12 +134,16 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadMessageBoxLayout();
+   LoadCreateProfileLayout();
+   LoadAddXboxLiveLayout();
++  LoadGamerProfileLayout();
+   LoadHudKeys();
+   input_thread_ = std::thread([this]() { InputThread(); });
+   schedule_thread_ = std::thread([this]() { ScheduleThread(); });
+   kernel::xam::create_profile_ui_hook = [this](uint32_t user_index) {
+     return ShowCreateProfile(user_index);
+   };
++  kernel::xam::gamer_card_ui_hook = [this](uint32_t user_index) {
++    return ShowGamerCard(user_index);
++  };
+   kernel::xam::title_message_box_hook =
+       [this](const kernel::xam::TitleMessageBox& box,
+              std::function<void(int)> done) {
+@@ -155,6 +162,7 @@ GuideOverlay::~GuideOverlay() {
+   kernel::xam::live_upsell_ui_hook = nullptr;
+   kernel::xam::title_message_box_hook = nullptr;
+   kernel::xam::create_profile_ui_hook = nullptr;
++  kernel::xam::gamer_card_ui_hook = nullptr;
+   running_ = false;
+   {
+     std::lock_guard<std::mutex> lock(schedule_mutex_);
+@@ -393,6 +401,9 @@ void GuideOverlay::InputThread() {
+       prev |= hid::X_INPUT_GAMEPAD_GUIDE;
+     }
+     uint16_t pressed = buttons & ~prev;
++    if (pressed && !cvars::blades_guide_test.empty()) {
++      XELOGI("Guide: test input {:04X}", pressed);
++    }
+     if (pressed & hid::X_INPUT_GAMEPAD_GUIDE) {
+       XELOGI("Guide: button pressed");
+     }
+@@ -439,6 +450,11 @@ void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float lx,
+       EndCreateProfile();  // closing the Guide leaves profile creation
+       return;
+     }
++    if (gp_active_ && mode != Mode::kClosed) {
++      lock.unlock();
++      EndGamerProfile();
++      return;
++    }
+     lock.unlock();
+     if (mode == Mode::kClosed || mode == Mode::kClosing) {
+       Open();
+@@ -609,6 +625,10 @@ void GuideOverlay::FinishClose() {
+ 
+ void GuideOverlay::Move(Direction direction) {
+   std::lock_guard<std::mutex> lock(mutex_);
++  if (GpKey(page_) && transition_ == Transition::kNone) {
++    GpMove(direction);
++    return;
++  }
+   if (page_ == Page::kUpsell || page_ == Page::kAddXboxLive ||
+       page_ == Page::kGamerTag || transition_ != Transition::kNone) {
+     return;  // a single button / nothing to move to / sliding
+@@ -681,6 +701,11 @@ void GuideOverlay::Activate() {
+   std::unique_lock<std::mutex> lock(mutex_);
+   Page page = page_;
+   int choice = choice_;
++  if (GpKey(page) && transition_ == Transition::kNone) {
++    lock.unlock();
++    GpActivate();
++    return;
++  }
+   if (transition_ != Transition::kNone || page == Page::kAddXboxLive ||
+       page == Page::kGamerTag) {
+     return;  // AddXboxLive, GamerTag: no A (its legend is dimmed)
+@@ -735,6 +760,11 @@ void GuideOverlay::Back() {
+   if (transition_ != Transition::kNone) {
+     return;
+   }
++  if (GpKey(page_)) {
++    lock.unlock();
++    GpBack();
++    return;
++  }
+   if (page_ == Page::kAddXboxLive) {
+     lock.unlock();
+     AddXboxLiveBack();
+@@ -961,7 +991,8 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+                      page_ == Page::kTitleMessage ||
+                      page_ == Page::kProfileError;
+   float open_after = page_ == Page::kUpsell || page_ == Page::kKeyboard ||
+-                             page_ == Page::kSaveProfile || message_box
++                             page_ == Page::kSaveProfile || GpKey(page_) ||
++                             message_box
+                          ? layout_.slide_frames
+                          : layout_.slide_frames + layout_.fade_frames;
+   if (mode_ == Mode::kOpening && view.frames >= open_after) {
+@@ -1177,10 +1208,12 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   }
+ 
+   const bool profile_page = view.page == Page::kKeyboard ||
+-                            view.page == Page::kSaveProfile;
++                            view.page == Page::kSaveProfile ||
++                            GpKey(view.page) != nullptr;
+   const bool full = view.base == Page::kUpsell ||
+                     view.base == Page::kKeyboard ||
+-                    view.base == Page::kSaveProfile;
++                    view.base == Page::kSaveProfile ||
++                    GpKey(view.base) != nullptr;
+   const bool axl_page = view.base == Page::kAddXboxLive;
+   // Legend layers per page: <prefix>_legends_a / _b / _xy.
+   auto legend_prefix = [](Page page) -> const char* {
+@@ -1197,6 +1230,11 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+         return "menu";
+       case Page::kUpsell:
+         return "upsell";
++      case Page::kGpCard:
++      case Page::kGpEdit:
++      case Page::kGpEditPic:
++      case Page::kGpPics:
++        return "gp";
+       default:
+         return nullptr;
+     }
+@@ -1459,7 +1497,11 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+         content = "axl_page";
+         break;
+       case Page::kKeyboard:
+-      case Page::kSaveProfile: {
++      case Page::kSaveProfile:
++      case Page::kGpCard:
++      case Page::kGpEdit:
++      case Page::kGpEditPic:
++      case Page::kGpPics: {
+         // Composed from createprofile's page images with the name and the
+         // captions in the console font; again whenever it changes.
+         uint64_t version;
+@@ -2076,6 +2118,14 @@ void GuideOverlay::LoadCreateProfileLayout() {
+ void GuideOverlay::PrepareCreateProfileImages(float ppu) {
+   auto start = Clock::now();
+   std::vector<std::string> names = {"kbd_base", "kbd_caret"};
++  for (const auto& [key, page] : gp_pages_) {
++    if (page.buttons.empty()) names.push_back(key);
++    for (const auto& b : page.buttons) names.push_back(key + "_" + b.id);
++  }
++  if (gp_ready_) {
++    names.push_back("gp_cell_normal");
++    names.push_back("gp_cell_focus");
++  }
+   for (auto& b : save_buttons_) names.push_back(b.image);
+   for (auto& [id, key] : kbd_keys_) {
+     if (!key.image.empty()) names.push_back("kbd_focus_" + key.image);
+@@ -2826,18 +2876,246 @@ void GuideOverlay::DrawAddXboxLive(float k, float ox, float oy, float up,
+   }
+ }
+ 
+-// Congratulations' gamerTileImage: the picture (xam's 64x64 PNG, read by
+-// the scene with XamReadTile) drawn into its box.
+-void GuideOverlay::DrawGamerPicture(Pixels& out, int picture, float ppu) {
+-  if (picture <= 0 || save_tile_[2] <= 0) {
++// ------------------------------------------------------------ gamerprofile
++
++const char* GuideOverlay::GpKey(Page page) {
++  switch (page) {
++    case Page::kGpCard:
++      return "gpcard";
++    case Page::kGpEdit:
++      return "gpedit";
++    case Page::kGpEditPic:
++      return "gpeditp";
++    case Page::kGpPics:
++      return "gppics";
++    default:
++      return nullptr;
++  }
++}
++
++void GuideOverlay::LoadGamerProfileLayout() {
++  std::ifstream in(asset_dir_ / "gamerprofile.txt");
++  std::string line;
++  while (std::getline(in, line)) {
++    std::istringstream ls(line);
++    std::string kind, page, name;
++    ls >> kind;
++    if (kind == "page") {
++      ls >> page;
++      ls >> gp_pages_[page].default_focus;
++    } else if (kind == "text") {
++      std::string color;
++      ls >> page >> name;
++      MessageBoxItem item;
++      item.is_text = true;
++      ls >> item.x >> item.y >> item.w >> item.h >> item.size >> item.ascent >>
++          item.line_h >> item.style >> color;
++      item.color = uint32_t(std::stoul(color, nullptr, 16));
++      gp_pages_[page].texts[name] = item;
++    } else if (kind == "image") {
++      std::array<float, 4> r;
++      ls >> page >> name >> r[0] >> r[1] >> r[2] >> r[3];
++      gp_pages_[page].images[name] = r;
++    } else if (kind == "button") {
++      SaveButton b;
++      ls >> page >> b.id >> b.up >> b.down;
++      if (b.up == "-") b.up.clear();
++      if (b.down == "-") b.down.clear();
++      gp_pages_[page].buttons.push_back(b);
++    } else if (kind == "cells") {
++      for (float& v : gp_cells_) ls >> v;
++    }
++  }
++  std::ifstream strings(asset_dir_ / "gamerprofile_strings.txt",
++                        std::ios::binary);
++  while (std::getline(strings, line)) {
++    if (!line.empty() && line.back() == '\r') line.pop_back();
++    size_t space = line.find(' ');
++    if (space != std::string::npos) {
++      gp_strings_[line.substr(0, space)] = Unescape(line.substr(space + 1));
++    }
++  }
++  gp_ready_ = gp_pages_.size() == 4 && gp_cells_[4] > 0;
++  if (!gp_ready_) {
++    XELOGW("Guide: gamerprofile assets missing (gamerprofile.txt)");
++  }
++}
++
++bool GuideOverlay::ShowGamerCard(uint32_t user_index) {
++  if (!gp_ready_ || !create_profile_ready_) {
++    return false;
++  }
++  auto user =
++      emulator_->kernel_state()->xam_state()->GetUserProfile(user_index);
++  if (!user) {
++    return false;
++  }
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (mode_ != Mode::kClosed || create_profile_active_ || gp_active_) {
++      return false;
++    }
++    gp_active_ = true;
++    gp_xuid_ = user->xuid();
++    gp_back_.clear();
++    gp_cell_ = 0;
++    gp_focus_ = gp_pages_["gpcard"].default_focus;
++    ++page_version_;
++  }
++  if (display_h_ > 0) {
++    float ppu = display_h_ / layout_.canvas_h;
++    if (scaling_for_ != ppu) {
++      scaling_for_ = ppu;
++      scaled_ready_ = false;
++      if (scale_thread_.joinable()) scale_thread_.join();
++      scale_thread_ =
++          std::thread([this, ppu]() { PrepareCreateProfileImages(ppu); });
++    }
++  }
++  emulator_->kernel_state()->BroadcastNotification(
++      xe::kXNotificationSystemUI, true);
++  XELOGI("Guide: gamer card (gamerprofile.xex, mode 0)");
++  Open(Page::kGpCard);  // GamerCardScene, full width (ClosedToFull)
++  return true;
++}
++
++void GuideOverlay::EndGamerProfile() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    gp_active_ = false;
++  }
++  BeginClose();
++  std::thread([this]() {
++    std::this_thread::sleep_for(std::chrono::milliseconds(600));
++    emulator_->kernel_state()->BroadcastNotification(
++        xe::kXNotificationSystemUI, false);
++  }).detach();
++}
++
++void GuideOverlay::GpGoTo(Page page) {
++  // XuiSceneNavigateForward to another full-width scene: the frame stays.
++  gp_back_.push_back({page_, gp_focus_});
++  page_ = page;
++  if (page == Page::kGpPics) {
++    gp_cell_ = 0;  // 90117CE0: the list selects its first item
++    gp_focus_.clear();
++  } else {
++    gp_focus_ = gp_pages_[GpKey(page)].default_focus;
++  }
++  ++page_version_;
++}
++
++void GuideOverlay::GpMove(Direction direction) {
++  if (page_ == Page::kGpPics) {
++    // the list's grid, 3 columns of 12 items
++    const int cols = int(gp_cells_[4]), count = int(gp_cells_[5]);
++    int next = gp_cell_;
++    if (direction == kLeft && gp_cell_ % cols > 0) next = gp_cell_ - 1;
++    if (direction == kRight && gp_cell_ % cols < cols - 1 &&
++        gp_cell_ + 1 < count)
++      next = gp_cell_ + 1;
++    if (direction == kUp && gp_cell_ - cols >= 0) next = gp_cell_ - cols;
++    if (direction == kDown && gp_cell_ + cols < count) next = gp_cell_ + cols;
++    if (next == gp_cell_) return;
++    gp_cell_ = next;
++  } else {
++    if (direction != kUp && direction != kDown) return;
++    std::string next;
++    for (const auto& b : gp_pages_[GpKey(page_)].buttons) {
++      if (b.id == gp_focus_) next = direction == kUp ? b.up : b.down;
++    }
++    if (next.empty()) return;
++    gp_focus_ = next;
++  }
++  ++page_version_;
++  PlaySfx("btn_Focus");
++}
++
++void GuideOverlay::GpActivate() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  const Page page = page_;
++  const std::string focus = gp_focus_;
++  PlaySfx("btn_Select");
++  if (page == Page::kGpCard) {
++    if (focus == "editProfileButton") {
++      GpGoTo(Page::kGpEdit);  // 808_EditProfile.xur
++    } else if (focus == "autoSignInButton") {
++      // 9010C9E0: Auto Sign-In on for this profile, or off (XConfig user
++      // setting 8 = the profile's XUID, or 0)
++      uint64_t xuid = cvars::default_profile_xuid == gp_xuid_ ? 0 : gp_xuid_;
++      kernel::xboxkrnl::SetDefaultProfile(xuid);
++      XELOGI("Guide: auto sign-in {:016X}", xuid);
++      ++page_version_;
++    } else {
++      XELOGW("Guide: gamer card {} is not built yet", focus);
++    }
++    return;
++  }
++  if (page == Page::kGpEdit) {
++    if (focus == "gamerTileButton") {
++      GpGoTo(Page::kGpEditPic);  // 807_EditGamerTile.xur
++    } else {
++      XELOGW("Guide: Edit Gamer Profile {} is not built yet", focus);
++    }
+     return;
+   }
+-  auto it = gamer_pictures_.find(picture);
++  if (page == Page::kGpEditPic) {
++    if (focus == "changeGamerTileButton") {
++      GpGoTo(Page::kGpPics);  // 809_ChangeGamerTile.xur
++    } else if (focus == "downloadTilesButton") {
++      // 90106430: not on Xbox Live -> XamShowMessageBox(the button's text,
++      // string 0x43, {OK}, flags 1)
++      kernel::xam::TitleMessageBox box;
++      box.title = xe::to_utf16("Download Gamer Pictures");
++      box.text = gp_strings_["s43"];
++      box.buttons = {profile_strings_["ok"]};
++      box.icon = 1;
++      ShowProfileBox(box, Page::kGpEditPic);
++    } else {
++      XELOGW("Guide: Edit Gamer Picture {} is not built yet", focus);
++    }
++    return;
++  }
++  if (page == Page::kGpPics) {
++    // 90105990: XamWriteGamerTileEx with the item's title and ids, then
++    // 901052A8 back to Edit Gamer Picture
++    const int n = gp_cell_ + 1;
++    const uint64_t xuid = gp_xuid_;
++    lock.unlock();
++    kernel::xam::WriteGamerPicture(xuid, 0xFFFE07D1, 0x20000 + n, 0x10000 + n);
++    lock.lock();
++    if (!gp_back_.empty()) {
++      page_ = gp_back_.back().first;
++      gp_focus_ = gp_back_.back().second;
++      gp_back_.pop_back();
++    }
++    ++page_version_;
++  }
++}
++
++void GuideOverlay::GpBack() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!gp_back_.empty()) {
++      page_ = gp_back_.back().first;
++      gp_focus_ = gp_back_.back().second;
++      gp_back_.pop_back();
++      ++page_version_;
++      PlaySfx("btn_Back");
++      return;
++    }
++  }
++  PlaySfx("btn_Back");
++  EndGamerProfile();  // the first scene: gamerprofile.xex ends
++}
++
++const GuideOverlay::Pixels* GuideOverlay::GamerPicture(int number) {
++  auto it = gamer_pictures_.find(number);
+   if (it == gamer_pictures_.end()) {
+     Pixels pixels;
+     auto path = xe::filesystem::GetExecutableFolder() / "gamerpics" /
+-                fmt::format("64_fffe07d1{:08x}{:08x}.png", 0x20000 + picture,
+-                            0x10000 + picture);
++                fmt::format("64_fffe07d1{:08x}{:08x}.png", 0x20000 + number,
++                            0x10000 + number);
+     std::ifstream file(path, std::ios::binary);
+     std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                               std::istreambuf_iterator<char>());
+@@ -2849,29 +3127,155 @@ void GuideOverlay::DrawGamerPicture(Pixels& out, int picture, float ppu) {
+                          rgba + size_t(pixels.width) * pixels.height * 4);
+       stbi_image_free(rgba);
+     }
+-    it = gamer_pictures_.emplace(picture, std::move(pixels)).first;
+-  }
+-  if (it->second.rgba.empty()) {
+-    return;
++    it = gamer_pictures_.emplace(number, std::move(pixels)).first;
+   }
+-  const int x0 = int(std::lround(save_tile_[0] * ppu));
+-  const int y0 = int(std::lround(save_tile_[1] * ppu));
+-  const int w = std::max(1, int(std::lround(save_tile_[2] * ppu)));
+-  const int h = std::max(1, int(std::lround(save_tile_[3] * ppu)));
+-  Pixels tile = Resample(it->second, w, h);
+-  for (int y = 0; y < h; ++y) {
+-    int oy = y0 + y;
++  return it->second.rgba.empty() ? nullptr : &it->second;
++}
++
++void GuideOverlay::DrawPictureInto(Pixels& out, const Pixels& picture, float x,
++                                   float y, float w, float h, float ppu) {
++  const int x0 = int(std::lround(x * ppu)), y0 = int(std::lround(y * ppu));
++  const int pw = std::max(1, int(std::lround(w * ppu)));
++  const int ph = std::max(1, int(std::lround(h * ppu)));
++  Pixels tile = Resample(picture, pw, ph);
++  for (int yy = 0; yy < ph; ++yy) {
++    int oy = y0 + yy;
+     if (oy < 0 || oy >= out.height) continue;
+-    for (int x = 0; x < w; ++x) {
+-      int ox = x0 + x;
++    for (int xx = 0; xx < pw; ++xx) {
++      int ox = x0 + xx;
+       if (ox < 0 || ox >= out.width) continue;
+-      const uint8_t* p = &tile.rgba[(size_t(y) * w + x) * 4];
++      const uint8_t* p = &tile.rgba[(size_t(yy) * pw + xx) * 4];
+       BlendPixel(&out.rgba[(size_t(oy) * out.width + ox) * 4], p[0] / 255.0f,
+                  p[1] / 255.0f, p[2] / 255.0f, p[3] / 255.0f);
+     }
+   }
+ }
+ 
++bool GuideOverlay::ComposeGamerProfilePage(Page page, float ppu, Pixels& out) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  const std::string focus = gp_focus_;
++  const int cell = gp_cell_;
++  const uint64_t xuid = gp_xuid_;
++  lock.unlock();
++  const std::string key = GpKey(page);
++  const GpPage& layout = gp_pages_[key];
++  // the gamer card's data, as xam's gamercard control shows it (819B6B20):
++  // gamertag, gamerscore, games played, achievements earned
++  auto* state = emulator_->kernel_state()->xam_state();
++  auto user = state->GetUserProfile(xuid);
++  std::u16string gamertag;
++  int32_t cred = 0, titles = 0, achievements = 0;
++  std::u16string last_title;
++  Pixels own_picture;
++  if (user) {
++    gamertag = xe::to_utf16(user->name());
++    auto* tracker = state->user_tracker();
++    auto value = [&](kernel::xam::UserSettingId id) {
++      auto setting = tracker->GetSetting(user, kernel::kDashboardID,
++                                         uint32_t(id));
++      if (!setting) return int32_t(0);
++      auto data = setting->get_host_data();
++      if (auto* v = std::get_if<int32_t>(&data)) return *v;
++      if (auto* u = std::get_if<uint32_t>(&data)) return int32_t(*u);
++      return int32_t(0);
++    };
++    cred = value(kernel::xam::UserSettingId::XPROFILE_GAMERCARD_CRED);
++    titles = value(kernel::xam::UserSettingId::XPROFILE_GAMERCARD_TITLES_PLAYED);
++    achievements = value(
++        kernel::xam::UserSettingId::XPROFILE_GAMERCARD_ACHIEVEMENTS_EARNED);
++    // the extended panel's title: the most recently played game
++    auto played = tracker->GetPlayedTitles(xuid);
++    const kernel::xam::TitleInfo* last = nullptr;
++    for (const auto& t : played) {
++      if (!last || t.last_played > last->last_played) last = &t;
++    }
++    if (last) last_title = last->title_name;
++    auto icon = tracker->GetIcon(xuid, 0, kernel::xam::XTileType::kGamerTile, 0);
++    int channels;
++    if (!icon.empty()) {
++      if (uint8_t* rgba = stbi_load_from_memory(
++              icon.data(), int(icon.size()), &own_picture.width,
++              &own_picture.height, &channels, STBI_rgb_alpha)) {
++        own_picture.rgba.assign(
++            rgba, rgba + size_t(own_picture.width) * own_picture.height * 4);
++        stbi_image_free(rgba);
++      }
++    }
++  }
++  std::lock_guard<std::mutex> images_lock(prepare_mutex_);
++  if (!scaled_ready_ || scaled_ppu_ != ppu) {
++    return false;
++  }
++  auto base = scaled_.find(page == Page::kGpPics ? key : key + "_" + focus);
++  if (base == scaled_.end()) return false;
++  out = base->second;
++  auto text = [&](const char* name, const std::u16string& value) {
++    auto it = layout.texts.find(name);
++    if (it != layout.texts.end()) RenderText(out, it->second, value, ppu);
++  };
++  text("gamertag", gamertag);
++  text("cred", xe::to_utf16(std::to_string(cred)));
++  text("titles", xe::to_utf16(std::to_string(titles)));
++  text("achievements", xe::to_utf16(std::to_string(achievements)));
++  text("ext_title", last_title);
++  text("autosignin",
++       gp_strings_[cvars::default_profile_xuid == xuid && xuid ? "disable"
++                                                                : "enable"]);
++  // the card's picture: on Change Gamer Picture the focused item's (its
++  // focus change sets it on the card, 901056C8), else the profile's own
++  const Pixels* picture = own_picture.rgba.empty() ? nullptr : &own_picture;
++  if (page == Page::kGpPics) picture = GamerPicture(cell + 1);
++  auto tile = layout.images.find("tile");
++  if (picture && tile != layout.images.end()) {
++    const auto& r = tile->second;
++    DrawPictureInto(out, *picture, r[0], r[1], r[2], r[3], ppu);
++  }
++  if (page == Page::kGpPics) {
++    const float x0 = gp_cells_[0], y0 = gp_cells_[1], dx = gp_cells_[2],
++                dy = gp_cells_[3];
++    const int cols = int(gp_cells_[4]), count = int(gp_cells_[5]);
++    auto normal = scaled_.find("gp_cell_normal");
++    auto focused = scaled_.find("gp_cell_focus");
++    for (int i = 0; i < count; ++i) {
++      const float x = x0 + (i % cols) * dx, y = y0 + (i / cols) * dy;
++      auto img = i == cell ? focused : normal;
++      if (img != scaled_.end()) {
++        const Pixels& c = img->second;
++        const int ox0 = int(std::lround(x * ppu)), oy0 = int(std::lround(y * ppu));
++        for (int yy = 0; yy < c.height; ++yy) {
++          int oy = oy0 + yy;
++          if (oy < 0 || oy >= out.height) continue;
++          for (int xx = 0; xx < c.width; ++xx) {
++            int ox = ox0 + xx;
++            if (ox < 0 || ox >= out.width) continue;
++            const uint8_t* p = &c.rgba[(size_t(yy) * c.width + xx) * 4];
++            BlendPixel(&out.rgba[(size_t(oy) * out.width + ox) * 4],
++                       p[0] / 255.0f, p[1] / 255.0f, p[2] / 255.0f,
++                       p[3] / 255.0f);
++          }
++        }
++      }
++      if (const Pixels* pic = GamerPicture(i + 1)) {
++        DrawPictureInto(out, *pic, x + gp_cells_[6], y + gp_cells_[7], 64.0f,
++                        64.0f, ppu);
++      }
++    }
++  }
++  return true;
++}
++
++// Congratulations' gamerTileImage: the picture (xam's 64x64 PNG, read by
++// the scene with XamReadTile) drawn into its box.
++void GuideOverlay::DrawGamerPicture(Pixels& out, int picture, float ppu) {
++  if (picture <= 0 || save_tile_[2] <= 0) {
++    return;
++  }
++  if (const Pixels* pixels = GamerPicture(picture)) {
++    DrawPictureInto(out, *pixels, save_tile_[0], save_tile_[1], save_tile_[2],
++                    save_tile_[3], ppu);
++  }
++}
++
+ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+   std::unique_lock<std::mutex> lock(mutex_);
+   const Page page = page_;
+@@ -2881,6 +3285,9 @@ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+   const int picture = save_picture_;
+   const std::string focus = page == Page::kSaveProfile ? save_focus_ : kbd_focus_;
+   lock.unlock();
++  if (GpKey(page)) {
++    return ComposeGamerProfilePage(page, ppu, out);
++  }
+   std::lock_guard<std::mutex> images_lock(prepare_mutex_);
+   if (!scaled_ready_ || scaled_ppu_ != ppu) {
+     return false;
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index ca539f1a2..04688fbd4 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -65,6 +65,8 @@ class GuideOverlay {
+   // keyboard for the name, then "Save Gamer Profile") for the controller
+   // `user_index`. False if the Guide is busy or the assets are missing.
+   bool ShowCreateProfile(uint32_t user_index);
++  // XamShowGamerCardUI: gamerprofile.xex's screens for your own gamer card.
++  bool ShowGamerCard(uint32_t user_index);
+ 
+  private:
+   class Dialog;
+@@ -93,7 +95,14 @@ class GuideOverlay {
+     kSaveProfile,
+     kProfileError,
+     kAddXboxLive,
+-    kGamerTag
++    kGamerTag,
++    // gamerprofile.xex (XamShowGamerCardUI, createprofile's Customize):
++    // GamerCardScene, 808 Edit Gamer Profile, 807 Edit Gamer Picture, 809
++    // Change Gamer Picture; all full width.
++    kGpCard,
++    kGpEdit,
++    kGpEditPic,
++    kGpPics
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+@@ -353,6 +362,36 @@ class GuideOverlay {
+   float axl_text_ppu_ = 0;
+   uint64_t axl_text_drawn_ = 0;
+   void LoadAddXboxLiveLayout();
++  // gamerprofile.xex's pages (gamerprofile.txt)
++  struct GpPage {
++    std::string default_focus;
++    std::map<std::string, MessageBoxItem> texts;
++    std::map<std::string, std::array<float, 4>> images;
++    std::vector<SaveButton> buttons;
++  };
++  std::map<std::string, GpPage> gp_pages_;
++  // tile grid: x0 y0 dx dy cols count tile_dx tile_dy cell_w cell_h
++  float gp_cells_[10] = {};
++  std::map<std::string, std::u16string> gp_strings_;
++  bool gp_ready_ = false;
++  void LoadGamerProfileLayout();
++  static const char* GpKey(Page page);
++  // Under mutex_:
++  bool gp_active_ = false;
++  uint64_t gp_xuid_ = 0;
++  std::string gp_focus_;
++  int gp_cell_ = 0;
++  // the scenes below the current one (Back returns to them) with their focus
++  std::vector<std::pair<Page, std::string>> gp_back_;
++  void GpGoTo(Page page);  // forward to a scene (mutex_ held)
++  void GpMove(Direction direction);  // mutex_ held
++  void GpActivate();
++  void GpBack();
++  void EndGamerProfile();
++  bool ComposeGamerProfilePage(Page page, float ppu, Pixels& out);
++  void DrawPictureInto(Pixels& out, const Pixels& picture, float x, float y,
++                       float w, float h, float ppu);
++  const Pixels* GamerPicture(int number);  // gamerpics 64x64, cached
+   // hudbkgnd's own moving pieces (the frame's base and blade, the ring of
+   // light), placed by their keyframes at the HUD's current frame.
+   struct HudKey {
+diff --git a/src/xenia/kernel/xam/xam_ui.cc b/src/xenia/kernel/xam/xam_ui.cc
+index 22795dc91..6048d5ac9 100644
+--- a/src/xenia/kernel/xam/xam_ui.cc
++++ b/src/xenia/kernel/xam/xam_ui.cc
+@@ -446,6 +446,7 @@ DECLARE_XAM_EXPORT2(XamIsUIActive, kUI, kImplemented, kHighFrequency);
+ 
+ std::function<bool()> live_upsell_ui_hook;
+ std::function<bool(uint32_t user_index)> create_profile_ui_hook;
++std::function<bool(uint32_t user_index)> gamer_card_ui_hook;
+ std::function<bool(const TitleMessageBox&, std::function<void(int)>)>
+     title_message_box_hook;
+ 
+@@ -1104,6 +1105,11 @@ dword_result_t XamShowGamerCardUI_entry(dword_t user_index) {
+   if (!user) {
+     return X_ERROR_ACCESS_DENIED;
+   }
++  // xam 818EDE40: message 0x21008 to the system UI, gamerprofile.xex with
++  // mode 0 (your own gamer card): its screens in the Guide.
++  if (gamer_card_ui_hook && gamer_card_ui_hook(user_index)) {
++    return X_ERROR_SUCCESS;
++  }
+ 
+   xe::ui::ImGuiDrawer* imgui_drawer =
+       kernel_state()->emulator()->imgui_drawer();
+diff --git a/src/xenia/kernel/xam/xam_ui.h b/src/xenia/kernel/xam/xam_ui.h
+index f1a86809b..c319697bd 100644
+--- a/src/xenia/kernel/xam/xam_ui.h
++++ b/src/xenia/kernel/xam/xam_ui.h
+@@ -26,6 +26,8 @@ extern std::function<bool()> live_upsell_ui_hook;
+ // has it (the Blades Guide overlay); returns whether it did.
+ // XamShowCreateProfileUI(Ex) with the controller that asked
+ extern std::function<bool(uint32_t user_index)> create_profile_ui_hook;
++// XamShowGamerCardUI: gamerprofile.xex's own gamer card and its screens
++extern std::function<bool(uint32_t user_index)> gamer_card_ui_hook;
+ // XamWriteGamerTile's work: a gamer picture (title, big and small tile id,
+ // e.g. FFFE07D1 / 0002000N / 0001000N) into the profile.
+ X_RESULT WriteGamerPicture(uint64_t xuid, uint32_t title_id, uint32_t big_id,
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
+index 7b323992c..746203864 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
+@@ -60,6 +60,11 @@ DEFINE_uint32(retail_flags, 0x40,
+               "(createprofile asks once before joining).",
+               "XConfig");
+ 
++DEFINE_uint64(default_profile_xuid, 0,
++              "XCONFIG_USER_DEFAULT_PROFILE: the profile set for Auto Sign-In "
++              "(gamerprofile's Enable / Disable Auto Sign-In), 0 = none.",
++              "XConfig");
++
+ DECLARE_bool(widescreen);
+ DECLARE_bool(use_50Hz_mode);
+ DECLARE_int32(video_standard);
+@@ -140,6 +145,10 @@ X_STATUS xeExGetXConfigSetting(X_CONFIG_CATEGORY category, uint16_t setting,
+           setting_size = 4;
+           xe::store_and_swap<uint32_t>(value, cvars::retail_flags);
+           break;
++        case XCONFIG_USER_DEFAULT_PROFILE:
++          setting_size = 8;
++          xe::store_and_swap<uint64_t>(value, cvars::default_profile_xuid);
++          break;
+         case XCONFIG_USER_COUNTRY:
+           setting_size = 1;
+           value[0] = static_cast<uint8_t>(cvars::user_country);
+@@ -350,10 +359,23 @@ dword_result_t ExSetXConfigSetting_entry(word_t category, word_t setting,
+       setting == XCONFIG_USER_RETAIL_FLAGS && buffer_ptr && buffer_size >= 4) {
+     SetRetailFlags(xe::load_and_swap<uint32_t>(buffer_ptr));
+   }
++  if (category == XCONFIG_USER_CATEGORY &&
++      setting == XCONFIG_USER_DEFAULT_PROFILE && buffer_ptr &&
++      buffer_size >= 8) {
++    SetDefaultProfile(xe::load_and_swap<uint64_t>(buffer_ptr));
++  }
+   return X_STATUS_SUCCESS;
+ }
+ DECLARE_XBOXKRNL_EXPORT1(ExSetXConfigSetting, kModules, kStub);
+ 
++void SetDefaultProfile(uint64_t xuid) {
++  if (cvars::default_profile_xuid == xuid) {
++    return;
++  }
++  OVERRIDE_uint64(default_profile_xuid, xuid);
++  config::SaveConfig();
++}
++
+ void SetRetailFlags(uint32_t flags) {
+   if (cvars::retail_flags == flags) {
+     return;
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h
+index 6b52f45c1..60d45187a 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h
+@@ -390,6 +390,8 @@ enum X_KEYBOARD_LAYOUT : uint16_t {
+ 
+ // XCONFIG_USER_RETAIL_FLAGS as ExSetXConfigSetting writes it (saved).
+ void SetRetailFlags(uint32_t flags);
++// XCONFIG_USER_DEFAULT_PROFILE (Auto Sign-In), saved.
++void SetDefaultProfile(uint64_t xuid);
+ 
+ }  // namespace xboxkrnl
+ }  // namespace kernel
+-- 
+2.55.0.windows.3
+

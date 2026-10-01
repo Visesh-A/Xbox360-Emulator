@@ -1,0 +1,162 @@
+From 85d6830a07fb5815a61fc0e83f3f05f28989d2ab Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 22:15:00 +0530
+Subject: [PATCH 40/51] Auto Sign-In: keep default_profile_xuid as a hex string
+
+It was a uint64 cvar, saved as a decimal TOML integer. Profile XUIDs
+(E0...) are past INT64_MAX, so once Auto Sign-In was enabled the config
+no longer parsed on the next start. It is now a string like
+logged_profile_slot_N_xuid ("" = none); xboxkrnl::DefaultProfile() reads
+it.
+
+Tested: Enable Auto Sign-In writes "E0300000262BC7DB", power-on signs that
+profile in, and deleting it in Memory clears the setting to "".
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/xenia/app/guide_overlay.cc                |  8 +++---
+ src/xenia/kernel/xam/profile_manager.cc       |  5 ++--
+ src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc | 25 ++++++++++++++-----
+ src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h  |  3 ++-
+ 4 files changed, 27 insertions(+), 14 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 35b695315..1fae4cfd4 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -51,7 +51,6 @@
+ DECLARE_bool(blades_guide);
+ DECLARE_bool(dashboard_handoff);
+ DECLARE_uint32(retail_flags);
+-DECLARE_uint64(default_profile_xuid);
+ DECLARE_int32(draw_resolution_scale_y);
+ DEFINE_string(blades_guide_test, "",
+               "Debug: open the Guide by itself, \"<delay ms>[,<menu item 0-4>"
+@@ -3662,7 +3661,7 @@ void GuideOverlay::GpActivate() {
+     } else if (focus == "autoSignInButton") {
+       // 9010C9E0: Auto Sign-In on for this profile, or off (XConfig user
+       // setting 8 = the profile's XUID, or 0)
+-      uint64_t xuid = cvars::default_profile_xuid == gp_xuid_ ? 0 : gp_xuid_;
++      uint64_t xuid = kernel::xboxkrnl::DefaultProfile() == gp_xuid_ ? 0 : gp_xuid_;
+       kernel::xboxkrnl::SetDefaultProfile(xuid);
+       XELOGI("Guide: auto sign-in {:016X}", xuid);
+       ++page_version_;
+@@ -3890,8 +3889,9 @@ bool GuideOverlay::ComposeGamerProfilePage(Page page, float ppu, Pixels& out) {
+   text("achievements", xe::to_utf16(std::to_string(achievements)));
+   text("ext_title", last_title);
+   text("autosignin",
+-       gp_strings_[cvars::default_profile_xuid == xuid && xuid ? "disable"
+-                                                                : "enable"]);
++       gp_strings_[kernel::xboxkrnl::DefaultProfile() == xuid && xuid
++                       ? "disable"
++                       : "enable"]);
+   // the card's picture: on Change Gamer Picture the focused item's (its
+   // focus change sets it on the card, 901056C8), else the profile's own
+   const Pixels* picture = own_picture.rgba.empty() ? nullptr : &own_picture;
+diff --git a/src/xenia/kernel/xam/profile_manager.cc b/src/xenia/kernel/xam/profile_manager.cc
+index 60dbf9c0a..e0d33b0e5 100644
+--- a/src/xenia/kernel/xam/profile_manager.cc
++++ b/src/xenia/kernel/xam/profile_manager.cc
+@@ -25,7 +25,6 @@ DEFINE_bool(power_on, false,
+             "Auto Sign-In profile signs in.",
+             "Profiles");
+ DECLARE_uint32(retail_flags);
+-DECLARE_uint64(default_profile_xuid);
+ 
+ DEFINE_string(logged_profile_slot_0_xuid, "",
+               "XUID of the profile to load on boot in slot 0", "Profiles");
+@@ -122,7 +121,7 @@ ProfileManager::ProfileManager(KernelState* kernel_state,
+     for (uint8_t slot = 0; slot < XUserMaxUserCount; ++slot) {
+       UpdateConfig(0, slot);
+     }
+-    const uint64_t xuid = cvars::default_profile_xuid;
++    const uint64_t xuid = xboxkrnl::DefaultProfile();
+     if ((cvars::retail_flags & 0x40) && xuid && accounts_.count(xuid) &&
+         !(accounts_[xuid].GetReservedFlags() &
+           X_XAMACCOUNTINFO::AccountReservedFlags::kRecovering)) {
+@@ -605,7 +604,7 @@ void ProfileManager::UpdateConfig(const uint64_t xuid, const uint8_t slot) {
+ 
+ // xam 818EA210: a deleted profile is no longer the Auto Sign-In one.
+ void ProfileManager::ClearDefaultProfile(const uint64_t xuid) {
+-  if (xuid && cvars::default_profile_xuid == xuid) {
++  if (xuid && xboxkrnl::DefaultProfile() == xuid) {
+     xboxkrnl::SetDefaultProfile(0);
+   }
+ }
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
+index 746203864..2797cb4d5 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h"
+ #include "xenia/base/logging.h"
++#include "xenia/base/string_util.h"
+ #include "xenia/config.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/util/shim_utils.h"
+@@ -60,9 +61,12 @@ DEFINE_uint32(retail_flags, 0x40,
+               "(createprofile asks once before joining).",
+               "XConfig");
+ 
+-DEFINE_uint64(default_profile_xuid, 0,
+-              "XCONFIG_USER_DEFAULT_PROFILE: the profile set for Auto Sign-In "
+-              "(gamerprofile's Enable / Disable Auto Sign-In), 0 = none.",
++// A string (hex), as logged_profile_slot_N_xuid: XUIDs (E0...) are past
++// what a TOML integer holds.
++DEFINE_string(default_profile_xuid, "",
++              "XCONFIG_USER_DEFAULT_PROFILE: the profile (XUID) set for Auto "
++              "Sign-In (gamerprofile's Enable / Disable Auto Sign-In), empty = "
++              "none.",
+               "XConfig");
+ 
+ DECLARE_bool(widescreen);
+@@ -147,7 +151,7 @@ X_STATUS xeExGetXConfigSetting(X_CONFIG_CATEGORY category, uint16_t setting,
+           break;
+         case XCONFIG_USER_DEFAULT_PROFILE:
+           setting_size = 8;
+-          xe::store_and_swap<uint64_t>(value, cvars::default_profile_xuid);
++          xe::store_and_swap<uint64_t>(value, DefaultProfile());
+           break;
+         case XCONFIG_USER_COUNTRY:
+           setting_size = 1;
+@@ -368,11 +372,20 @@ dword_result_t ExSetXConfigSetting_entry(word_t category, word_t setting,
+ }
+ DECLARE_XBOXKRNL_EXPORT1(ExSetXConfigSetting, kModules, kStub);
+ 
++uint64_t DefaultProfile() {
++  if (cvars::default_profile_xuid.empty()) {
++    return 0;
++  }
++  return xe::string_util::from_string<uint64_t>(cvars::default_profile_xuid,
++                                                true);
++}
++
+ void SetDefaultProfile(uint64_t xuid) {
+-  if (cvars::default_profile_xuid == xuid) {
++  if (DefaultProfile() == xuid) {
+     return;
+   }
+-  OVERRIDE_uint64(default_profile_xuid, xuid);
++  OVERRIDE_string(default_profile_xuid,
++                  xuid ? fmt::format("{:016X}", xuid) : std::string());
+   config::SaveConfig();
+ }
+ 
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h
+index 60d45187a..637fc605d 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h
+@@ -390,7 +390,8 @@ enum X_KEYBOARD_LAYOUT : uint16_t {
+ 
+ // XCONFIG_USER_RETAIL_FLAGS as ExSetXConfigSetting writes it (saved).
+ void SetRetailFlags(uint32_t flags);
+-// XCONFIG_USER_DEFAULT_PROFILE (Auto Sign-In), saved.
++// XCONFIG_USER_DEFAULT_PROFILE (Auto Sign-In), saved; 0 = none.
++uint64_t DefaultProfile();
+ void SetDefaultProfile(uint64_t xuid);
+ 
+ }  // namespace xboxkrnl
+-- 
+2.55.0.windows.3
+

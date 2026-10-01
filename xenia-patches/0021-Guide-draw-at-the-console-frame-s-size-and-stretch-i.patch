@@ -1,0 +1,101 @@
+From 25ee7e677d05173f7c54b3066135a09bd6de475d Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 09:01:08 +0530
+Subject: [PATCH 21/51] Guide: draw at the console frame's size and stretch it
+ like the dashboard
+
+The Guide was drawn at the window's full resolution, sharper and thinner
+than the dashboard, which Xenia renders at 1280x720 (x resolution scale)
+and stretches to the window. Its images are now prepared for that frame
+and drawn scaled by the same factor with linear filtering.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 34 +++++++++++++++++++++-------------
+ 1 file changed, 21 insertions(+), 13 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 4994dbbcc..972f5faf3 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -46,6 +46,7 @@
+ DECLARE_bool(blades_guide);
+ DECLARE_bool(dashboard_handoff);
+ DECLARE_uint32(retail_flags);
++DECLARE_int32(draw_resolution_scale_y);
+ DEFINE_string(blades_guide_test, "",
+               "Debug: open the Guide by itself, \"<delay ms>[,<menu item 0-4>"
+               "|exit|off[,yes]]\", for screenshots.",
+@@ -1125,12 +1126,19 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     clock_alpha = 0;
+   }
+ 
+-  // The 1120x770 Guide canvas is scaled to the screen height and placed where
+-  // the console puts it (layout offset, measured on real footage). Whole
+-  // pixels, so the resampled images stay one texel per pixel.
+-  const float k = display_h / l.canvas_h;
+-  display_h_ = display_h;
++  // The 1120x770 Guide canvas is drawn into the console's frame (720 lines
++  // for the 720p output, times Xenia's resolution scale) where the console
++  // puts it (layout offset, measured on real footage), in whole frame pixels
++  // so the resampled images stay one texel per pixel. Xenia shows that frame
++  // stretched to the window, so the Guide is stretched by the same factor
++  // (`up`) instead of being drawn sharper than the dashboard around it.
++  const float frame_h = std::min(
++      display_h, 720.0f * float(std::max(1, cvars::draw_resolution_scale_y)));
++  const float k = frame_h / l.canvas_h;
++  const float up = display_h / frame_h;
++  display_h_ = frame_h;
+   const float ox = std::round(l.offset_x * k), oy = std::round(l.offset_y * k);
++  auto V = [up](float x, float y) { return ImVec2(x * up, y * up); };
+   ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+   bool test_backdrop =
+       cvars::blades_guide_test.find("black") != std::string::npos;
+@@ -1155,7 +1163,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       float w = exact ? float(image->width) : image->units_w * k;
+       float h = exact ? float(image->height) : image->units_h * k;
+       draw_list->AddImage(reinterpret_cast<ImTextureID>(image->texture.get()),
+-                          ImVec2(ox + x * k, oy), ImVec2(ox + x * k + w, oy + h),
++                          V(ox + x * k, oy), V(ox + x * k + w, oy + h),
+                           ImVec2(0, 0), ImVec2(1, 1),
+                           IM_COL32(255, 255, 255, int(alpha * 255.0f + 0.5f)));
+     }
+@@ -1251,8 +1259,8 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+         float bx = l.battery_menu_x, by = l.battery_menu_y;
+         draw_list->AddImage(
+             reinterpret_cast<ImTextureID>(icon->texture.get()),
+-            ImVec2(ox + bx * k, oy + by * k),
+-            ImVec2(ox + (bx + l.battery_size) * k, oy + (by + l.battery_size) * k),
++            V(ox + bx * k, oy + by * k),
++            V(ox + (bx + l.battery_size) * k, oy + (by + l.battery_size) * k),
+             ImVec2(0, 0), ImVec2(1, 1),
+             IM_COL32(255, 255, 255, int(content_alpha * 255.0f + 0.5f)));
+       }
+@@ -1301,8 +1309,8 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       float y = kbd_edit_.y + kbd_caret_[1];
+       draw_list->AddImage(
+           reinterpret_cast<ImTextureID>(caret.texture.get()),
+-          ImVec2(ox + x * k, oy + y * k),
+-          ImVec2(ox + x * k + caret.width, oy + y * k + caret.height));
++          V(ox + x * k, oy + y * k),
++          V(ox + x * k + caret.width, oy + y * k + caret.height));
+     }
+   }
+ 
+@@ -1347,9 +1355,9 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       float cx = pen - l.clock_pad;
+       float cy = baseline - (l.clock_pad + l.clock_ascent);
+       draw_list->AddImage(reinterpret_cast<ImTextureID>(atlas.texture.get()),
+-                          ImVec2(ox + cx * k, oy + cy * k),
+-                          ImVec2(ox + (cx + l.clock_cell) * k,
+-                                 oy + (cy + cell_h) * k),
++                          V(ox + cx * k, oy + cy * k),
++                          V(ox + (cx + l.clock_cell) * k,
++                            oy + (cy + cell_h) * k),
+                           ImVec2(u0, 0), ImVec2(u1, cell_h / atlas.units_h),
+                           tint);
+       pen += l.clock_advance.at(*c);
+-- 
+2.55.0.windows.3
+

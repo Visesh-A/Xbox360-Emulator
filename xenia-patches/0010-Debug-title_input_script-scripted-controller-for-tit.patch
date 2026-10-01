@@ -1,0 +1,220 @@
+From d75b271d8a086b07846fd6267befbc0967934901 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 15:14:42 +0530
+Subject: [PATCH 10/51] Debug: --title_input_script scripted controller for
+ titles
+
+Presses for player 1 ("down,a,wait2000,b,...") as button state and as
+VK_PAD keystrokes (XUI titles like the dashboard read keystrokes), each
+logged with the wall-clock time, for testing without a controller.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/kernel/xam/xam_input.cc | 165 ++++++++++++++++++++++++++++++
+ 1 file changed, 165 insertions(+)
+
+diff --git a/src/xenia/kernel/xam/xam_input.cc b/src/xenia/kernel/xam/xam_input.cc
+index faa799a3d..1be291290 100644
+--- a/src/xenia/kernel/xam/xam_input.cc
++++ b/src/xenia/kernel/xam/xam_input.cc
+@@ -7,6 +7,13 @@
+  ******************************************************************************
+  */
+ 
++#include <chrono>
++#include <map>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <vector>
++
+ #include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/emulator.h"
+@@ -23,10 +30,136 @@ DEFINE_bool(blades_guide, false,
+             "then not passed to titles.",
+             "HID");
+ 
++DEFINE_string(title_input_script, "",
++              "Debug: controller presses for player 1, for testing titles "
++              "without a controller: \"<button>[*hold ms],wait<ms>,...\" from "
++              "the title's first input poll; buttons a b x y up down left right "
++              "lb rb lt rt start back, one every 1.5 s. Each press is logged "
++              "with the wall-clock time.",
++              "HID");
++
+ namespace xe {
+ namespace kernel {
+ namespace xam {
+ 
++namespace {
++struct ScriptedPress {
++  std::chrono::steady_clock::time_point down, up;
++  uint16_t buttons;
++  bool left_trigger, right_trigger;
++  std::string name;
++  bool logged;
++  uint16_t virtual_key;  // VK_PAD_* for XUI titles, which read keystrokes
++  int keystrokes_sent;   // 0 none, 1 key down, 2 key down + up
++};
++std::mutex script_mutex;
++std::vector<ScriptedPress> script;
++bool script_started = false;
++uint32_t script_packet = 0;
++
++// Player 1's scripted buttons now (starts the script on the first call).
++uint16_t ScriptedButtons(bool& left_trigger, bool& right_trigger) {
++  using namespace std::chrono;
++  std::lock_guard<std::mutex> lock(script_mutex);
++  auto now = steady_clock::now();
++  if (!script_started) {
++    script_started = true;
++    static const std::map<std::string, uint16_t> keys = {
++        {"a", 0x5800},     {"b", 0x5801},    {"x", 0x5802},    {"y", 0x5803},
++        {"rb", 0x5804},    {"lb", 0x5805},   {"lt", 0x5806},   {"rt", 0x5807},
++        {"up", 0x5810},    {"down", 0x5811}, {"left", 0x5812}, {"right", 0x5813},
++        {"start", 0x5814}, {"back", 0x5815}};
++    static const std::map<std::string, uint16_t> names = {
++        {"a", hid::X_INPUT_GAMEPAD_A},
++        {"b", hid::X_INPUT_GAMEPAD_B},
++        {"x", hid::X_INPUT_GAMEPAD_X},
++        {"y", hid::X_INPUT_GAMEPAD_Y},
++        {"up", hid::X_INPUT_GAMEPAD_DPAD_UP},
++        {"down", hid::X_INPUT_GAMEPAD_DPAD_DOWN},
++        {"left", hid::X_INPUT_GAMEPAD_DPAD_LEFT},
++        {"right", hid::X_INPUT_GAMEPAD_DPAD_RIGHT},
++        {"lb", hid::X_INPUT_GAMEPAD_LEFT_SHOULDER},
++        {"rb", hid::X_INPUT_GAMEPAD_RIGHT_SHOULDER},
++        {"start", hid::X_INPUT_GAMEPAD_START},
++        {"back", hid::X_INPUT_GAMEPAD_BACK},
++        {"lt", 0},
++        {"rt", 0}};
++    auto at = now;
++    std::stringstream spec(cvars::title_input_script);
++    for (std::string token; std::getline(spec, token, ',');) {
++      if (token.rfind("wait", 0) == 0) {
++        at += milliseconds(std::atoi(token.c_str() + 4));
++        continue;
++      }
++      size_t star = token.find('*');
++      std::string name = token.substr(0, star);
++      auto it = names.find(name);
++      if (it == names.end()) {
++        XELOGE("Input script: unknown button {}", name);
++        continue;
++      }
++      int hold = star == std::string::npos ? 120 : std::atoi(token.c_str() + star + 1);
++      script.push_back({at, at + milliseconds(hold), it->second, name == "lt",
++                        name == "rt", name, false, keys.at(name), 0});
++      at += milliseconds(hold) + milliseconds(1500);
++    }
++    XELOGI("Input script: started with {} presses at {} ms", script.size(),
++           duration_cast<milliseconds>(system_clock::now().time_since_epoch())
++               .count());
++  }
++  uint16_t buttons = 0;
++  for (auto& press : script) {
++    if (now >= press.down && now < press.up) {
++      buttons |= press.buttons;
++      left_trigger |= press.left_trigger;
++      right_trigger |= press.right_trigger;
++      if (!press.logged) {
++        press.logged = true;
++        XELOGI("Input script: {} at {} ms", press.name,
++               duration_cast<milliseconds>(
++                   system_clock::now().time_since_epoch())
++                   .count());
++      }
++    }
++  }
++  return buttons;
++}
++
++// Next due keystroke event of the script (key down at the press, key up at
++// its release), if any.
++bool ScriptedKeystroke(hid::X_INPUT_KEYSTROKE* out) {
++  bool lt, rt;
++  ScriptedButtons(lt, rt);  // starts the script, logs presses
++  std::lock_guard<std::mutex> lock(script_mutex);
++  auto now = std::chrono::steady_clock::now();
++  for (auto& press : script) {
++    if (press.keystrokes_sent == 0 && now >= press.down) {
++      press.keystrokes_sent = 1;
++      out->virtual_key = press.virtual_key;
++      out->flags = hid::X_INPUT_KEYSTROKE_KEYDOWN;
++    } else if (press.keystrokes_sent == 1 && now >= press.up) {
++      press.keystrokes_sent = 2;
++      out->virtual_key = press.virtual_key;
++      out->flags = hid::X_INPUT_KEYSTROKE_KEYUP;
++    } else {
++      continue;
++    }
++    out->unicode = 0;
++    out->user_index = 0;
++    out->hid_code = 0;
++    if (!press.logged) {
++      press.logged = true;
++      XELOGI("Input script: {} at {} ms", press.name,
++             std::chrono::duration_cast<std::chrono::milliseconds>(
++                 std::chrono::system_clock::now().time_since_epoch())
++                 .count());
++    }
++    return true;
++  }
++  return false;
++}
++}  // namespace
++
+ using xe::hid::X_INPUT_CAPABILITIES;
+ using xe::hid::X_INPUT_FLAG;
+ using xe::hid::X_INPUT_KEYSTROKE;
+@@ -137,6 +270,30 @@ dword_result_t XamInputGetState_entry(dword_t user_index, dword_t flags,
+         input_state);
+   }
+ 
++  if (input_state && actual_user_index == 0 &&
++      !cvars::title_input_script.empty()) {
++    bool lt = false, rt = false;
++    uint16_t buttons = ScriptedButtons(lt, rt);
++    if (result != X_ERROR_SUCCESS) {
++      memset((void*)input_state.host_address(), 0, sizeof(X_INPUT_STATE));
++      result = X_ERROR_SUCCESS;
++    }
++    uint16_t merged = uint16_t(input_state->gamepad.buttons | buttons);
++    if (merged != input_state->gamepad.buttons || lt || rt) {
++      input_state->gamepad.buttons = merged;
++      if (lt) input_state->gamepad.left_trigger = 0xFF;
++      if (rt) input_state->gamepad.right_trigger = 0xFF;
++    }
++    // Titles only look at a state whose packet number changed.
++    static uint16_t last_scripted = 0;
++    if (buttons != last_scripted) {
++      last_scripted = buttons;
++      ++script_packet;
++    }
++    input_state->packet_number =
++        uint32_t(input_state->packet_number) + script_packet;
++  }
++
+   if (input_state && result == X_ERROR_SUCCESS) {
+     if (cvars::blades_guide) {
+       // The Guide button belongs to the Guide overlay.
+@@ -216,6 +373,14 @@ dword_result_t XamInputGetKeystrokeEx_entry(
+     user_index = 0;
+   }
+ 
++  if (!cvars::title_input_script.empty() &&
++      (user_index == 0 || (flags & X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER)) &&
++      ScriptedKeystroke(reinterpret_cast<hid::X_INPUT_KEYSTROKE*>(
++          keystroke.host_address()))) {
++    *user_index_ptr = 0;
++    return X_ERROR_SUCCESS;
++  }
++
+   if (flags & X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER) {
+     // That flag means we should iterate over every connected controller and
+     // check which one have pending request.
+-- 
+2.55.0.windows.3
+

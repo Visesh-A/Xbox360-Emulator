@@ -1,0 +1,225 @@
+From 14f79ab47ec3d2ca2b90139c8cb49492e216cab9 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 13:28:04 +0530
+Subject: [PATCH 44/51] Guide: Active Downloads; Notifications and presence as
+ xam keeps them
+
+Personal Settings > Active Downloads: XamShowMarketplaceUI(user, 0xA) (xam 818EE4D8, message 0x2100A) opens marketplace.xex's ActiveDownloads.xur without Xbox Live checks for this type (90107F34). With no background downloads (901133A0) its list hides, txtNoDownloads shows and LegendA is cleared; B returns to Options on Active Downloads.
+
+Notifications: XNotifyUISetOptions (818DA938) keeps show / sound in XCONFIG_USER_RETAIL_FLAGS bits 0x10 / 0x20 (set = off), read at start-up (818DACE8); the Guide now uses retail_flags instead of its own cvars. Online Status: the preset presence state is per sign-in slot (xam user table +0x198, 818E8EA0), 0 until set, which hud shows as no radio selected.
+
+dump_patched_system_modules also writes marketplace.xex.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/app/guide_options.cc | 54 ++++++++++++++++++++++------------
+ src/xenia/app/guide_overlay.cc |  7 ++++-
+ src/xenia/app/guide_overlay.h  |  7 +++--
+ src/xenia/emulator.cc          |  2 +-
+ 4 files changed, 47 insertions(+), 23 deletions(-)
+
+diff --git a/src/xenia/app/guide_options.cc b/src/xenia/app/guide_options.cc
+index 25a3a559f..ec581ebf5 100644
+--- a/src/xenia/app/guide_options.cc
++++ b/src/xenia/app/guide_options.cc
+@@ -25,18 +25,13 @@
+ #include "xenia/kernel/title_id_utils.h"
+ #include "xenia/kernel/xam/user_tracker.h"
+ #include "xenia/kernel/xam/xam_state.h"
++#include "xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h"
+ 
+-// XNotifyUIGetOptions / XNotifyUISetOptions (hud 9144A630 / 9144A4D0): kept
+-// in the config (where xam keeps them was not traced; see the verification
+-// list).
+-DEFINE_bool(notify_show, true,
+-            "Personal Settings > Notifications: Show Notifications "
+-            "(XNotifyUISetOptions).",
+-            "UI");
+-DEFINE_bool(notify_sound, true,
+-            "Personal Settings > Notifications: Play Sound "
+-            "(XNotifyUISetOptions).",
+-            "UI");
++// XNotifyUIGetOptions / XNotifyUISetOptions (hud 9144A630 / 9144A4D0; xam
++// 818DB188 / 818DB138 -> 818DA938) keep show / sound in
++// XCONFIG_USER_RETAIL_FLAGS: 0x10 set = notifications hidden, 0x20 set = no
++// sound (read at start-up, 818DACE8; both on when unset).
++DECLARE_uint32(retail_flags);
+ 
+ namespace xe {
+ namespace app {
+@@ -80,6 +75,8 @@ const char* GuideOverlay::OptKey(Page page) {
+       return "optonl";
+     case Page::kOptVoice:
+       return "optvoice";
++    case Page::kOptDl:
++      return "optdl";
+     default:
+       return nullptr;
+   }
+@@ -209,6 +206,7 @@ bool GuideOverlay::OptEnabled(const std::string& id) const {
+ // XUI's initial focus: the scene's DefaultFocus, or when that cannot take
+ // focus its first enabled child in the scene's order.
+ std::string GuideOverlay::OptFirstFocus(Page page) const {
++  if (page == Page::kOptDl) return "";  // lstDownloads, empty
+   const OptPage& p = opt_pages_.at(OptKey(page));
+   if (page != Page::kOpt || OptEnabled(p.default_focus)) return p.default_focus;
+   for (const auto& id : p.order) {
+@@ -227,7 +225,8 @@ bool GuideOverlay::ComposeOptionsPage(Page page, float ppu, Pixels& out) {
+   std::map<std::string, bool> enabled;
+   for (const auto& c : opt_pages_[key].ctrls) enabled[c.id] = OptEnabled(c.id);
+   lock.unlock();
+-  const bool show = cvars::notify_show, sound = cvars::notify_sound;
++  const bool show = !(cvars::retail_flags & 0x10),
++             sound = !(cvars::retail_flags & 0x20);
+   auto checked = [&](const std::string& id) {
+     if (id == "chkVibration") return vib;
+     if (id == "chkShow") return show;
+@@ -407,8 +406,16 @@ void GuideOverlay::OptActivate() {
+       ShowMessageBox(Page::kTurnOff);
+       return;
+     }
+-    // Themes (SkinSelect.xur) and Active Downloads (XamShowMarketplaceUI):
+-    // not built
++    if (focus == "btnDownloads") {
++      // 9144AB10: XamShowMarketplaceUI(user, 0xA) -> marketplace.xex's
++      // ActiveDownloads.xur (no Xbox Live check for this type, 90107F34);
++      // it comes back to Options on btnDownloads (91443470 state 0x11)
++      OptGoTo(Page::kOptDl);
++      lock.unlock();
++      PlaySfx("btn_Select");
++      return;
++    }
++    // Themes (SkinSelect.xur): not built
+     lock.unlock();
+     PlaySfx("btn_Select");
+     XELOGW("Guide: Personal Settings {} is not available", focus);
+@@ -427,16 +434,15 @@ void GuideOverlay::OptActivate() {
+   if (page == Page::kOptNot) {
+     // 9144A4D0: XNotifyUISetOptions(show, sound)
+     if (focus == "chkShow") {
+-      OVERRIDE_bool(notify_show, !cvars::notify_show);
++      kernel::xboxkrnl::SetRetailFlags(cvars::retail_flags ^ 0x10);
+     } else if (focus == "chkSound") {
+-      OVERRIDE_bool(notify_sound, !cvars::notify_sound);
++      kernel::xboxkrnl::SetRetailFlags(cvars::retail_flags ^ 0x20);
+     } else {
+       return;
+     }
+     ++page_version_;
+     lock.unlock();
+     PlaySfx("btn_Focus");
+-    config::SaveConfig();
+     return;
+   }
+   if (page == Page::kOptOnl) {
+@@ -446,7 +452,7 @@ void GuideOverlay::OptActivate() {
+       if (focus != kOnline[i]) continue;
+       // 9144A748: XamSetUserPresetPresenceState, then back to Options
+       opt_presence_ = i;
+-      opt_presence_by_user_[opt_user_] = i;
++      opt_presence_by_user_[opt_user_] = kPresence[i];
+       XELOGI("Guide: preset presence state {:X}", kPresence[i]);
+       ++page_version_;
+       OptNavigateBack();
+@@ -528,8 +534,18 @@ void GuideOverlay::OptLoadValues(Page page) {
+     }
+   } else if (page == Page::kOptOnl) {
+     // 9144A8B0: XamGetUserPresetPresenceState's state as the radio
++    // xam 818E8EA0: the sign-in slot's preset state, 0 until set (xam's user
++    // table +0x198; a Live logon clears it, 818EAD34). 0x4 Appear Offline;
++    // low bit with 0 / 0x10000 / 0x20000 Online / Away / Busy; else no
++    // radio is set.
+     auto it = opt_presence_by_user_.find(user_index);
+-    opt_presence_ = it != opt_presence_by_user_.end() ? it->second : 0;
++    const uint32_t s = it != opt_presence_by_user_.end() ? it->second : 0;
++    opt_presence_ = (s & 0x4)                            ? 3
++                    : !(s & 1)                           ? -1
++                    : (s & 0xF0000) == 0                 ? 0
++                    : (s & 0xF0000) == 0x10000           ? 1
++                    : (s & 0xF0000) == 0x20000           ? 2
++                                                         : -1;
+   }
+   ++page_version_;
+ }
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 6c3208cc5..090665fef 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -1319,7 +1319,8 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+     }
+   }
+   if (opt_ready_) {  // Options.xur's legends (all its scenes: Select, Back)
+-    for (const char* name : {"opt_legends_a", "opt_legends_b", "opt_legends_xy"}) {
++    for (const char* name : {"opt_legends_a", "opt_legends_b", "opt_legends_xy",
++                             "dl_legends_a", "dl_legends_b", "dl_legends_xy"}) {
+       names.push_back(name);
+     }
+   }
+@@ -1461,6 +1462,8 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kOptOnl:
+       case Page::kOptVoice:
+         return "opt";
++      case Page::kOptDl:
++        return "dl";
+       case Page::kAddXboxLive:
+         return "axl";
+       case Page::kGamerTag:
+@@ -1788,6 +1791,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kOptNot:
+       case Page::kOptOnl:
+       case Page::kOptVoice:
++      case Page::kOptDl:
+       case Page::kSignIn:
+       case Page::kKeyboard:
+       case Page::kSaveProfile:
+@@ -2454,6 +2458,7 @@ void GuideOverlay::PrepareCreateProfileImages(float ppu) {
+   }
+   if (opt_ready_) {
+     for (const auto& [key, page] : opt_pages_) names.push_back(key + "_base");
++    names.push_back("optdl_base");
+   }
+   for (const auto& [key, page] : gp_pages_) {
+     if (page.buttons.empty()) names.push_back(key);
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index a1d7b4467..8de0f6f2d 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -130,7 +130,10 @@ class GuideOverlay {
+     kOptVib,
+     kOptNot,
+     kOptOnl,
+-    kOptVoice
++    kOptVoice,
++    // marketplace.xex's ActiveDownloads.xur (Personal Settings > Active
++    // Downloads, XamShowMarketplaceUI type 0xA)
++    kOptDl
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+@@ -495,7 +498,7 @@ class GuideOverlay {
+   uint32_t opt_user_ = 0;
+   bool opt_vib_ = true, opt_mute_ = false;
+   int opt_presence_ = 0, opt_output_ = 1, opt_volume_ = 10;
+-  std::map<uint32_t, int> opt_presence_by_user_;
++  std::map<uint32_t, uint32_t> opt_presence_by_user_;  // preset states
+   // The scenes' trans_FadeOut (frames 0-15) / trans_FadeIn (25-40): the
+   // outgoing scene's image (the menu's, or the composed page kept as
+   // "opt_prev") fades out while the new one waits, then fades in.
+diff --git a/src/xenia/emulator.cc b/src/xenia/emulator.cc
+index ea5f1faac..cfa22fdf3 100644
+--- a/src/xenia/emulator.cc
++++ b/src/xenia/emulator.cc
+@@ -792,7 +792,7 @@ void Emulator::DumpPatchedSystemModules(const std::string& spec) {
+   };
+   for (const char* name :
+        {"hud", "huduiskin", "xam", "minimediaplayer", "signin", "createprofile",
+-        "vk", "gamerprofile", "dash"}) {
++        "vk", "gamerprofile", "marketplace", "dash"}) {
+     if (std::string(name) == "dash") {
+       // The running dashboard, already patched as the title's update.
+       if (auto exe = kernel_state_->GetExecutableModule()) {
+-- 
+2.55.0.windows.3
+

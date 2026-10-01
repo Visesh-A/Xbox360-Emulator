@@ -1,0 +1,341 @@
+From 75a6343272eab2c8e05c066e89a06cfeb82382b2 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 14:27:14 +0530
+Subject: [PATCH 28/51] Gamer pictures: XamReadTile buffer size,
+ XamWriteGamerTile, createprofile's pick
+
+- XamReadTile/Ex copied the whole picture into the caller's buffer
+  whatever its size; the 2858 dashboard first asks with a 0-byte buffer,
+  so a profile with a picture corrupted its heap and hung it. The size is
+  now respected (ERROR_INSUFFICIENT_BUFFER with the size, as xam passes the
+  buffer size with the request). XamReadTileEx takes its 9th argument, the
+  overlapped (xam 818C0640).
+- XamWriteGamerTile (a stub) now stores the picture's 64 and 32 pixel
+  images in the profile and its gamercard picture key; its arguments are
+  (user, title, big id, small id, 0, overlapped) as createprofile calls it.
+  The pictures are xam's own (shrdres 64_/32_fffe07d1...), in gamerpics\.
+- Create profile: Save Gamer Profile picks a picture as createprofile does
+  (RtlRandom(GetTickCount()) % 12, then + 1) and shows it on its gamercard;
+  AddXboxLive's Updating profile stores it (90103380 -> XamWriteGamerTile).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc   | 70 ++++++++++++++++++++++++
+ src/xenia/app/guide_overlay.h    |  6 ++
+ src/xenia/kernel/xam/xam_ui.h    |  4 ++
+ src/xenia/kernel/xam/xam_user.cc | 94 +++++++++++++++++++++++++++-----
+ 4 files changed, 160 insertions(+), 14 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 2a2e61ebd..4823e89a9 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -13,6 +13,7 @@
+ #include <cstdlib>
+ #include <ctime>
+ #include <fstream>
++#include <random>
+ #include <set>
+ #include <sstream>
+ #include <vector>
+@@ -2044,6 +2045,12 @@ void GuideOverlay::LoadCreateProfileLayout() {
+       save_buttons_.push_back(b);
+     } else if (kind == "default") {
+       save >> save_default_;
++    } else if (kind == "image") {
++      std::string name;
++      save >> name;
++      float r[4];
++      save >> r[0] >> r[1] >> r[2] >> r[3];
++      if (name == "tile") std::copy(r, r + 4, save_tile_);
+     } else {
+       std::string rest;
+       std::getline(save, rest);
+@@ -2312,6 +2319,12 @@ void GuideOverlay::KeyboardSubmit() {
+   }
+   kbd_text_ = name;
+   kbd_cursor_ = int(name.size());
++  // Congratulations (90103C50) picks the gamer picture as its scene starts:
++  // RtlRandom(GetTickCount()) % 12, picture n + 1 of FFFE07D1.
++  {
++    static std::mt19937 rng{std::random_device{}()};
++    save_picture_ = int(rng() % 12) + 1;
++  }
+   page_ = Page::kSaveProfile;
+   save_focus_ = save_default_;
+   ++page_version_;
+@@ -2471,9 +2484,18 @@ void GuideOverlay::AddXboxLiveStep(uint64_t run, int step) {
+     }
+     case 3: {  // "Updating profile" done: 901029F0 and the scene's end
+       std::string button;
++      int picture;
++      uint64_t xuid;
+       {
+         std::lock_guard<std::mutex> lock(mutex_);
+         button = axl_button_;
++        picture = save_picture_;
++        xuid = created_xuid_;
++      }
++      // 90103380: XamWriteGamerTile(user, FFFE07D1, big, small)
++      if (picture > 0 && xuid > 1) {
++        kernel::xam::WriteGamerPicture(xuid, 0xFFFE07D1, 0x20000 + picture,
++                                       0x10000 + picture);
+       }
+       if (button == "getLiveButton") {
+         JoinXboxLive(run);
+@@ -2804,12 +2826,59 @@ void GuideOverlay::DrawAddXboxLive(float k, float ox, float oy, float up,
+   }
+ }
+ 
++// Congratulations' gamerTileImage: the picture (xam's 64x64 PNG, read by
++// the scene with XamReadTile) drawn into its box.
++void GuideOverlay::DrawGamerPicture(Pixels& out, int picture, float ppu) {
++  if (picture <= 0 || save_tile_[2] <= 0) {
++    return;
++  }
++  auto it = gamer_pictures_.find(picture);
++  if (it == gamer_pictures_.end()) {
++    Pixels pixels;
++    auto path = xe::filesystem::GetExecutableFolder() / "gamerpics" /
++                fmt::format("64_fffe07d1{:08x}{:08x}.png", 0x20000 + picture,
++                            0x10000 + picture);
++    std::ifstream file(path, std::ios::binary);
++    std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
++                              std::istreambuf_iterator<char>());
++    int channels;
++    if (uint8_t* rgba = stbi_load_from_memory(
++            data.data(), int(data.size()), &pixels.width, &pixels.height,
++            &channels, STBI_rgb_alpha)) {
++      pixels.rgba.assign(rgba,
++                         rgba + size_t(pixels.width) * pixels.height * 4);
++      stbi_image_free(rgba);
++    }
++    it = gamer_pictures_.emplace(picture, std::move(pixels)).first;
++  }
++  if (it->second.rgba.empty()) {
++    return;
++  }
++  const int x0 = int(std::lround(save_tile_[0] * ppu));
++  const int y0 = int(std::lround(save_tile_[1] * ppu));
++  const int w = std::max(1, int(std::lround(save_tile_[2] * ppu)));
++  const int h = std::max(1, int(std::lround(save_tile_[3] * ppu)));
++  Pixels tile = Resample(it->second, w, h);
++  for (int y = 0; y < h; ++y) {
++    int oy = y0 + y;
++    if (oy < 0 || oy >= out.height) continue;
++    for (int x = 0; x < w; ++x) {
++      int ox = x0 + x;
++      if (ox < 0 || ox >= out.width) continue;
++      const uint8_t* p = &tile.rgba[(size_t(y) * w + x) * 4];
++      BlendPixel(&out.rgba[(size_t(oy) * out.width + ox) * 4], p[0] / 255.0f,
++                 p[1] / 255.0f, p[2] / 255.0f, p[3] / 255.0f);
++    }
++  }
++}
++
+ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+   std::unique_lock<std::mutex> lock(mutex_);
+   const Page page = page_;
+   const std::u16string text = kbd_text_;
+   const bool caps = kbd_caps_;
+   const bool highlight = kbd_default_active_;
++  const int picture = save_picture_;
+   const std::string focus = page == Page::kSaveProfile ? save_focus_ : kbd_focus_;
+   lock.unlock();
+   std::lock_guard<std::mutex> images_lock(prepare_mutex_);
+@@ -2825,6 +2894,7 @@ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+     if (it == scaled_.end()) return false;
+     out = it->second;
+     RenderText(out, save_gamertag_, text, ppu);
++    DrawGamerPicture(out, picture, ppu);
+     return true;
+   }
+   auto base = scaled_.find("kbd_base");
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 376eb22d9..ca539f1a2 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -336,6 +336,11 @@ class GuideOverlay {
+   std::u16string axl_status_;  // under mutex_
+   std::string axl_status_key_;  // which status (st_creating: B does nothing)
+   bool axl_signed_in_ = false;  // the new profile's sign-in went through
++  // The gamer picture Save Gamer Profile picked (1-12 of title FFFE07D1:
++  // big tile 0x0002000N, small 0x0001000N), 0 = none yet; under mutex_.
++  int save_picture_ = 0;
++  float save_tile_[4] = {};  // where Save Gamer Profile shows it (units)
++  std::map<int, Pixels> gamer_pictures_;  // 64x64, by number (UI thread)
+   std::chrono::steady_clock::time_point axl_start_;  // its wait cursor's t=0
+   MessageBoxItem axl_status_item_;
+   struct SpinFrame {
+@@ -385,6 +390,7 @@ class GuideOverlay {
+   float composed_ppu_ = 0;
+   void PrepareCreateProfileImages(float ppu);  // background
+   bool ComposeCreateProfilePage(float ppu, Pixels& out);
++  void DrawGamerPicture(Pixels& out, int picture, float ppu);
+   std::chrono::steady_clock::time_point caret_start_;
+ 
+   std::atomic<bool> running_{true};
+diff --git a/src/xenia/kernel/xam/xam_ui.h b/src/xenia/kernel/xam/xam_ui.h
+index e43455fda..f1a86809b 100644
+--- a/src/xenia/kernel/xam/xam_ui.h
++++ b/src/xenia/kernel/xam/xam_ui.h
+@@ -26,6 +26,10 @@ extern std::function<bool()> live_upsell_ui_hook;
+ // has it (the Blades Guide overlay); returns whether it did.
+ // XamShowCreateProfileUI(Ex) with the controller that asked
+ extern std::function<bool(uint32_t user_index)> create_profile_ui_hook;
++// XamWriteGamerTile's work: a gamer picture (title, big and small tile id,
++// e.g. FFFE07D1 / 0002000N / 0001000N) into the profile.
++X_RESULT WriteGamerPicture(uint64_t xuid, uint32_t title_id, uint32_t big_id,
++                           uint32_t small_id);
+ 
+ // A message box (XamShowMessageBoxUI) for the host to show as the console
+ // does (the Blades Guide overlay's ErrorHUD). The hook returns false if it
+diff --git a/src/xenia/kernel/xam/xam_user.cc b/src/xenia/kernel/xam/xam_user.cc
+index ecc9c202a..6d30f544b 100644
+--- a/src/xenia/kernel/xam/xam_user.cc
++++ b/src/xenia/kernel/xam/xam_user.cc
+@@ -9,6 +9,7 @@
+ 
+ #include <ranges>
+ 
++#include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/util/shim_utils.h"
+@@ -710,6 +711,9 @@ dword_result_t XamReadTile_entry(dword_t tile_type, dword_t title_id,
+     return X_ERROR_INVALID_PARAMETER;
+   }
+ 
++  // The caller's buffer size, as xam passes it with the request (it is read
++  // before the request runs).
++  const uint32_t capacity = *buffer_size_ptr;
+   auto run = [=](uint32_t& extended_error, uint32_t& length) {
+     std::span<const uint8_t> tile =
+         kernel_state()->xam_state()->user_tracker()->GetIcon(
+@@ -720,15 +724,15 @@ dword_result_t XamReadTile_entry(dword_t tile_type, dword_t title_id,
+ 
+     if (tile.empty()) {
+       result = X_ERROR_FILE_NOT_FOUND;
+-    }
+-
+-    *buffer_size_ptr = static_cast<uint32_t>(tile.size());
+-
+-    if (output_ptr) {
+-      memcpy(output_ptr, tile.data(), tile.size());
+-    } else {
++    } else if (!output_ptr || capacity < tile.size()) {
++      // never past the caller's buffer
+       result = X_ERROR_INSUFFICIENT_BUFFER;
++    } else {
++      memcpy(output_ptr, tile.data(), tile.size());
+     }
++    *buffer_size_ptr = static_cast<uint32_t>(tile.size());
++    XELOGD("XamReadTile: {} bytes (buffer {}) -> {:X}", tile.size(), capacity,
++           result);
+ 
+     extended_error = X_HRESULT_FROM_WIN32(result);
+     length = 0;
+@@ -745,13 +749,23 @@ dword_result_t XamReadTile_entry(dword_t tile_type, dword_t title_id,
+ }
+ DECLARE_XAM_EXPORT1(XamReadTile, kUserProfiles, kSketchy);
+ 
++// As xam 2858 (818C0640): (type, title, id, user index, r7, r8, buffer, size
++// pointer, overlapped) -- the 9th argument on the stack is the overlapped.
+ dword_result_t XamReadTileEx_entry(dword_t tile_type, dword_t game_id,
+                                    qword_t item_id, dword_t offset,
+                                    dword_t unk1, dword_t unk2,
+                                    lpdword_t output_ptr,
+-                                   lpdword_t buffer_size_ptr) {
++                                   lpdword_t buffer_size_ptr,
++                                   lpvoid_t overlapped_ptr) {
++  XELOGD(
++      "XamReadTileEx(type {}, title {:08X}, id {:016X}, user {}, {:08X}, "
++      "{:08X}, buf {:08X}, size {}, ovl {:08X})",
++      tile_type.value(), game_id.value(), item_id.value(), offset.value(),
++      unk1.value(), unk2.value(), output_ptr.guest_address(),
++      buffer_size_ptr ? uint32_t(*buffer_size_ptr) : 0xFFFFFFFFu,
++      overlapped_ptr.guest_address());
+   return XamReadTile_entry(tile_type, game_id, item_id, offset, output_ptr,
+-                           buffer_size_ptr, 0);
++                           buffer_size_ptr, overlapped_ptr);
+ }
+ DECLARE_XAM_EXPORT1(XamReadTileEx, kUserProfiles, kSketchy);
+ 
+@@ -881,16 +895,68 @@ dword_result_t XamReadTileToTexture_entry(dword_t tile_type, dword_t title_id,
+ }
+ DECLARE_XAM_EXPORT1(XamReadTileToTexture, kUserProfiles, kStub);
+ 
++X_RESULT WriteGamerPicture(uint64_t xuid, uint32_t title_id, uint32_t big_id,
++                           uint32_t small_id) {
++  auto user = kernel_state()->xam_state()->GetUserProfile(xuid);
++  if (!user) {
++    return X_ERROR_NO_SUCH_USER;
++  }
++  // The pictures as xam's resources hold them (shrdres
++  // 64_ / 32_<title><big id><small id>.png), copied to gamerpics\.
++  const std::string key =
++      fmt::format("{:08x}{:08x}{:08x}", title_id, big_id, small_id);
++  const auto folder = xe::filesystem::GetExecutableFolder() / "gamerpics";
++  auto read = [&](const char* size) {
++    std::vector<uint8_t> data;
++    FILE* file = xe::filesystem::OpenFile(
++        folder / fmt::format("{}_{}.png", size, key), "rb");
++    if (file) {
++      fseek(file, 0, SEEK_END);
++      data.resize(size_t(ftell(file)));
++      fseek(file, 0, SEEK_SET);
++      data.resize(fread(data.data(), 1, data.size(), file));
++      fclose(file);
++    }
++    return data;
++  };
++  const std::vector<uint8_t> tile_64 = read("64"), tile_32 = read("32");
++  if (tile_64.empty() || tile_32.empty()) {
++    XELOGW("WriteGamerPicture: no picture {}", key);
++    return X_ERROR_FILE_NOT_FOUND;
++  }
++  // (stored by size: tile_64.png / tile_32.png)
++  auto* tracker = kernel_state()->xam_state()->user_tracker();
++  tracker->UpdateUserIcon(xuid, tile_64);
++  tracker->UpdateUserIcon(xuid, tile_32);
++  // the gamercard's picture key, as the default one is kept
++  const UserSetting setting(
++      UserSettingId::XPROFILE_GAMERCARD_PICTURE_KEY,
++      xe::string_util::read_u16string_and_swap(
++          xe::to_utf16(fmt::format("{:08X}{:08X}{:08X}", title_id, big_id,
++                                   small_id))
++              .c_str()));
++  tracker->UpsertSetting(xuid, kDashboardID, &setting);
++  XELOGI("Gamer picture {} written for {:016X}", key, xuid);
++  return X_ERROR_SUCCESS;
++}
++
++// As createprofile calls it (90108970): (user index, title, big tile id,
++// small tile id, 0, overlapped); xam stores the picture's two sizes in the
++// profile and sets its gamercard picture key.
+ dword_result_t XamWriteGamerTile_entry(dword_t user_index, dword_t title_id,
+-                                       dword_t small_tile_id,
+-                                       dword_t big_tile_id, dword_t arg5,
++                                       dword_t big_tile_id,
++                                       dword_t small_tile_id, dword_t arg5,
+                                        dword_t overlapped_ptr) {
++  X_RESULT result = X_ERROR_NO_SUCH_USER;
++  if (auto user = kernel_state()->xam_state()->GetUserProfile(user_index)) {
++    result = WriteGamerPicture(user->xuid(), title_id, big_tile_id,
++                               small_tile_id);
++  }
+   if (overlapped_ptr) {
+-    kernel_state()->CompleteOverlappedImmediate(overlapped_ptr,
+-                                                X_ERROR_SUCCESS);
++    kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);
+     return X_ERROR_IO_PENDING;
+   }
+-  return X_ERROR_SUCCESS;
++  return result;
+ }
+ DECLARE_XAM_EXPORT1(XamWriteGamerTile, kUserProfiles, kStub);
+ 
+-- 
+2.55.0.windows.3
+

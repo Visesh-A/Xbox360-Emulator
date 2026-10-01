@@ -1,0 +1,60 @@
+From c381c07fc5e097d2e1ef2d85f6341c99ef9ac511 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 00:25:29 +0530
+Subject: [PATCH 04/51] Guide overlay: eased slide like hudbkgnd.xur
+
+The frame scene's slide keys use interpolation 2 (ease): EaseOut 100 when the
+Guide opens, EaseIn 100 when it closes. Approximated as quadratic.
+---
+ src/xenia/app/guide_overlay.cc | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 110e1bb01..22119d731 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -62,6 +62,10 @@ const char* const kMenuItems[] = {"btnSignIn", "btnNewProfile",
+ constexpr int kMenuCount = 5;
+ 
+ float Clamp01(float v) { return std::min(1.0f, std::max(0.0f, v)); }
++// XUI keyframe easing (Interpolation 2) at full strength, approximated as
++// quadratic: EaseIn = slow start, EaseOut = slow end.
++float EaseIn(float u) { return u * u; }
++float EaseOut(float u) { return 1.0f - (1.0f - u) * (1.0f - u); }
+ }  // namespace
+ 
+ // Lives while the Guide is on screen; the ImGui drawer calls OnDraw each frame.
+@@ -645,9 +649,10 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   bool content_visible = true;
+   switch (view.mode) {
+     case Mode::kOpening: {
+-      // hudbkgnd.xur ClosedToHalf: chrome slides in (frames 1-30) while the
+-      // content and legends are invisible, then they fade in (30-44).
+-      float slide = Clamp01(view.frames / l.slide_frames);
++      // hudbkgnd.xur ClosedToHalf: chrome slides in (frames 1-30, eased:
++      // EaseOut 100, fast start and settling into place) while the content
++      // and legends are invisible, then they fade in (30-44).
++      float slide = EaseOut(Clamp01(view.frames / l.slide_frames));
+       chrome_x = -l.slide * (1.0f - slide);
+       content_alpha = legend_alpha =
+           Clamp01((view.frames - l.slide_frames) / l.fade_frames);
+@@ -657,12 +662,13 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       break;
+     case Mode::kClosing: {
+       // HalfToClosed: the hosted scene hides at once, chrome and legends
+-      // slide back out.
+-      float slide = Clamp01(view.frames / l.slide_frames);
++      // slide back out (EaseIn 100: slow start, accelerating away).
++      float progress = Clamp01(view.frames / l.slide_frames);
++      float slide = EaseIn(progress);
+       chrome_x = -l.slide * slide;
+       legend_x = -kLegendSlide * slide;
+       content_visible = false;
+-      if (slide >= 1.0f) {
++      if (progress >= 1.0f) {
+         FinishClose();
+         return;
+       }
+-- 
+2.55.0.windows.3
+

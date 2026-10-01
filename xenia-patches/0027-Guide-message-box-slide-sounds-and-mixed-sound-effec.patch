@@ -1,0 +1,187 @@
+From c458e209638473796aaccf2fd7331c4ee6a21e5f Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 13:51:07 +0530
+Subject: [PATCH 27/51] Guide: message box slide sounds and mixed sound effects
+
+- hudbkgnd's GuideSound plays HUD_close as a Guide <-> message box slide
+  starts and HUD_open 30 frames later as its second half comes in
+  (HalfToError 299/329, ErrorToHalf 359/389, FullToError 419/449,
+  ErrorToFull 479/509). The Guide's own boxes and createprofile's boxes
+  played none of these; now they do. (Boxes opening from a closed Guide
+  already played HUD_open / HUD_close, as ClosedToError / ErrorToClosed.)
+- Sounds play on their own waveOut voices so they mix, as on the console:
+  PlaySound played one at a time, so HUD_close cut off the button sound.
+- In test runs (--blades_guide_test) each sound is logged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 92 +++++++++++++++++++++++++++++++---
+ src/xenia/app/guide_overlay.h  | 19 +++++++
+ 2 files changed, 105 insertions(+), 6 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index b72d9248a..2a2e61ebd 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -163,6 +163,10 @@ GuideOverlay::~GuideOverlay() {
+   if (schedule_thread_.joinable()) {
+     schedule_thread_.join();
+   }
++  {
++    std::lock_guard<std::mutex> lock(sfx_mutex_);
++    ReapSfxVoices(true);
++  }
+   if (scale_thread_.joinable()) {
+     scale_thread_.join();
+   }
+@@ -789,6 +793,7 @@ void GuideOverlay::ShowMessageBox(Page page) {
+   if (mode_ == Mode::kOpen) {
+     transition_ = Transition::kToError;
+     transition_start_ = Clock::now();
++    PlayBoxSlideSfx();  // HalfToError
+   } else {
+     // still sliding in: straight to the message box (ClosedToError)
+     mode_ = Mode::kOpening;
+@@ -798,10 +803,13 @@ void GuideOverlay::ShowMessageBox(Page page) {
+ }
+ 
+ void GuideOverlay::DismissMessageBox() {
+-  std::lock_guard<std::mutex> lock(mutex_);
+-  mode_ = Mode::kOpen;  // (if it was still sliding in)
+-  transition_ = Transition::kFromError;
+-  transition_start_ = Clock::now();
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    mode_ = Mode::kOpen;  // (if it was still sliding in)
++    transition_ = Transition::kFromError;
++    transition_start_ = Clock::now();
++  }
++  PlayBoxSlideSfx();  // ErrorToHalf / ErrorToFull
+ }
+ 
+ void GuideOverlay::HandOff(const std::string& request) {
+@@ -825,8 +833,79 @@ void GuideOverlay::HandOff(const std::string& request) {
+ }
+ 
+ void GuideOverlay::PlaySfx(const char* name) {
+-  auto path = asset_dir_ / (std::string(name) + ".wav");
+-  ::PlaySoundW(path.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
++  std::lock_guard<std::mutex> lock(sfx_mutex_);
++  ReapSfxVoices(false);
++  auto it = sfx_.find(name);
++  if (it == sfx_.end()) {
++    // RIFF WAVE: the "fmt " and "data" chunks
++    Sfx sfx;
++    std::ifstream file(asset_dir_ / (std::string(name) + ".wav"),
++                       std::ios::binary);
++    std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
++                              std::istreambuf_iterator<char>());
++    for (size_t at = 12; at + 8 <= data.size();) {
++      uint32_t size = data[at + 4] | data[at + 5] << 8 | data[at + 6] << 16 |
++                      uint32_t(data[at + 7]) << 24;
++      size_t body = at + 8;
++      if (body + size > data.size()) break;
++      if (!memcmp(&data[at], "fmt ", 4)) {
++        sfx.format.assign(sizeof(WAVEFORMATEX), 0);
++        memcpy(sfx.format.data(), &data[body],
++               std::min<size_t>(size, sizeof(WAVEFORMATEX)));
++        reinterpret_cast<WAVEFORMATEX*>(sfx.format.data())->cbSize = 0;
++      } else if (!memcmp(&data[at], "data", 4)) {
++        sfx.pcm.assign(data.begin() + body, data.begin() + body + size);
++      }
++      at = body + size + (size & 1);
++    }
++    it = sfx_.emplace(name, std::move(sfx)).first;
++  }
++  const Sfx& sfx = it->second;
++  if (sfx.format.empty() || sfx.pcm.empty()) {
++    return;
++  }
++  HWAVEOUT device = nullptr;
++  if (waveOutOpen(&device, WAVE_MAPPER,
++                  reinterpret_cast<const WAVEFORMATEX*>(sfx.format.data()), 0,
++                  0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
++    return;
++  }
++  SfxVoice voice{device, std::make_unique<uint8_t[]>(sizeof(WAVEHDR))};
++  auto* header = reinterpret_cast<WAVEHDR*>(voice.header.get());
++  memset(header, 0, sizeof(WAVEHDR));
++  header->lpData = reinterpret_cast<LPSTR>(const_cast<uint8_t*>(sfx.pcm.data()));
++  header->dwBufferLength = DWORD(sfx.pcm.size());
++  if (waveOutPrepareHeader(device, header, sizeof(WAVEHDR)) !=
++          MMSYSERR_NOERROR ||
++      waveOutWrite(device, header, sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
++    waveOutClose(device);
++    return;
++  }
++  sfx_voices_.push_back(std::move(voice));
++  if (!cvars::blades_guide_test.empty()) {
++    XELOGI("Guide: sound {} ({} playing)", name, sfx_voices_.size());
++  }
++}
++
++void GuideOverlay::ReapSfxVoices(bool all) {
++  for (auto it = sfx_voices_.begin(); it != sfx_voices_.end();) {
++    auto device = static_cast<HWAVEOUT>(it->device);
++    auto* header = reinterpret_cast<WAVEHDR*>(it->header.get());
++    if (!all && !(header->dwFlags & WHDR_DONE)) {
++      ++it;
++      continue;
++    }
++    waveOutReset(device);
++    waveOutUnprepareHeader(device, header, sizeof(WAVEHDR));
++    waveOutClose(device);
++    it = sfx_voices_.erase(it);
++  }
++}
++
++void GuideOverlay::PlayBoxSlideSfx() {
++  PlaySfx("HUD_close");
++  Schedule(Clock::now() + std::chrono::milliseconds(500),
++           [this]() { PlaySfx("HUD_open"); });
+ }
+ 
+ bool GuideOverlay::DashboardIsRunning() const {
+@@ -2290,6 +2369,7 @@ void GuideOverlay::ShowProfileBox(const kernel::xam::TitleMessageBox& box,
+   if (slide) {
+     transition_ = Transition::kToError;  // FullToError / HalfToError
+     transition_start_ = Clock::now();
++    PlayBoxSlideSfx();
+   }
+ }
+ 
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index f0981840a..376eb22d9 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -157,7 +157,26 @@ class GuideOverlay {
+   enum Direction { kUp, kDown, kLeft, kRight };
+   void Move(Direction direction);
+   void HandOff(const std::string& request);
++  // The Guide's sounds, each on its own output so they mix like the
++  // console's (a button's sound and the HUD's play together).
+   void PlaySfx(const char* name);
++  // hudbkgnd's GuideSound for a slide between the Guide and a message box:
++  // HUD_close as the first half leaves, HUD_open 30 frames later as the
++  // second half comes in (HalfToError 299/329, ErrorToHalf 359/389,
++  // FullToError 419/449, ErrorToFull 479/509).
++  void PlayBoxSlideSfx();
++  struct Sfx {
++    std::vector<uint8_t> format;  // WAVEFORMATEX bytes
++    std::vector<uint8_t> pcm;
++  };
++  std::map<std::string, Sfx> sfx_;
++  std::mutex sfx_mutex_;
++  struct SfxVoice {
++    void* device;                 // HWAVEOUT
++    std::unique_ptr<uint8_t[]> header;  // WAVEHDR
++  };
++  std::vector<SfxVoice> sfx_voices_;
++  void ReapSfxVoices(bool all);  // sfx_mutex_ held
+   bool DashboardIsRunning() const;
+   View Snapshot();
+   void FinishClose();  // closing animation ended (UI thread)
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,53 @@
+From dcb0b962b7eab7ae69780e0bc94176a85b2b2694 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 23:45:25 +0530
+Subject: [PATCH 42/51] Guide: prepare its images at start-up, not on first use
+
+The Guide's images (about 4 s) and the profile screens' (about 4 s) were
+made the first time each was needed, so the first Guide press held the
+animation and the first profile screen stayed blank for seconds. They are
+now made in the background when Xenia starts, for the console frame's
+size Draw uses (720 lines times the resolution scale). Tested: the first
+Guide press opens at once and the first Sign In list fades in with its
+normal transition.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TJbC5pRrQe1sZncuLBwzXN
+---
+ src/xenia/app/guide_overlay.cc | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 2310ff550..88546f26b 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -161,6 +161,26 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+       g.loaded = true;
+     }
+   }
++  // The images at the console frame's size (what Draw uses: 720 lines times
++  // the resolution scale), made now in the background so neither the first
++  // Guide press nor the first profile screen waits seconds for them (the
++  // console shows them at once). A shorter window prepares again on its own.
++  {
++    const float ppu =
++        720.0f * float(std::max(1, cvars::draw_resolution_scale_y)) /
++        layout_.canvas_h;
++    {
++      std::lock_guard<std::mutex> lock(prepare_mutex_);
++      prepare_for_ = ppu;
++      prepare_busy_ = true;
++      prepare_thread_ = std::thread([this, ppu]() { PrepareImages(ppu); });
++    }
++    if (create_profile_ready_) {
++      scaling_for_ = ppu;
++      scale_thread_ =
++          std::thread([this, ppu]() { PrepareCreateProfileImages(ppu); });
++    }
++  }
+   input_thread_ = std::thread([this]() { InputThread(); });
+   schedule_thread_ = std::thread([this]() { ScheduleThread(); });
+   kernel::xam::create_profile_ui_hook = [this](uint32_t user_index) {
+-- 
+2.55.0.windows.3
+

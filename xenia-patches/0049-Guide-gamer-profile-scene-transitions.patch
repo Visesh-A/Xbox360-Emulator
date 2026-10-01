@@ -1,0 +1,211 @@
+From 0becce95dbf57d35af7cc6eeb3abe7d7e7a30cfd Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 20:21:40 +0530
+Subject: [PATCH 49/51] Guide: gamer profile scene transitions
+
+gamerprofile.xex's scenes play the skin's transition visuals (TransFrom /
+trans_FadeOut 0-15, TransTo / trans_FadeIn 25-40) on forward and back
+navigation; 821 and 828 name none and change at once (xam 81930340: no
+visual and no named frames of their own). The outgoing scene is drawn
+over the new one with its arrows.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/app/guide_overlay.cc | 63 +++++++++++++++++++++++++++-------
+ src/xenia/app/guide_overlay.h  | 14 ++++++--
+ 2 files changed, 62 insertions(+), 15 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 96ee23e70..23c70cd07 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -1802,6 +1802,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   bool fading = false;
+   float fade_out = 0.0f, fade_in = 1.0f;
+   std::string fade_from;
++  Page fade_page = Page::kMenu;
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+     if (opt_fade_capture_) {
+@@ -1818,11 +1819,16 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+                       l.fps;
+       if (t >= 40.0f) {
+         opt_fading_ = false;
++        opt_fade_out_on_ = opt_fade_in_on_ = true;
++        opt_fade_page_ = Page::kMenu;
+       } else {
+         fading = true;
+-        fade_out = std::max(0.0f, 1.0f - t / 15.0f);
+-        fade_in = t < 25.0f ? 0.0f : (t - 25.0f) / 15.0f;
++        fade_out = opt_fade_out_on_ ? std::max(0.0f, 1.0f - t / 15.0f) : 0.0f;
++        fade_in = !opt_fade_in_on_ ? 1.0f
++                  : t < 25.0f      ? 0.0f
++                                   : (t - 25.0f) / 15.0f;
+         fade_from = opt_fade_from_;
++        fade_page = opt_fade_page_;
+       }
+     }
+   }
+@@ -1930,13 +1936,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     if (blade.show) layer("hud_blade", blade.x - 991.0f, 1.0f);
+   }
+   if (content_visible) {
+-    if (fading && fade_out > 0.0f && !fade_from.empty()) {
+-      layer(fade_from, 0.0f, content_alpha * fade_out);
+-      if (fade_from.rfind("menu", 0) == 0) {
+-        DrawMenuDynamic(k, ox, oy, up, content_alpha * fade_out,
+-                        view.signed_in);
+-      }
+-    }
++    const float scene_alpha = content_alpha;
+     if (fading) content_alpha *= fade_in;
+     if (page_ready) {
+       layer(content, 0.0f, content_alpha);
+@@ -1955,6 +1955,21 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     if (content == "axl_page" && page_ready && content_alpha > 0.0f) {
+       DrawAddXboxLive(k, ox, oy, up, content_alpha);
+     }
++    // The outgoing scene over the new one (they overlap only when the new
++    // scene has no transition of its own: shown at once, 821 / 828).
++    if (fading && fade_out > 0.0f && !fade_from.empty()) {
++      layer(fade_from, 0.0f, scene_alpha * fade_out);
++      if (fade_from.rfind("menu", 0) == 0) {
++        DrawMenuDynamic(k, ox, oy, up, scene_alpha * fade_out,
++                        view.signed_in);
++      }
++      // the outgoing scene's arrows go with it
++      if (fade_page == Page::kGpPrefCat || fade_page == Page::kGpPrefSet) {
++        DrawPrefs(k, ox, oy, up, scene_alpha * fade_out, fade_page);
++      } else if (fade_page == Page::kGpGames || fade_page == Page::kGpAchs) {
++        DrawViewGames(k, ox, oy, up, scene_alpha * fade_out, fade_page);
++      }
++    }
+ 
+     // A wireless controller's battery (part of the hosted scene, so it fades
+     // with it); none for a wired one, like the console.
+@@ -3688,8 +3703,27 @@ void GuideOverlay::EndGamerProfile() {
+   }).detach();
+ }
+ 
++void GuideOverlay::GpFade(Page from, Page to) {
++  // 821 (GameAchievStatsMe) and 828 (AchievDetails) name no transition
++  auto has = [](Page p) {
++    return p != Page::kGpAchs && p != Page::kGpAchDetail;
++  };
++  opt_fade_out_on_ = has(from);
++  opt_fade_in_on_ = has(to);
++  if (!opt_fade_out_on_ && !opt_fade_in_on_) {
++    opt_fading_ = false;
++    return;
++  }
++  opt_fade_from_ = "opt_prev";
++  opt_fade_capture_ = true;
++  opt_fade_page_ = from;
++  opt_fading_ = true;
++  opt_fade_start_ = Clock::now();
++}
++
+ void GuideOverlay::GpGoTo(Page page) {
+   // XuiSceneNavigateForward to another full-width scene: the frame stays.
++  GpFade(page_, page);
+   gp_back_.push_back({page_, gp_focus_});
+   page_ = page;
+   if (page == Page::kGpPics || page == Page::kGpPersonal) {
+@@ -3835,6 +3869,7 @@ void GuideOverlay::GpActivate() {
+       SetPref(*setting, pref_item_);
+     }
+     if (!gp_back_.empty()) {
++      GpFade(page_, gp_back_.back().first);
+       page_ = gp_back_.back().first;
+       gp_focus_ = gp_back_.back().second;
+       gp_back_.pop_back();
+@@ -3934,6 +3969,7 @@ void GuideOverlay::GpActivate() {
+     }
+     lock.lock();
+     if (!gp_back_.empty()) {
++      GpFade(page_, gp_back_.back().first);
+       page_ = gp_back_.back().first;
+       gp_focus_ = gp_back_.back().second;
+       gp_back_.pop_back();
+@@ -3946,6 +3982,7 @@ void GuideOverlay::GpBack() {
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+     if (!gp_back_.empty()) {
++      GpFade(page_, gp_back_.back().first);
+       page_ = gp_back_.back().first;
+       gp_focus_ = gp_back_.back().second;
+       gp_back_.pop_back();
+@@ -4299,9 +4336,9 @@ bool GuideOverlay::ComposePrefsPage(Page page, float ppu, Pixels& out) {
+ // where it can scroll (ScrollMore). Scrolling one way plays that end's
+ // Scrolling glow (xhade1: 0 at frame 4, 1 at 14, 0 at 25).
+ void GuideOverlay::DrawPrefs(float k, float ox, float oy, float up,
+-                             float alpha) {
++                             float alpha, std::optional<Page> as) {
+   std::unique_lock<std::mutex> lock(mutex_);
+-  const Page page = page_;
++  const Page page = as ? *as : page_;
+   const int cat = pref_cat_, row = pref_row_, top = pref_top_;
+   const auto focus_at = pref_focus_at_, scroll_at = pref_scroll_at_;
+   const int dir = pref_scroll_dir_;
+@@ -4681,9 +4718,9 @@ bool GuideOverlay::ComposeViewGamesPage(Page page, float ppu, Pixels& out) {
+ // The lists' scroll ends (ScrollMore where they can scroll; the Scrolling
+ // glow when they do).
+ void GuideOverlay::DrawViewGames(float k, float ox, float oy, float up,
+-                                 float alpha) {
++                                 float alpha, std::optional<Page> as) {
+   std::unique_lock<std::mutex> lock(mutex_);
+-  const Page page = page_;
++  const Page page = as ? *as : page_;
+   const bool games = page == Page::kGpGames;
+   const int count = games ? int(vg_titles_.size()) : int(vg_achs_.size());
+   const int top = games ? vg_game_top_ : vg_ach_top_;
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 9ecff69bd..ca6a40ebb 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -9,6 +9,7 @@
+ #ifndef XENIA_APP_GUIDE_OVERLAY_H_
+ #define XENIA_APP_GUIDE_OVERLAY_H_
+ 
++#include <optional>
+ #include <array>
+ #include <atomic>
+ #include <chrono>
+@@ -564,6 +565,13 @@ class GuideOverlay {
+   // outgoing scene's image (the menu's, or the composed page kept as
+   // "opt_prev") fades out while the new one waits, then fades in.
+   bool opt_fading_ = false, opt_fade_capture_ = false;
++  // which halves play: a scene without a transition (no TransFrom / TransTo
++  // visual and no named frames of its own) changes at once (xam 81930340)
++  bool opt_fade_out_on_ = true, opt_fade_in_on_ = true;
++  Page opt_fade_page_ = Page::kMenu;  // the outgoing scene
++  // gamerprofile.xex's scenes: the skin's transition visuals (TransFrom /
++  // trans_FadeOut 0-15, TransTo / trans_FadeIn 25-40); mutex_ held
++  void GpFade(Page from, Page to);
+   std::string opt_fade_from_;
+   std::chrono::steady_clock::time_point opt_fade_start_;
+   // where the Guide's own boxes (Exit, Turn Off) go back to
+@@ -600,7 +608,8 @@ class GuideOverlay {
+   int PrefIndex(const PrefSetting& setting) const;  // current value's index
+   void SetPref(const PrefSetting& setting, int index);
+   bool ComposePrefsPage(Page page, float ppu, Pixels& out);
+-  void DrawPrefs(float k, float ox, float oy, float up, float alpha);
++  void DrawPrefs(float k, float ox, float oy, float up, float alpha,
++                 std::optional<Page> as = std::nullopt);
+   // Under mutex_:
+   int pref_cat_ = 0, pref_row_ = 0, pref_item_ = 0, pref_top_ = 0;
+   std::chrono::steady_clock::time_point pref_focus_at_;   // 832 row focused
+@@ -632,7 +641,8 @@ class GuideOverlay {
+   void SortAchievements();  // mutex_ held
+   void GpY();
+   bool ComposeViewGamesPage(Page page, float ppu, Pixels& out);
+-  void DrawViewGames(float k, float ox, float oy, float up, float alpha);
++  void DrawViewGames(float k, float ox, float oy, float up, float alpha,
++                     std::optional<Page> as = std::nullopt);
+   const Pixels* VgPicture(const std::string& key,
+                           const std::vector<uint8_t>& png);
+   // Under mutex_:
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,302 @@
+From 28e9a0bbcb162c34fc804f1ab880daf4f377cb2e Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 19:04:09 +0530
+Subject: [PATCH 34/51] Guide: Profile Name (Edit Gamer Profile);
+ XamProfileRenameAccount
+
+Edit Gamer Profile's Profile Name (901066C0) opens vk's keyboard titled
+"Edit Profile Name" with the gamertag. Done: an unchanged name is accepted
+(90106750); otherwise 90115580 checks the text as typed with LiveProfile's
+messages. A failure shows XamShowMessageBox(the keyboard's title, the
+message, {OK}, error icon) and the keyboard again (90118DF0). Accepted:
+XamProfileRenameAccount (90107090) and back to Edit Gamer Profile. B
+returns without a change.
+
+XamProfileRenameAccount (xuid, gamertag) is implemented: the account's
+gamertag is saved in its Account file and a signed-in profile's copy is
+updated.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc          | 103 +++++++++++++++++++++++-
+ src/xenia/app/guide_overlay.h           |   4 +
+ src/xenia/kernel/xam/profile_manager.cc |  30 +++++++
+ src/xenia/kernel/xam/profile_manager.h  |   2 +
+ src/xenia/kernel/xam/user_profile.h     |   2 +
+ src/xenia/kernel/xam/xam_profile.cc     |  14 ++++
+ 6 files changed, 154 insertions(+), 1 deletion(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 9ba992d9b..a00d913bf 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -800,6 +800,19 @@ void GuideOverlay::Back() {
+     AddXboxLiveBack();
+     return;
+   }
++  if (page_ == Page::kKeyboard && kbd_rename_) {
++    // vk's Back on Profile Name: back to Edit Gamer Profile, no change
++    kbd_rename_ = false;
++    if (!gp_back_.empty()) {
++      page_ = gp_back_.back().first;
++      gp_focus_ = gp_back_.back().second;
++      gp_back_.pop_back();
++    }
++    ++page_version_;
++    lock.unlock();
++    PlaySfx("btn_Back");
++    return;
++  }
+   if (page_ == Page::kKeyboard) {
+     // vk's Back: the keyboard closes and createprofile gives up
+     lock.unlock();
+@@ -2323,6 +2336,78 @@ void GuideOverlay::EndCreateProfile() {
+   }).detach();
+ }
+ 
++// Profile Name's Done (mutex_ held): 90106750 accepts the gamertag as it is,
++// else 90115580 checks the text as typed (no spaces taken out) with
++// LiveProfile's messages; a failure is XamShowMessageBox(the keyboard's
++// title, the message, {OK}) and the keyboard again (90118DF0). Accepted:
++// 90107090, XamProfileRenameAccount, back to Edit Gamer Profile.
++void GuideOverlay::RenameSubmit() {
++  auto* profiles = emulator_->kernel_state()->xam_state()->profile_manager();
++  const auto* account = profiles->GetAccount(gp_xuid_);
++  const std::u16string name = kbd_text_;
++  const std::u16string current =
++      account ? xe::to_utf16(account->GetGamertagString()) : u"";
++  std::u16string error;
++  if (name != current) {
++    if (name.empty()) {
++      error = profile_strings_["err_empty"];
++    } else if (!IsLetter(name[0])) {
++      error = profile_strings_["err_letter"];
++    } else {
++      bool prev_space = false;
++      for (size_t i = 1; i < name.size() && error.empty(); ++i) {
++        char16_t c = name[i];
++        if (c == u' ') {
++          if (prev_space) error = profile_strings_["err_spaces"];
++          prev_space = true;
++        } else if (IsLetter(c) || IsDigit(c)) {
++          prev_space = false;
++        } else {
++          error = profile_strings_["err_chars"];
++        }
++      }
++      if (error.empty() && name.back() == u' ') {
++        error = profile_strings_["err_end"];
++      }
++      if (error.empty()) {
++        // 901151E8: another profile with this name
++        for (const auto& [xuid, other] : *profiles->GetAccounts()) {
++          if (xuid != gp_xuid_ &&
++              xe::utf8::equal_case(other.GetGamertagString(),
++                                   xe::to_utf8(name))) {
++            std::u16string text = profile_strings_["err_dup"];
++            size_t at = text.find(u"%s");
++            if (at != std::u16string::npos) text.replace(at, 2, name);
++            error = text;
++            break;
++          }
++        }
++      }
++    }
++  }
++  if (!error.empty()) {
++    kernel::xam::TitleMessageBox box;
++    box.title = gp_strings_["editname"];
++    box.text = error;
++    box.buttons = {profile_strings_["ok"]};
++    box.icon = 1;  // XamShowMessageBox flags 1 (90118EB8)
++    ShowProfileBox(box, Page::kKeyboard);
++    OpenKeyboard(kbd_text_);
++    page_ = Page::kProfileError;
++    return;
++  }
++  if (name != current) {
++    profiles->RenameProfile(gp_xuid_, name);
++  }
++  kbd_rename_ = false;
++  if (!gp_back_.empty()) {
++    page_ = gp_back_.back().first;
++    gp_focus_ = gp_back_.back().second;
++    gp_back_.pop_back();
++  }
++  ++page_version_;
++}
++
+ void GuideOverlay::ShowKeyboardFromGamerTag() {
+   // GamerTagScene (90106A80, on its transition) checks the storage device
+   // (90106450; the hard drive: nothing to show) and shows vk's keyboard
+@@ -2404,6 +2489,10 @@ void GuideOverlay::KeyboardPress(const std::string& id) {
+ }
+ 
+ void GuideOverlay::KeyboardSubmit() {
++  if (kbd_rename_) {
++    RenameSubmit();
++    return;
++  }
+   // createprofile 90105E40: runs of spaces become one, a trailing one goes.
+   std::u16string name;
+   bool space = false;
+@@ -3186,6 +3275,7 @@ void GuideOverlay::EndGamerProfile() {
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+     gp_active_ = false;
++    kbd_rename_ = false;
+   }
+   BeginClose();
+   std::thread([this]() {
+@@ -3271,6 +3361,15 @@ void GuideOverlay::GpActivate() {
+   if (page == Page::kGpEdit) {
+     if (focus == "gamerTileButton") {
+       GpGoTo(Page::kGpEditPic);  // 807_EditGamerTile.xur
++    } else if (focus == "profileNameButton") {
++      // 901066C0: vk's keyboard (full width, over the full Guide), titled
++      // "Edit Profile Name" (0x22) with LiveProfile 6, the gamertag as its
++      // text, 15 characters, gamertag keys (4).
++      auto user =
++          emulator_->kernel_state()->xam_state()->GetUserProfile(gp_xuid_);
++      gp_back_.push_back({page_, gp_focus_});
++      kbd_rename_ = true;
++      OpenKeyboard(user ? xe::to_utf16(user->name()) : std::u16string());
+     } else {
+       XELOGW("Guide: Edit Gamer Profile {} is not built yet", focus);
+     }
+@@ -3500,6 +3599,7 @@ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+   const bool caps = kbd_caps_;
+   const bool highlight = kbd_default_active_;
+   const int picture = save_picture_;
++  const bool rename = kbd_rename_;
+   const std::string focus = page == Page::kSaveProfile ? save_focus_ : kbd_focus_;
+   lock.unlock();
+   if (GpKey(page)) {
+@@ -3544,7 +3644,8 @@ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+       }
+     }
+   }
+-  RenderText(out, kbd_title_, profile_strings_["title"], ppu);
++  RenderText(out, kbd_title_,
++             rename ? gp_strings_["editname"] : profile_strings_["title"], ppu);
+   RenderText(out, kbd_prompt_, profile_strings_["prompt"], ppu);
+   if (highlight && font_ && !text.empty()) {
+     // vk's default text format: a solid brush 0x64B0DCAB behind the run
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 092a5e1c5..a881d2add 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -301,6 +301,9 @@ class GuideOverlay {
+   std::u16string kbd_text_;
+   int kbd_cursor_ = 0;
+   bool kbd_caps_ = false;
++  // The keyboard is gamerprofile's Profile Name (808 -> 901066C0), not
++  // createprofile's.
++  bool kbd_rename_ = false;
+   // vk's highlighted default text (VKBD flag 0x20000000): the next character,
+   // Backspace or Delete replaces all of it, a cursor key keeps it.
+   bool kbd_default_active_ = false;
+@@ -320,6 +323,7 @@ class GuideOverlay {
+                        std::function<void(int)> done);  // then dismisses
+   uint64_t page_version_ = 1;  // bumped when the composed page changes
+   void KeyboardPress(const std::string& key);  // A on a key (mutex_ held)
++  void RenameSubmit();                         // Profile Name's Done
+   void KeyboardSubmit();                       // Done (mutex_ held)
+   // The keyboard (again) with `text` as vk's highlighted default text.
+   void OpenKeyboard(const std::u16string& text);  // mutex_ held
+diff --git a/src/xenia/kernel/xam/profile_manager.cc b/src/xenia/kernel/xam/profile_manager.cc
+index 45eed2679..60dbf9c0a 100644
+--- a/src/xenia/kernel/xam/profile_manager.cc
++++ b/src/xenia/kernel/xam/profile_manager.cc
+@@ -650,6 +650,36 @@ bool ProfileManager::DeleteProfilePackage(const uint64_t xuid) {
+   return true;
+ }
+ 
++bool ProfileManager::RenameProfile(const uint64_t xuid,
++                                   const std::u16string& gamertag) {
++  if (!accounts_.count(xuid)) {
++    return false;
++  }
++  X_XAMACCOUNTINFO account = accounts_[xuid];
++  std::memset(account.gamertag, 0, sizeof(account.gamertag));
++  string_util::copy_and_swap_truncating(account.gamertag, gamertag,
++                                        sizeof(account.gamertag));
++  const uint8_t user_index = GetUserIndexAssignedToProfile(xuid);
++  const bool signed_in = user_index < XUserMaxUserCount;
++  // the Account file is in the profile's package, mounted while signed in
++  if (!signed_in && !MountProfile(xuid)) {
++    return false;
++  }
++  const bool result = UpdateAccount(xuid, &account);
++  if (!signed_in) {
++    DismountProfile(xuid);
++  }
++  if (!result) {
++    return false;
++  }
++  accounts_[xuid] = account;
++  if (signed_in) {
++    logged_profiles_.at(user_index)->SetAccountInfo(account);
++  }
++  XELOGI("Profile {:016X} renamed to {}", xuid, account.GetGamertagString());
++  return true;
++}
++
+ bool ProfileManager::IsGamertagValid(const std::string gamertag) {
+   std::regex pattern(R"(^[A-Za-z][A-Za-z0-9]*( [A-Za-z0-9]+)*$)");
+ 
+diff --git a/src/xenia/kernel/xam/profile_manager.h b/src/xenia/kernel/xam/profile_manager.h
+index cc5aee2bc..cf537df83 100644
+--- a/src/xenia/kernel/xam/profile_manager.h
++++ b/src/xenia/kernel/xam/profile_manager.h
+@@ -111,6 +111,8 @@ class ProfileManager {
+       const XContentType content_type = XContentType::kInvalid) const;
+ 
+   bool UpdateAccount(const uint64_t xuid, const X_XAMACCOUNTINFO* account);
++  // XamProfileRenameAccount: the profile's gamertag, saved in its Account.
++  bool RenameProfile(const uint64_t xuid, const std::u16string& gamertag);
+ 
+   static bool IsGamertagValid(const std::string gamertag);
+ 
+diff --git a/src/xenia/kernel/xam/user_profile.h b/src/xenia/kernel/xam/user_profile.h
+index 820fdec46..95cc887f4 100644
+--- a/src/xenia/kernel/xam/user_profile.h
++++ b/src/xenia/kernel/xam/user_profile.h
+@@ -98,6 +98,8 @@ class UserProfile {
+ 
+   uint64_t xuid() const { return xuid_; }
+   std::string name() const { return account_info_.GetGamertagString(); }
++  // The account renamed (XamProfileRenameAccount) while signed in.
++  void SetAccountInfo(const X_XAMACCOUNTINFO& info) { account_info_ = info; }
+   uint32_t signin_state() const {
+     return static_cast<uint32_t>(SignInState::SignedInLocally);
+   };
+diff --git a/src/xenia/kernel/xam/xam_profile.cc b/src/xenia/kernel/xam/xam_profile.cc
+index 16be54d38..ab3fe9183 100644
+--- a/src/xenia/kernel/xam/xam_profile.cc
++++ b/src/xenia/kernel/xam/xam_profile.cc
+@@ -138,6 +138,20 @@ dword_result_t XamProfileDelete_entry(dword_t device_id, qword_t xuid) {
+ }
+ DECLARE_XAM_EXPORT1(XamProfileDelete, kNone, kImplemented);
+ 
++// gamerprofile 90107090 (Edit Gamer Profile's Profile Name): the signed-in
++// profile's XUID and its new gamertag.
++dword_result_t XamProfileRenameAccount_entry(qword_t xuid,
++                                             lpu16string_t gamertag) {
++  auto* profile_manager = kernel_state()->xam_state()->profile_manager();
++  if (!gamertag || !profile_manager->GetAccount(xuid)) {
++    return X_E_INVALIDARG;
++  }
++  return profile_manager->RenameProfile(xuid, gamertag.value())
++             ? X_ERROR_SUCCESS
++             : X_E_FAIL;
++}
++DECLARE_XAM_EXPORT1(XamProfileRenameAccount, kNone, kImplemented);
++
+ dword_result_t XamProfileClose_entry(lpstring_t mount_name) {
+   std::string guest_name = mount_name.value();
+   const bool result =
+-- 
+2.55.0.windows.3
+

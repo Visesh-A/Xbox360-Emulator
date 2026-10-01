@@ -1,0 +1,419 @@
+From 0729102f128bba8bcdabbe4d2b2ed328c470c314 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 15:14:40 +0530
+Subject: [PATCH 08/51] Blades dashboard (2.0.2858): fixes found by walking
+ every blade
+
+- Threads: a new thread without an explicit processor reports its parent's
+  hardware thread (XDK: children stay on the parent's thread until
+  XSetThreadProcessor), and a title's main thread starts on hardware thread
+  0. The dashboard treats a nonzero previous processor from
+  XSetThreadProcessor as failure and abandoned its Pictures screen. Host
+  threads still spread over cores.
+- XMPGetMediaSources: succeed with no sources (none emulated) instead of
+  E_INVALIDARG (Pictures).
+- XConfig: media center category (never paired: zeroed, Computers screen),
+  composite screen size, and a value buffer large enough for the 0x40-byte
+  settings.
+- VdGetDisplayDiscoveryData (no HDMI on these consoles: FALSE) and
+  VdEnumerateVideoModes (no modes) instead of undefined imports, which made
+  the Display pane show a time zone as the video mode.
+- DVD drive: XN_SYS_TRAYSTATECHANGED carries the media state (0 none,
+  1 360 game, 3 unknown, 4 DVD, ... as the dashboard's disc tile shows it),
+  XamLoaderGetDvdTrayState answers 0 closed / 2 open and
+  HalOpenCloseODDTray(1) opens: an empty drive is now "Open Tray"/"Close
+  Tray" instead of "Unrecognized Disc". A console powers on with the tray
+  closed.
+- Research: the patched-module dump also writes the running dashboard.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/emulator.cc                         | 12 +++++++++-
+ src/xenia/kernel/kernel_state.cc              | 13 +++++-----
+ src/xenia/kernel/smc.cc                       | 15 +++++++++++-
+ src/xenia/kernel/smc.h                        |  2 ++
+ src/xenia/kernel/xam/apps/xmp_app.cc          | 16 ++++++++-----
+ src/xenia/kernel/xam/apps/xmp_app.h           | 10 +++++---
+ src/xenia/kernel/xam/xam_content.cc           | 11 ++++++++-
+ src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc     |  7 ++++--
+ src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc   | 15 ++++++++++++
+ src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc | 15 +++++++++++-
+ src/xenia/kernel/xthread.cc                   | 24 +++++++++++++++----
+ src/xenia/kernel/xthread.h                    |  3 ++-
+ src/xenia/vfs/virtual_file_system.cc          | 10 ++++++++
+ src/xenia/vfs/virtual_file_system.h           |  2 ++
+ 14 files changed, 128 insertions(+), 27 deletions(-)
+
+diff --git a/src/xenia/emulator.cc b/src/xenia/emulator.cc
+index 921bf9d55..8abd04ed5 100644
+--- a/src/xenia/emulator.cc
++++ b/src/xenia/emulator.cc
+@@ -615,6 +615,9 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
+       XELOGE("Unable to put dashboard disc in drive: {}",
+              xe::path_to_utf8(cvars::dashboard_disc));
+     }
++  } else {
++    // A console powers on with its tray closed, here with the drive empty.
++    kernel_state_->smc()->SetTrayState(X_DVD_TRAY_STATE::CLOSED);
+   }
+ 
+   // Launch the game.
+@@ -705,7 +708,14 @@ void Emulator::DumpPatchedSystemModules(const std::string& spec) {
+     }
+   };
+   for (const char* name :
+-       {"hud", "huduiskin", "xam", "minimediaplayer", "signin"}) {
++       {"hud", "huduiskin", "xam", "minimediaplayer", "signin", "dash"}) {
++    if (std::string(name) == "dash") {
++      // The running dashboard, already patched as the title's update.
++      if (auto exe = kernel_state_->GetExecutableModule()) {
++        dump("dash_2858.bin", exe->xex_module());
++      }
++      continue;
++    }
+     auto base_data = read(std::filesystem::path(parts[0]) /
+                           (std::string(name) + ".xex"));
+     auto patch_data = read(std::filesystem::path(parts[1]) /
+diff --git a/src/xenia/kernel/kernel_state.cc b/src/xenia/kernel/kernel_state.cc
+index defdb06b2..8f9afb8c6 100644
+--- a/src/xenia/kernel/kernel_state.cc
++++ b/src/xenia/kernel/kernel_state.cc
+@@ -299,9 +299,11 @@ object_ref<XThread> KernelState::LaunchModule(object_ref<UserModule> module) {
+ 
+   // Create a thread to run in.
+   // We start suspended so we can run the debugger prep.
+-  auto thread = object_ref<XThread>(
+-      new XThread(kernel_state(), module->stack_size(), 0,
+-                  module->entry_point(), 0, X_CREATE_SUSPENDED, true, true));
++  // A title's main thread starts on hardware thread 0 (processor mask 1 in
++  // the creation flags' top byte); its child threads stay there until moved.
++  auto thread = object_ref<XThread>(new XThread(
++      kernel_state(), module->stack_size(), 0, module->entry_point(), 0,
++      X_CREATE_SUSPENDED | (1u << 24), true, true));
+ 
+   // We know this is the 'main thread'.
+   thread->set_name("Main XThread");
+@@ -928,9 +930,8 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
+   // after this notification.
+   if (listener->mask() & kXNotifySystem &&
+       smc()->GetTrayState() == X_DVD_TRAY_STATE::CLOSED) {
+-    listener->EnqueueNotification(
+-        kXNotificationSystemTrayStateChanged,
+-        static_cast<uint8_t>(X_DVD_TRAY_STATE::CLOSED));
++    listener->EnqueueNotification(kXNotificationSystemTrayStateChanged,
++                                  smc()->MediaState());
+   }
+   if (!has_notified_live_startup_ && listener->mask() & kXNotifyLive) {
+     has_notified_live_startup_ = true;
+diff --git a/src/xenia/kernel/smc.cc b/src/xenia/kernel/smc.cc
+index e76b4a077..fcd974ecf 100644
+--- a/src/xenia/kernel/smc.cc
++++ b/src/xenia/kernel/smc.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "xenia/kernel/smc.h"
+ #include "xenia/kernel/util/shim_utils.h"
++#include "xenia/vfs/virtual_file_system.h"
+ 
+ DECLARE_int32(avpack);
+ 
+@@ -59,7 +60,19 @@ SystemManagementController::~SystemManagementController() {};
+ void SystemManagementController::SetTrayState(X_DVD_TRAY_STATE state) {
+   dvd_tray_state_ = state;
+   kernel_state()->BroadcastNotification(kXNotificationSystemTrayStateChanged,
+-                                        static_cast<uint8_t>(state));
++                                        MediaState());
++}
++
++uint32_t SystemManagementController::MediaState() const {
++  // What XN_SYS_TRAYSTATECHANGED carries: the media in the drive, as the
++  // blades dashboard's disc tile shows it (0 no disc -> "Open Tray",
++  // 1 Xbox 360 game -> "Play Game", 3 unknown -> "Unrecognized Disc",
++  // 4 DVD -> "Play DVD", ...). Only a closed tray holds readable media.
++  if (dvd_tray_state_ != X_DVD_TRAY_STATE::CLOSED ||
++      !kernel_state()->file_system()->HasDevice("\\Device\\Cdrom0")) {
++    return X_DVD_DISC_STATE::NO_DISC;
++  }
++  return X_DVD_DISC_STATE::XBOX_360_GAME_DISC;
+ }
+ 
+ void SystemManagementController::CallCommand(X_SMC_DATA* smc_message,
+diff --git a/src/xenia/kernel/smc.h b/src/xenia/kernel/smc.h
+index 4820e8ee5..bbca72993 100644
+--- a/src/xenia/kernel/smc.h
++++ b/src/xenia/kernel/smc.h
+@@ -222,6 +222,8 @@ class SystemManagementController {
+   X_DVD_TRAY_STATE GetTrayState() const { return dvd_tray_state_; }
+ 
+   void SetTrayState(X_DVD_TRAY_STATE state);
++  // X_DVD_DISC_STATE of the drive (the tray-state notification's value).
++  uint32_t MediaState() const;
+ 
+   void CallCommand(X_SMC_DATA* smc_message, X_SMC_DATA* smc_response);
+ 
+diff --git a/src/xenia/kernel/xam/apps/xmp_app.cc b/src/xenia/kernel/xam/apps/xmp_app.cc
+index 0d95e0927..714652f06 100644
+--- a/src/xenia/kernel/xam/apps/xmp_app.cc
++++ b/src/xenia/kernel/xam/apps/xmp_app.cc
+@@ -453,12 +453,16 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+ 
+       assert_true(args->xmp_client == 0x00000002 ||
+                   args->xmp_client == 0x00000000);
+-      XELOGD(
+-          "XMPGetMediaSources({:08X}, {:08X}, {:08X}, {:08X}, {:08X}), "
+-          "unimplemented",
+-          args->xmp_client.get(), args->unk1.get(), args->unk1_ptr.get(),
+-          args->unk2.get(), args->unk2_ptr.get());
+-      return X_E_INVALIDARG;
++      XELOGD("XMPGetMediaSources({:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
++             args->xmp_client.get(), args->unk1.get(), args->sources_ptr.get(),
++             args->max_sources.get(), args->count_ptr.get());
++      // No media devices are emulated: there are no sources. Failing the call
++      // instead made the blades dashboard abandon its Pictures screen.
++      if (args->count_ptr) {
++        xe::store_and_swap<uint32_t>(
++            memory_->TranslateVirtual(args->count_ptr), 0);
++      }
++      return X_E_SUCCESS;
+     }
+     case 0x0007002E: {
+       assert_true(!buffer_length ||
+diff --git a/src/xenia/kernel/xam/apps/xmp_app.h b/src/xenia/kernel/xam/apps/xmp_app.h
+index e389edc19..df927364e 100644
+--- a/src/xenia/kernel/xam/apps/xmp_app.h
++++ b/src/xenia/kernel/xam/apps/xmp_app.h
+@@ -145,12 +145,16 @@ struct XMP_GET_PLAYBACK_BEHAVIOR {
+ };
+ static_assert_size(XMP_GET_PLAYBACK_BEHAVIOR, 0x10);
+ 
++// Media sources (hard drive, PCs, portable devices, ...): the blades
++// dashboard (2.0.2858) first asks for the count (no buffer), allocates
++// count * 0xB4-byte entries (+0x00 a 40-byte id, +0x28 and +0x30 source type
++// values), then asks again with the buffer and its capacity.
+ struct XMP_GET_MEDIA_SOURCES {
+   xe::be<uint32_t> xmp_client;
+   xe::be<uint32_t> unk1;
+-  xe::be<uint32_t> unk1_ptr;
+-  xe::be<uint32_t> unk2;
+-  xe::be<uint32_t> unk2_ptr;
++  xe::be<uint32_t> sources_ptr;  // 0xB4-byte entries, or 0 to query the count
++  xe::be<uint32_t> max_sources;
++  xe::be<uint32_t> count_ptr;    // number of sources (returned)
+ };
+ static_assert_size(XMP_GET_MEDIA_SOURCES, 0x14);
+ 
+diff --git a/src/xenia/kernel/xam/xam_content.cc b/src/xenia/kernel/xam/xam_content.cc
+index 10d27268b..180bd9d5a 100644
+--- a/src/xenia/kernel/xam/xam_content.cc
++++ b/src/xenia/kernel/xam/xam_content.cc
+@@ -679,7 +679,16 @@ dword_result_t XamSwapDisc_entry(
+ DECLARE_XAM_EXPORT1(XamSwapDisc, kContent, kSketchy);
+ 
+ dword_result_t XamLoaderGetDvdTrayState_entry() {
+-  return static_cast<uint8_t>(kernel_state()->smc()->GetTrayState());
++  // Callers see 0 for a closed tray and 2 for an open one (the blades
++  // dashboard's disc tile: 0 -> "Open Tray", 2 -> "Close Tray", and it refuses
++  // to launch a disc while the tray reads 2), not the SMC's own numbering.
++  switch (kernel_state()->smc()->GetTrayState()) {
++    case X_DVD_TRAY_STATE::OPEN:
++    case X_DVD_TRAY_STATE::OPENING:
++      return 2;
++    default:
++      return 0;
++  }
+ }
+ DECLARE_XAM_EXPORT1(XamLoaderGetDvdTrayState, kNone, kImplemented);
+ 
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc
+index f6a3dd71b..40a46048e 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc
+@@ -56,9 +56,12 @@ void HalSendSMCMessage_entry(pointer_t<X_SMC_DATA> smc_message,
+ DECLARE_XBOXKRNL_EXPORT3(HalSendSMCMessage, kNone, kStub, kImportant,
+                          kHighFrequency);
+ 
++// 1 opens the tray, 0 closes it: the blades dashboard's disc tile calls it
++// with 1 when XamLoaderGetDvdTrayState says closed (0), labelled "Open Tray",
++// and with 0 when it says open (2), labelled "Close Tray".
+ void HalOpenCloseODDTray_entry(dword_t open_close) {
+-  kernel_state()->smc()->SetTrayState(open_close ? X_DVD_TRAY_STATE::CLOSED
+-                                                 : X_DVD_TRAY_STATE::OPEN);
++  kernel_state()->smc()->SetTrayState(open_close ? X_DVD_TRAY_STATE::OPEN
++                                                 : X_DVD_TRAY_STATE::CLOSED);
+ }
+ DECLARE_XBOXKRNL_EXPORT1(HalOpenCloseODDTray, kNone, kStub);
+ 
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc
+index 9fa9808c1..350ec0c29 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc
+@@ -228,6 +228,21 @@ void VdQueryVideoMode_entry(pointer_t<X_VIDEO_MODE> video_mode) {
+ }
+ DECLARE_XBOXKRNL_EXPORT1(VdQueryVideoMode, kVideo, kStub);
+ 
++// EDID-style display information, available over HDMI only: consoles of the
++// 2005-2006 era have no HDMI port, so there is never any (FALSE). As an
++// undefined import the blades dashboard read an unfilled block as success
++// and showed a time zone name as the display mode.
++dword_result_t VdGetDisplayDiscoveryData_entry(lpvoid_t data) { return 0; }
++DECLARE_XBOXKRNL_EXPORT1(VdGetDisplayDiscoveryData, kVideo, kStub);
++
++// Calls a guest callback for every mode the display supports; the caller
++// falls back to the AV pack's standard modes when nothing is enumerated.
++dword_result_t VdEnumerateVideoModes_entry(lpvoid_t callback,
++                                           dword_t context) {
++  return 0;
++}
++DECLARE_XBOXKRNL_EXPORT1(VdEnumerateVideoModes, kVideo, kStub);
++
+ dword_result_t VdQueryVideoFlags_entry() {
+   X_VIDEO_MODE mode;
+   VdQueryVideoMode(&mode, false);
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
+index 562f46607..82c44f0e5 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
+@@ -66,7 +66,8 @@ X_STATUS xeExGetXConfigSetting(X_CONFIG_CATEGORY category, uint16_t setting,
+                                void* buffer, uint16_t buffer_size,
+                                uint16_t* required_size) {
+   uint16_t setting_size = 0;
+-  alignas(uint32_t) uint8_t value[4];
++  // Large enough for every setting written below (the hint strings are 0x40).
++  alignas(uint32_t) uint8_t value[0x80] = {};
+ 
+   // TODO(benvanik): have real structs here that just get copied from.
+   // https://free60project.github.io/wiki/XConfig.html
+@@ -144,6 +145,11 @@ X_STATUS xeExGetXConfigSetting(X_CONFIG_CATEGORY category, uint16_t setting,
+           value[0] =
+               X_PC_FLAGS::XBLAllowed | X_PC_FLAGS::XBLMembershipCreationAllowed;
+           break;
++        case XCONFIG_USER_AV_COMPOSITE_SCREENSZ:
++          // Composite / S-Video output is standard definition.
++          setting_size = 4;
++          xe::store_and_swap<int32_t>(value, 0x028001E0);  // 640x480
++          break;
+         case XCONFIG_USER_AV_COMPONENT_SCREENSZ:
+           setting_size = 4;
+           // int16_t* value[2];
+@@ -248,6 +254,13 @@ X_STATUS xeExGetXConfigSetting(X_CONFIG_CATEGORY category, uint16_t setting,
+           return X_STATUS_INVALID_PARAMETER_2;
+       }
+       break;
++    case XCONFIG_MEDIA_CENTER_CATEGORY:
++      // Windows Media Center extender pairing (host id, keys, server name,
++      // ...): a console never paired with a PC has them all empty. The blades
++      // dashboard's Computers screen reads them and gave up on the error.
++      setting_size = std::min<uint16_t>(buffer_size ? buffer_size : 0x14,
++                                        uint16_t(sizeof(value)));
++      break;
+     case XCONFIG_CONSOLE_CATEGORY:
+       switch (setting) {
+         case XCONFIG_CONSOLE_SCREEN_SAVER:
+diff --git a/src/xenia/kernel/xthread.cc b/src/xenia/kernel/xthread.cc
+index f89bd29ad..186c30423 100644
+--- a/src/xenia/kernel/xthread.cc
++++ b/src/xenia/kernel/xthread.cc
+@@ -366,8 +366,21 @@ X_STATUS XThread::Create() {
+   // Exports use this to get the kernel.
+   thread_state_->context()->kernel_state = kernel_state_;
+ 
+-  uint8_t cpu_index = GetFakeCpuNumber(
+-      static_cast<uint8_t>(creation_params_.creation_flags >> 24));
++  uint8_t proc_mask =
++      static_cast<uint8_t>(creation_params_.creation_flags >> 24);
++  uint8_t cpu_index = GetFakeCpuNumber(proc_mask);
++  // Without an explicit processor, the console keeps a child thread on its
++  // parent's hardware thread until XSetThreadProcessor moves it (which
++  // returns the previous one: the dashboard treats anything but the parent's
++  // processor 0 as a failure and abandons e.g. its Pictures screen). Report
++  // that to the guest; the host thread still gets its own core.
++  int host_cpu = -1;
++  if (!proc_mask && XThread::IsInThread()) {
++    if (XThread* parent = XThread::GetCurrentThread()) {
++      host_cpu = cpu_index;
++      cpu_index = parent->active_cpu();
++    }
++  }
+ 
+   // Initialize the KTHREAD object.
+   InitializeGuestObject();
+@@ -435,7 +448,7 @@ X_STATUS XThread::Create() {
+ 
+   // Assign the newly created thread to the logical processor, and also set up
+   // the current CPU in KPCR and KTHREAD.
+-  SetActiveCpu(cpu_index);
++  SetActiveCpu(cpu_index, host_cpu);
+ 
+   // Notify processor of our creation.
+   emulator()->processor()->OnThreadCreated(handle(), thread_state_, this);
+@@ -693,7 +706,7 @@ uint8_t XThread::active_cpu() const {
+   return pcr.prcb_data.current_cpu;
+ }
+ 
+-void XThread::SetActiveCpu(uint8_t cpu_index) {
++void XThread::SetActiveCpu(uint8_t cpu_index, int host_cpu) {
+   // May be called during thread creation - don't skip if current == new.
+ 
+   assert_true(cpu_index < 6);
+@@ -709,7 +722,8 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+ 
+   if (xe::threading::logical_processor_count() >= 6) {
+     if (!cvars::ignore_thread_affinities) {
+-      thread_->set_affinity_mask(uint64_t(1) << cpu_index);
++      thread_->set_affinity_mask(uint64_t(1)
++                                 << (host_cpu >= 0 ? host_cpu : cpu_index));
+     }
+   } else {
+     // there no good reason why we need to log this... we don't perfectly
+diff --git a/src/xenia/kernel/xthread.h b/src/xenia/kernel/xthread.h
+index 727d9a554..8306d1184 100644
+--- a/src/xenia/kernel/xthread.h
++++ b/src/xenia/kernel/xthread.h
+@@ -428,7 +428,8 @@ class XThread : public XObject, public cpu::Thread {
+   // 5 - core 2, thread 1 - user
+   void SetAffinity(uint32_t affinity);
+   uint8_t active_cpu() const;
+-  void SetActiveCpu(uint8_t cpu_index);
++  // host_cpu: host core to pin to (-1: the same as cpu_index).
++  void SetActiveCpu(uint8_t cpu_index, int host_cpu = -1);
+ 
+   bool GetTLSValue(uint32_t slot, uint32_t* value_out);
+   bool SetTLSValue(uint32_t slot, uint32_t value);
+diff --git a/src/xenia/vfs/virtual_file_system.cc b/src/xenia/vfs/virtual_file_system.cc
+index 01ca0dd8c..51c421357 100644
+--- a/src/xenia/vfs/virtual_file_system.cc
++++ b/src/xenia/vfs/virtual_file_system.cc
+@@ -53,6 +53,16 @@ bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
+   return false;
+ }
+ 
++bool VirtualFileSystem::HasDevice(const std::string_view mount_path) {
++  auto global_lock = global_critical_region_.Acquire();
++  for (const auto& device : devices_) {
++    if (xe::utf8::equal_case(device->mount_path(), mount_path)) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
+                                              const std::string_view target) {
+   auto global_lock = global_critical_region_.Acquire();
+diff --git a/src/xenia/vfs/virtual_file_system.h b/src/xenia/vfs/virtual_file_system.h
+index e51b18566..eae3da737 100644
+--- a/src/xenia/vfs/virtual_file_system.h
++++ b/src/xenia/vfs/virtual_file_system.h
+@@ -32,6 +32,8 @@ class VirtualFileSystem {
+ 
+   bool RegisterDevice(std::unique_ptr<Device> device);
+   bool UnregisterDevice(const std::string_view path);
++  // Whether a device is mounted at exactly this path (e.g. \Device\Cdrom0).
++  bool HasDevice(const std::string_view mount_path);
+ 
+   bool RegisterSymbolicLink(const std::string_view path,
+                             const std::string_view target);
+-- 
+2.55.0.windows.3
+

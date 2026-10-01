@@ -1,0 +1,54 @@
+From 607c59a1e4133b0cda93679c5b3888dac9e953e8 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 18:54:50 +0530
+Subject: [PATCH 48/51] Guide: prepare the user's Guide look while the Guide is
+ shut
+
+Checked every 2 s on the input thread (sign-in, theme changes), so the
+images are usually ready before the Guide opens.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/app/guide_options.cc | 4 +++-
+ src/xenia/app/guide_overlay.cc | 8 ++++++++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/xenia/app/guide_options.cc b/src/xenia/app/guide_options.cc
+index 411162c69..42a6580bd 100644
+--- a/src/xenia/app/guide_options.cc
++++ b/src/xenia/app/guide_options.cc
+@@ -1075,7 +1075,9 @@ std::string GuideOverlay::LookForUser(uint32_t user_index) {
+     return fmt::format("color:{:08X}", color);
+   }
+   for (const auto& [name, file] : kTiles) {
+-    if (ReadFileBytes(asset_dir_ / file) == data) {
++    std::error_code ec;  // (checked every 2 s: read only a same-size file)
++    if (std::filesystem::file_size(asset_dir_ / file, ec) == data.size() &&
++        ReadFileBytes(asset_dir_ / file) == data) {
+       return std::string("image:") + file;
+     }
+   }
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 914798f45..96ee23e70 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -397,7 +397,15 @@ void GuideOverlay::InputThread() {
+     }
+   }
+ 
++  Clock::time_point next_look_check;
+   while (running_) {
++    if (Clock::now() >= next_look_check) {
++      // the Guide controller's user's Guide background, rendered and its
++      // images prepared while the Guide is shut (sign-in, theme changes)
++      next_look_check = Clock::now() + std::chrono::seconds(2);
++      UpdateGuideLook(hud_user_);
++      app_context_.CallInUIThread([this]() { SwitchGuideLook(); });
++    }
+     if (test_pending && Clock::now() >= test_at) {
+       test_pending = false;
+       if (test_page.rfind("closed", 0) == 0) {
+-- 
+2.55.0.windows.3
+

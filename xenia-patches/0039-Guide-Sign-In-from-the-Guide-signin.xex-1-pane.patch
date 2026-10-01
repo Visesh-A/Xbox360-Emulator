@@ -1,0 +1,448 @@
+From 17e2cf301bdef1a9c61108fc6187c9c74da847ae Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 21:49:49 +0530
+Subject: [PATCH 39/51] Guide: Sign In from the Guide (signin.xex, 1 pane)
+
+XamShowSigninUIp(user, 1, 0x10000) from the signed-out Guide menu (Sign In
+or X): signin1.xur's UserList with the console's profiles (gamertag, "Xbox
+Live" if Live-enabled, the device, the gamer picture from the profile's
+tile_64.png), A -> status.xur "Signing in" -> signed in on the Guide's
+controller; B / Guide close it. No profiles: the "No Profiles Found" box
+(Create New Profile / Exit). ProfileManager::GetProfilePath is public.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/xenia/app/guide_overlay.cc         | 280 ++++++++++++++++++++++++-
+ src/xenia/app/guide_overlay.h          |  24 ++-
+ src/xenia/kernel/xam/profile_manager.h |   4 +-
+ 3 files changed, 302 insertions(+), 6 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 800f34cf7..35b695315 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -148,6 +148,7 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadPrefsLayout();
+   LoadViewGamesLayout();
+   LoadSignedInLayout();
++  LoadSignInLayout();
+   LoadHudKeys();
+   {
+     std::ifstream in(asset_dir_ / "gamertag.txt");
+@@ -488,6 +489,11 @@ void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float lx,
+       EndGamerProfile();
+       return;
+     }
++    if (sn_active_ && mode != Mode::kClosed) {
++      lock.unlock();
++      EndSignIn();
++      return;
++    }
+     lock.unlock();
+     if (mode == Mode::kClosed || mode == Mode::kClosing) {
+       Open();
+@@ -672,6 +678,10 @@ void GuideOverlay::FinishClose() {
+ 
+ void GuideOverlay::Move(Direction direction) {
+   std::lock_guard<std::mutex> lock(mutex_);
++  if (page_ == Page::kSignIn && transition_ == Transition::kNone) {
++    SignInMove(direction);
++    return;
++  }
+   if (GpKey(page_) && transition_ == Transition::kNone) {
+     GpMove(direction);
+     return;
+@@ -748,6 +758,11 @@ void GuideOverlay::Activate() {
+   std::unique_lock<std::mutex> lock(mutex_);
+   Page page = page_;
+   int choice = choice_;
++  if (page == Page::kSignIn && transition_ == Transition::kNone) {
++    lock.unlock();
++    SignInActivate();
++    return;
++  }
+   if (GpKey(page) && transition_ == Transition::kNone) {
+     lock.unlock();
+     GpActivate();
+@@ -881,6 +896,16 @@ void GuideOverlay::Back() {
+   if (page_ == Page::kSigningOut) {
+     return;  // Status.xur: no legends
+   }
++  if (page_ == Page::kSignIn) {
++    const bool status = sn_status_;
++    lock.unlock();
++    if (!status) {
++      // navBack: XamAppUnloadStack, the Guide closes
++      PlaySfx("btn_Back");
++      EndSignIn();
++    }
++    return;
++  }
+   if (page_ == Page::kUpsell && upsell_from_menu_) {
+     // XuiSceneNavigateBack: the menu again (the frame goes FullToHalf)
+     upsell_from_menu_ = false;
+@@ -1252,6 +1277,11 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+       names.insert(names.begin() + std::min<size_t>(7, names.size()), name);
+     }
+   }
++  if (sn_ready_) {  // signin1.xur's legends
++    for (const char* name : {"si_legends_a", "si_legends_b", "si_legends_xy"}) {
++      names.push_back(name);
++    }
++  }
+   if (prefs_ready_) {
+     for (const char* name :
+          {"gp_spin_left", "gp_spin_left_shade", "gp_spin_right",
+@@ -1377,6 +1407,8 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     switch (page) {
+       case Page::kSigningOut:
+         return "status";
++      case Page::kSignIn:
++        return "si";
+       case Page::kAddXboxLive:
+         return "axl";
+       case Page::kGamerTag:
+@@ -1670,6 +1702,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kAddXboxLive:
+         content = "axl_page";
+         break;
++      case Page::kSignIn:
+       case Page::kKeyboard:
+       case Page::kSaveProfile:
+       case Page::kGpCard:
+@@ -2314,6 +2347,11 @@ void GuideOverlay::LoadCreateProfileLayout() {
+ void GuideOverlay::PrepareCreateProfileImages(float ppu) {
+   auto start = Clock::now();
+   std::vector<std::string> names = {"kbd_base", "kbd_caret"};
++  if (sn_ready_) {
++    for (const char* name : {"si_list", "si_status", "si_row_normal", "si_row_focus"}) {
++      names.push_back(name);
++    }
++  }
+   for (const auto& [key, page] : gp_pages_) {
+     if (page.buttons.empty()) names.push_back(key);
+     for (const auto& b : page.buttons) names.push_back(key + "_" + b.id);
+@@ -4683,11 +4721,242 @@ void GuideOverlay::DrawMenuDynamic(float k, float ox, float oy, float up,
+       IM_COL32(255, 255, 255, int(alpha * 255.0f + 0.5f)));
+ }
+ 
+-// signin.xex's panes: not built yet.
++// ---------------------------------------------------------- signin.xex
++
++void GuideOverlay::LoadSignInLayout() {
++  std::ifstream in(asset_dir_ / "signin.txt", std::ios::binary);
++  std::string line;
++  while (std::getline(in, line)) {
++    if (!line.empty() && line.back() == '\r') line.pop_back();
++    std::istringstream ls(line);
++    std::string kind, name;
++    ls >> kind;
++    if (kind == "text") {
++      std::string color;
++      MessageBoxItem item;
++      item.is_text = true;
++      ls >> name >> item.x >> item.y >> item.w >> item.h >> item.size >>
++          item.ascent >> item.line_h >> item.style >> color;
++      item.color = uint32_t(std::stoul(color, nullptr, 16));
++      sn_text_[name] = item;
++    } else if (kind == "image") {
++      std::array<float, 4> r;
++      ls >> name >> r[0] >> r[1] >> r[2] >> r[3];
++      sn_image_[name] = r;
++    } else if (kind == "list") {
++      for (float& v : sn_list_) ls >> v;
++    } else if (kind == "str") {
++      int id;
++      std::string text;
++      ls >> id;
++      std::getline(ls >> std::ws, text);
++      sn_str_[id] = xe::to_utf16(text);
++    }
++  }
++  sn_ready_ = sn_list_[4] > 0 && sn_text_.count("st_l1") && sn_str_.count(53);
++}
++
++// XamShowSigninUIp(user, 1 pane, 0x10000) from the Guide's Sign In. No
++// profiles (901054CC): XamShowMessageBox("No Profiles Found", 9, {Create
++// New Profile, Exit}, focus 0, icon 2); Create New Profile ->
++// XamShowCreateProfileUI (90104890). Else signin1.xur (a half-width scene)
++// with the console's profiles.
+ bool GuideOverlay::ShowSignIn(uint32_t user_index) {
+-  XELOGW("Guide: sign in (signin.xex) is not built yet (controller {})",
+-         user_index);
+-  return false;
++  if (!sn_ready_ || !create_profile_ready_) return false;
++  auto* state = emulator_->kernel_state()->xam_state();
++  std::vector<SiProfile> profiles;
++  for (const auto& [xuid, account] : *state->profile_manager()->GetAccounts()) {
++    SiProfile p;
++    p.xuid = xuid;
++    p.gamertag = xe::to_utf16(account.GetGamertagString());
++    // +0x1B0: "Xbox Live" for a profile with a Live account (its Live XUID)
++    p.live = account.IsLiveEnabled() ? sn_str_[16] : u"";
++    p.device = sn_str_[15];  // the hard drive ("HDD")
++    profiles.push_back(std::move(p));
++  }
++  if (profiles.empty()) {
++    kernel::xam::TitleMessageBox box;
++    box.title = sn_str_[53];
++    box.text = sn_str_[9];
++    box.buttons = {sn_str_[6], sn_str_[12]};
++    box.focus = 0;
++    box.icon = 2;
++    return ShowTitleMessageBox(box, [this, user_index](int choice) {
++      if (choice == 0) {
++        std::thread([this, user_index]() {
++          for (int i = 0; i < 100; ++i) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(50));
++            std::lock_guard<std::mutex> lock(mutex_);
++            if (mode_ == Mode::kClosed) break;
++          }
++          ShowCreateProfile(user_index);
++        }).detach();
++      }
++    });
++  }
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (mode_ != Mode::kClosed || create_profile_active_ || gp_active_ ||
++        sn_active_) {
++      return false;
++    }
++    sn_active_ = true;
++    sn_status_ = false;
++    sn_profiles_ = std::move(profiles);
++    sn_focus_ = sn_top_ = 0;
++    sn_user_ = user_index;
++    hud_user_ = user_index;
++    ++page_version_;
++  }
++  if (display_h_ > 0) {
++    float ppu = display_h_ / layout_.canvas_h;
++    if (scaling_for_ != ppu) {
++      scaling_for_ = ppu;
++      scaled_ready_ = false;
++      if (scale_thread_.joinable()) scale_thread_.join();
++      scale_thread_ =
++          std::thread([this, ppu]() { PrepareCreateProfileImages(ppu); });
++    }
++  }
++  emulator_->kernel_state()->BroadcastNotification(xe::kXNotificationSystemUI,
++                                                   true);
++  XELOGI("Guide: sign in (signin.xex, 1 pane)");
++  Open(Page::kSignIn);
++  return true;
++}
++
++void GuideOverlay::EndSignIn() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    sn_active_ = false;
++  }
++  BeginClose();
++  std::thread([this]() {
++    std::this_thread::sleep_for(std::chrono::milliseconds(600));
++    emulator_->kernel_state()->BroadcastNotification(
++        xe::kXNotificationSystemUI, false);
++  }).detach();
++}
++
++void GuideOverlay::SignInMove(Direction direction) {
++  if (sn_status_ || (direction != kUp && direction != kDown)) return;
++  const int count = int(sn_profiles_.size());
++  const int visible = std::max(1, int(sn_list_[4]));
++  const int next = sn_focus_ + (direction == kDown ? 1 : -1);
++  if (next < 0 || next >= count) return;
++  sn_focus_ = next;
++  if (sn_focus_ < sn_top_) sn_top_ = sn_focus_;
++  if (sn_focus_ >= sn_top_ + visible) sn_top_ = sn_focus_ - visible + 1;
++  ++page_version_;
++  PlaySfx("btn_Focus");
++}
++
++// A on a profile (901088D0): the pane goes to status.xur with it
++// ("Signing in"); it is signed in on the Guide's controller and signin.xex
++// ends.
++void GuideOverlay::SignInActivate() {
++  uint64_t xuid;
++  uint32_t user;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (sn_status_ || sn_focus_ < 0 || sn_focus_ >= int(sn_profiles_.size())) {
++      return;
++    }
++    sn_status_ = true;
++    xuid = sn_profiles_[sn_focus_].xuid;
++    user = sn_user_;
++    ++page_version_;
++  }
++  PlaySfx("btn_Select");
++  Schedule(Clock::now() + std::chrono::milliseconds(1000), [this, xuid, user]() {
++    auto* profiles = emulator_->kernel_state()->xam_state()->profile_manager();
++    const uint8_t slot = user < 4 ? uint8_t(user) : XUserIndexAny;
++    if (slot != XUserIndexAny) profiles->Logout(slot, false);
++    profiles->Login(xuid, slot);
++    XELOGI("Guide: signed in {:016X} on controller {}", xuid, user);
++    EndSignIn();
++  });
++}
++
++bool GuideOverlay::ComposeSignInPage(float ppu, Pixels& out) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  const std::vector<SiProfile> profiles = sn_profiles_;
++  const bool status = sn_status_;
++  const int focus = sn_focus_, top = sn_top_;
++  lock.unlock();
++  // XamReadImage(0xB): the profile's gamer picture. The listed profiles are
++  // not signed in (no User_ device mounted), so it is read from the
++  // profile's folder (tile_64.png, as UserProfile::LoadProfileIcon).
++  auto* profile_manager =
++      emulator_->kernel_state()->xam_state()->profile_manager();
++  auto picture_of = [&](uint64_t xuid) -> const Pixels* {
++    std::ifstream in(profile_manager->GetProfilePath(xuid) / "tile_64.png",
++                     std::ios::binary);
++    std::vector<uint8_t> icon((std::istreambuf_iterator<char>(in)),
++                              std::istreambuf_iterator<char>());
++    return VgPicture(fmt::format("p{:016X}_{}", xuid, icon.size()), icon);
++  };
++  std::lock_guard<std::mutex> images_lock(prepare_mutex_);
++  if (!scaled_ready_ || scaled_ppu_ != ppu) return false;
++  auto it = scaled_.find(status ? "si_status" : "si_list");
++  if (it == scaled_.end()) return false;
++  out = it->second;
++  auto text = [&](const std::string& name, const std::u16string& value,
++                  float dx = 0, float dy = 0) {
++    auto t = sn_text_.find(name);
++    if (t == sn_text_.end()) return;
++    MessageBoxItem item = t->second;
++    item.x += dx;
++    item.y += dy;
++    RenderText(out, item, value, ppu);
++  };
++  auto picture = [&](const std::string& name, const Pixels* p, float dx = 0,
++                     float dy = 0) {
++    auto r = sn_image_.find(name);
++    if (p && r != sn_image_.end()) {
++      DrawPictureInto(out, *p, r->second[0] + dx, r->second[1] + dy,
++                      r->second[2], r->second[3], ppu);
++    }
++  };
++  if (status) {
++    if (focus >= 0 && focus < int(profiles.size())) {
++      const SiProfile& p = profiles[focus];
++      text("st_l1", p.gamertag);
++      text("st_l2", p.live);
++      text("st_l3", p.device);
++      picture("st_img", picture_of(p.xuid));
++    }
++    return true;
++  }
++  const int visible = std::max(1, int(sn_list_[4]));
++  for (int i = top; i < int(profiles.size()) && i < top + visible; ++i) {
++    const float x = sn_list_[0], y = sn_list_[1] + (i - top) * sn_list_[3];
++    const std::string state = i == focus ? "focus" : "normal";
++    auto img = scaled_.find("si_row_" + state);
++    if (img != scaled_.end()) {
++      const Pixels& p = img->second;
++      const int ox0 = int(std::lround(x * ppu)), oy0 = int(std::lround(y * ppu));
++      for (int yy = 0; yy < p.height; ++yy) {
++        int oy = oy0 + yy;
++        if (oy < 0 || oy >= out.height) continue;
++        for (int xx = 0; xx < p.width; ++xx) {
++          int ox = ox0 + xx;
++          if (ox < 0 || ox >= out.width) continue;
++          const uint8_t* c = &p.rgba[(size_t(yy) * p.width + xx) * 4];
++          BlendPixel(&out.rgba[(size_t(oy) * out.width + ox) * 4],
++                     c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f,
++                     c[3] / 255.0f);
++        }
++      }
++    }
++    const SiProfile& p = profiles[i];
++    const std::string key = "row_" + state + "_";
++    text(key + "l1", p.gamertag, x, y);
++    text(key + "l2", p.live, x, y);
++    text(key + "l3", p.device, x, y);
++    picture(key + "img", picture_of(p.xuid), x, y);
++  }
++  return true;
+ }
+ 
+ // Congratulations' gamerTileImage: the picture (xam's 64x64 PNG, read by
+@@ -4715,6 +4984,9 @@ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+   if (GpKey(page)) {
+     return ComposeGamerProfilePage(page, ppu, out);
+   }
++  if (page == Page::kSignIn) {
++    return ComposeSignInPage(ppu, out);
++  }
+   std::lock_guard<std::mutex> images_lock(prepare_mutex_);
+   if (!scaled_ready_ || scaled_ppu_ != ppu) {
+     return false;
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 644218911..49348cdb7 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -120,7 +120,10 @@ class GuideOverlay {
+     kGpGsInfo,
+     // hud.xex: X "Sign Out"'s message box, then Status.xur ("Signing out")
+     kSignOut,
+-    kSigningOut
++    kSigningOut,
++    // signin.xex (XamShowSigninUIp, 1 pane): signin1.xur's UserList, then
++    // its status pane
++    kSignIn
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+@@ -425,6 +428,25 @@ class GuideOverlay {
+                        bool signed_in);
+   // XamShowSigninUIp: signin.xex's panes in the Guide.
+   bool ShowSignIn(uint32_t user_index);
++  struct SiProfile {
++    uint64_t xuid = 0;
++    std::u16string gamertag, live, device;
++  };
++  std::map<std::string, MessageBoxItem> sn_text_;
++  std::map<std::string, std::array<float, 4>> sn_image_;
++  float sn_list_[6] = {};  // x, y, row w, row h, visible rows, host scale
++  std::map<int, std::u16string> sn_str_;
++  bool sn_ready_ = false;
++  void LoadSignInLayout();
++  bool ComposeSignInPage(float ppu, Pixels& out);
++  void SignInMove(Direction direction);  // mutex_ held
++  void SignInActivate();
++  void EndSignIn();
++  // Under mutex_:
++  bool sn_active_ = false, sn_status_ = false;
++  std::vector<SiProfile> sn_profiles_;
++  int sn_focus_ = 0, sn_top_ = 0;
++  uint32_t sn_user_ = 0;
+   std::map<std::string, MessageBoxItem> si_text_;
+   std::array<float, 4> si_tile_ = {};
+   std::map<int, std::u16string> si_str_;
+diff --git a/src/xenia/kernel/xam/profile_manager.h b/src/xenia/kernel/xam/profile_manager.h
+index cf537df83..da55efcd4 100644
+--- a/src/xenia/kernel/xam/profile_manager.h
++++ b/src/xenia/kernel/xam/profile_manager.h
+@@ -114,6 +114,9 @@ class ProfileManager {
+   // XamProfileRenameAccount: the profile's gamertag, saved in its Account.
+   bool RenameProfile(const uint64_t xuid, const std::u16string& gamertag);
+ 
++  // The profile's folder (Account, tile_64.png, the GPDs).
++  std::filesystem::path GetProfilePath(const uint64_t xuid) const;
++
+   static bool IsGamertagValid(const std::string gamertag);
+ 
+  private:
+@@ -121,7 +124,6 @@ class ProfileManager {
+   bool CreateAccount(const uint64_t xuid, const std::string gamertag);
+   bool CreateAccount(const uint64_t xuid, const X_XAMACCOUNTINFO* account);
+ 
+-  std::filesystem::path GetProfilePath(const uint64_t xuid) const;
+   std::filesystem::path GetProfilePath(const std::string xuid) const;
+ 
+   std::vector<uint64_t> FindProfiles() const;
+-- 
+2.55.0.windows.3
+

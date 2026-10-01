@@ -1,0 +1,616 @@
+From 7f025c9cce5b95848baae7c06eeacf4a0e79b919 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 21:33:51 +0530
+Subject: [PATCH 19/51] Create profile: default name, AddXboxLive paths as
+ createprofile.xex does
+
+- vk's highlighted default text: PlayerN (first unused), brush
+  0x64B0DCAB; a character/Backspace replaces it, cursor keys keep it;
+  the keyboard reopens with the name after an error or Back.
+- All three Save Gamer Profile buttons save the profile and sign it in on
+  the controller that created it (XamUserLogon); Join Xbox Live then asks
+  once (retail flags 0x4) and shows Can't Connect, Test Connection ->
+  Exit Session; Cancel/No go back to Save Gamer Profile.
+- XCONFIG_USER_RETAIL_FLAGS is kept (cvar retail_flags, saved on
+  ExSetXConfigSetting).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/xenia/app/guide_overlay.cc                | 280 ++++++++++++++++--
+ src/xenia/app/guide_overlay.h                 |  28 +-
+ src/xenia/kernel/xam/xam_ui.cc                |   4 +-
+ src/xenia/kernel/xam/xam_ui.h                 |   3 +-
+ src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc |  22 +-
+ src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h  |   3 +
+ 6 files changed, 300 insertions(+), 40 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index b4563f0b5..29d54ba98 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -12,6 +12,7 @@
+ #include <cstdlib>
+ #include <ctime>
+ #include <fstream>
++#include <set>
+ #include <sstream>
+ #include <vector>
+ 
+@@ -35,6 +36,7 @@
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/xam/xam_state.h"
+ #include "xenia/kernel/xam/xam_ui.h"
++#include "xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h"
+ #include "xenia/ui/imgui_dialog.h"
+ #include "xenia/ui/imgui_drawer.h"
+ #include "xenia/ui/windowed_app_context.h"
+@@ -43,6 +45,7 @@
+ 
+ DECLARE_bool(blades_guide);
+ DECLARE_bool(dashboard_handoff);
++DECLARE_uint32(retail_flags);
+ DEFINE_string(blades_guide_test, "",
+               "Debug: open the Guide by itself, \"<delay ms>[,<menu item 0-4>"
+               "|exit|off[,yes]]\", for screenshots.",
+@@ -51,6 +54,13 @@ DEFINE_string(blades_guide_test, "",
+ namespace xe {
+ namespace app {
+ 
++struct GuideOverlay::NextProfileBox {
++  kernel::xam::TitleMessageBox box;
++  Page return_to;
++  std::function<void(int)> done;
++};
++
++
+ namespace {
+ using Clock = std::chrono::steady_clock;
+ 
+@@ -103,7 +113,9 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadMessageBoxLayout();
+   LoadCreateProfileLayout();
+   input_thread_ = std::thread([this]() { InputThread(); });
+-  kernel::xam::create_profile_ui_hook = [this]() { return ShowCreateProfile(); };
++  kernel::xam::create_profile_ui_hook = [this](uint32_t user_index) {
++    return ShowCreateProfile(user_index);
++  };
+   kernel::xam::title_message_box_hook =
+       [this](const kernel::xam::TitleMessageBox& box,
+              std::function<void(int)> done) {
+@@ -654,10 +666,9 @@ void GuideOverlay::Activate() {
+     return;
+   }
+   if (page == Page::kProfileError) {
+-    // OK: the keyboard again, with the name (ErrorToFull)
+     lock.unlock();
+     PlaySfx("btn_Select");
+-    DismissMessageBox();
++    AnswerProfileBox(choice);
+     return;
+   }
+   if (page == Page::kTitleMessage) {
+@@ -695,9 +706,9 @@ void GuideOverlay::Back() {
+     return;
+   }
+   if (page_ == Page::kSaveProfile) {
+-    // Back_Functionality: back to the keyboard with the name
+-    page_ = Page::kKeyboard;
+-    ++page_version_;
++    // Back_Functionality: createprofile opens the keyboard again with the
++    // name as its default text
++    OpenKeyboard(kbd_text_);
+     lock.unlock();
+     PlaySfx("btn_Back");
+     return;
+@@ -705,7 +716,7 @@ void GuideOverlay::Back() {
+   if (page_ == Page::kProfileError) {
+     lock.unlock();
+     PlaySfx("btn_Back");
+-    DismissMessageBox();
++    AnswerProfileBox(-1);  // xam's hidden cancel button
+     return;
+   }
+   if (page_ == Page::kTitleMessage) {
+@@ -790,6 +801,10 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+     if (page_ == Page::kProfileError) {
+       page_ = profile_box_return_;
+       ++page_version_;
++      if (profile_box_next_) {
++        auto next = std::move(profile_box_next_);
++        ShowProfileBox(next->box, next->return_to, std::move(next->done));
++      }
+     } else if (page_ != Page::kKeyboard && page_ != Page::kSaveProfile) {
+       page_ = Page::kMenu;
+     }
+@@ -1778,22 +1793,36 @@ void GuideOverlay::PrepareCreateProfileImages(float ppu) {
+              .count());
+ }
+ 
+-bool GuideOverlay::ShowCreateProfile() {
++bool GuideOverlay::ShowCreateProfile(uint32_t user_index) {
+   if (!create_profile_ready_) {
+     return false;
+   }
++  // createprofile 90106758: the default name is "Player%u" with the first
++  // number no profile on the console uses (its set of gamertags hashes and
++  // compares them exactly).
++  std::set<std::string> taken;
++  auto* profiles = emulator_->kernel_state()->xam_state()->profile_manager();
++  for (const auto& [xuid, account] : *profiles->GetAccounts()) {
++    taken.insert(account.GetGamertagString());
++  }
++  unsigned number = 1;
++  while (taken.count("Player" + std::to_string(number))) {
++    ++number;
++  }
++  const std::u16string default_name =
++      xe::to_utf16("Player" + std::to_string(number));
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+     if (mode_ != Mode::kClosed || create_profile_active_) {
+       return false;
+     }
+     create_profile_active_ = true;
+-    kbd_text_.clear();
+-    kbd_cursor_ = 0;
+-    kbd_caps_ = false;
+-    kbd_focus_ = kbd_default_;
++    create_user_index_ = user_index;
++    created_xuid_ = 0;
++    profile_box_done_ = nullptr;
++    profile_box_next_.reset();
+     save_focus_ = save_default_;
+-    ++page_version_;
++    OpenKeyboard(default_name);
+   }
+   // Prepared for the screen's size; if the Guide has not been drawn yet, the
+   // first frame does it (Draw).
+@@ -1827,6 +1856,21 @@ void GuideOverlay::EndCreateProfile() {
+   }).detach();
+ }
+ 
++void GuideOverlay::OpenKeyboard(const std::u16string& text) {
++  // createprofile 901068A0 passes the name (or the default one) with VKBD
++  // flags 0x20000004; vk 917EF6E8 highlights it (XuiEditSetTextFormatInfo,
++  // brush 0x64B0DCAB) with the caret at its end. A new keyboard each time:
++  // its default focus, no Caps.
++  kbd_text_ = text;
++  kbd_cursor_ = int(text.size());
++  kbd_default_active_ = !text.empty();
++  kbd_caps_ = false;
++  kbd_focus_ = kbd_default_;
++  page_ = Page::kKeyboard;
++  caret_start_ = Clock::now();
++  ++page_version_;
++}
++
+ void GuideOverlay::KeyboardPress(const std::string& id) {
+   auto it = kbd_keys_.find(id);
+   if (it == kbd_keys_.end() || !it->second.enabled) {
+@@ -1834,6 +1878,23 @@ void GuideOverlay::KeyboardPress(const std::string& id) {
+   }
+   const KeyboardKey& key = it->second;
+   constexpr size_t kMaxLength = 15;  // createprofile passes 15
++  if (kbd_default_active_) {
++    // vk 917EF804: a character (Space too), Backspace or Delete first
++    // selects all of the highlighted text, so it is replaced; the cursor
++    // keys only take the highlight away. Other keys leave it.
++    if (key.ch || id == "Key.Spc" || id == "Key.BS") {
++      kbd_text_.clear();
++      kbd_cursor_ = 0;
++      kbd_default_active_ = false;
++      if (id == "Key.BS") {
++        caret_start_ = Clock::now();
++        ++page_version_;
++        return;  // the selection was what it deleted
++      }
++    } else if (id == "Key.Left" || id == "Key.Right") {
++      kbd_default_active_ = false;
++    }
++  }
+   if (key.ch) {
+     if (kbd_text_.size() < kMaxLength) {
+       char16_t c = key.ch;
+@@ -1924,6 +1985,9 @@ void GuideOverlay::KeyboardSubmit() {
+     box.text = error;
+     box.buttons = {profile_strings_["ok"]};
+     ShowProfileBox(box, Page::kKeyboard);
++    // behind the box: the keyboard opened again with what was typed
++    OpenKeyboard(kbd_text_);
++    page_ = Page::kProfileError;
+     return;
+   }
+   kbd_text_ = name;
+@@ -1933,8 +1997,32 @@ void GuideOverlay::KeyboardSubmit() {
+   ++page_version_;
+ }
+ 
++void GuideOverlay::QueueProfileBox(const kernel::xam::TitleMessageBox& box,
++                                   Page return_to,
++                                   std::function<void(int)> done) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  profile_box_next_ = std::make_unique<NextProfileBox>(
++      NextProfileBox{box, return_to, std::move(done)});
++}
++
++void GuideOverlay::AnswerProfileBox(int choice) {
++  std::function<void(int)> done;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    done = std::move(profile_box_done_);
++    profile_box_done_ = nullptr;
++  }
++  if (done) {
++    done(choice);
++  } else {
++    DismissMessageBox();  // back to profile_box_return_ (ErrorToFull)
++  }
++}
++
+ void GuideOverlay::ShowProfileBox(const kernel::xam::TitleMessageBox& box,
+-                                  Page return_to) {
++                                  Page return_to,
++                                  std::function<void(int)> done) {
++  profile_box_done_ = std::move(done);
+   float ppu = scaled_ppu_ > 0 ? scaled_ppu_ : layout_.scale;
+   std::map<std::string, Pixels> images;
+   for (int focus = 0; focus < int(box.buttons.size()); ++focus) {
+@@ -1962,31 +2050,136 @@ void GuideOverlay::ShowProfileBox(const kernel::xam::TitleMessageBox& box,
+   transition_start_ = Clock::now();
+ }
+ 
++// Congratulations (90104124): each button sets what follows (app +0x94:
++// 1 Done, 2 Customize Profile, 3 Join Xbox Live) and opens AddXboxLive.xur,
++// which saves the profile and signs it in for all three; only Join Xbox Live
++// goes on to its Xbox Live checks (90103450 -> 90103278).
+ void GuideOverlay::SaveProfilePress() {
+-  std::unique_lock<std::mutex> lock(mutex_);
+-  if (save_focus_ != "doneButton") {
+-    // Join Xbox Live / Customize Profile: AddXboxLive.xur checks the network;
+-    // without one createprofile shows "Can't Connect" (901030D8).
+-    kernel::xam::TitleMessageBox box;
++  std::string focus;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    focus = save_focus_;
++  }
++  PlaySfx("btn_Select");
++  if (!SaveProfile()) {
++    EndCreateProfile();
++    return;
++  }
++  if (focus == "getLiveButton") {
++    JoinXboxLive();
++    return;
++  }
++  if (focus == "editProfileButton") {
++    // 90104AA8: XamAppLoad("gamerprofile.xex", mode 3), Edit Gamer Profile.
++    XELOGW("Guide: Edit Gamer Profile (gamerprofile.xex) is not built yet");
++  }
++  EndCreateProfile();
++}
++
++bool GuideOverlay::SaveProfile() {
++  std::string name;
++  uint32_t user_index;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (created_xuid_) {
++      return true;  // saved on an earlier pass (90103768: +0x98 set)
++    }
++    name = xe::to_utf8(kbd_text_);
++    user_index = create_user_index_;
++  }
++  auto* profiles = emulator_->kernel_state()->xam_state()->profile_manager();
++  if (!profiles->CreateProfile(name, false, false)) {
++    XELOGE("Guide: profile \"{}\" NOT created", name);
++    return false;
++  }
++  uint64_t xuid = 0;
++  for (const auto& [id, account] : *profiles->GetAccounts()) {
++    if (account.GetGamertagString() == name) {
++      xuid = id;
++    }
++  }
++  // 90103530 -> 90102820: XamUserLogon with the new profile on the
++  // controller that created it, in place of whoever was signed in there.
++  if (xuid) {
++    uint8_t slot = user_index < 4 ? uint8_t(user_index) : XUserIndexAny;
++    if (slot != XUserIndexAny) {
++      profiles->Logout(slot, false);
++    }
++    profiles->Login(xuid, slot);
++  }
++  XELOGI("Guide: profile \"{}\" created, signed in on controller {}", name,
++         user_index);
++  std::lock_guard<std::mutex> lock(mutex_);
++  created_xuid_ = xuid ? xuid : 1;
++  return true;
++}
++
++void GuideOverlay::JoinXboxLive() {
++  using kernel::xam::TitleMessageBox;
++  auto back = [this](int) {
++    // 90102CE8: XuiSceneNavigateBack, to Save Gamer Profile
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      profile_box_return_ = Page::kSaveProfile;
++    }
++    DismissMessageBox();
++  };
++  // 901028F8: network status; offline, 901030D8 "Can't Connect".
++  auto cant_connect = [this, back]() {
++    TitleMessageBox box;
+     box.title = profile_strings_["cant_title"];
+     box.text = profile_strings_["cant_text"];
+     box.buttons = {profile_strings_["test"], profile_strings_["cancel"]};
+     box.focus = 0;
+     box.icon = 1;  // XamShowMessageBox flags 1
+-    ShowProfileBox(box, Page::kSaveProfile);
+-    lock.unlock();
+-    PlaySfx("btn_Select");
++    return std::make_pair(box, std::function<void(int)>([this, back](int c) {
++      if (c != 0) {
++        back(c);  // Cancel / B
++        return;
++      }
++      // Test Connection (90102E60): "Exit Session", [Yes, No], No focused.
++      TitleMessageBox exit;
++      exit.title = profile_strings_["exit_title"];
++      exit.text = profile_strings_["exit_text"];
++      exit.buttons = {profile_strings_["yes"], profile_strings_["no"]};
++      exit.focus = 1;
++      exit.icon = 3;  // flags 3
++      QueueProfileBox(exit, Page::kSaveProfile, [this, back](int e) {
++        if (e != 0) {
++          back(e);
++          return;
++        }
++        // 90102AD8: the dashboard again with launch data 2 (its network
++        // test), which is not available here.
++        XELOGW("Guide: the dashboard's connection test is not available");
++        EndCreateProfile();
++      });
++      DismissMessageBox();
++    }));
++  };
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (cvars::retail_flags & 0x4) {
++    auto [box, done] = cant_connect();
++    ShowProfileBox(box, Page::kSaveProfile, done);
+     return;
+   }
+-  std::string name = xe::to_utf8(kbd_text_);
+-  lock.unlock();
+-  PlaySfx("btn_Select");
+-  auto* profiles = emulator_->kernel_state()->xam_state()->profile_manager();
+-  // Signed in when nobody else is.
+-  bool autologin = !profiles->IsAnyProfileSignedIn();
+-  bool created = profiles->CreateProfile(name, autologin, false);
+-  XELOGI("Guide: profile \"{}\" {}", name, created ? "created" : "NOT created");
+-  EndCreateProfile();
++  // 90102D78: XCONFIG_USER_RETAIL_FLAGS without 0x4: asked first.
++  TitleMessageBox ask;
++  ask.title = profile_strings_["live_title"];
++  ask.text = profile_strings_["live_text"];
++  ask.buttons = {profile_strings_["live_yes"], profile_strings_["live_no"]};
++  ask.focus = 0;
++  ask.icon = 1;  // flags 1
++  ShowProfileBox(ask, Page::kSaveProfile, [this, back, cant_connect](int c) {
++    if (c != 0) {
++      back(c);  // No, not now / B
++      return;
++    }
++    kernel::xboxkrnl::SetRetailFlags(cvars::retail_flags | 0x4);
++    auto [box, done] = cant_connect();
++    QueueProfileBox(box, Page::kSaveProfile, done);
++    DismissMessageBox();
++  });
+ }
+ 
+ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+@@ -1994,6 +2187,7 @@ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+   const Page page = page_;
+   const std::u16string text = kbd_text_;
+   const bool caps = kbd_caps_;
++  const bool highlight = kbd_default_active_;
+   const std::string focus = page == Page::kSaveProfile ? save_focus_ : kbd_focus_;
+   lock.unlock();
+   std::lock_guard<std::mutex> images_lock(prepare_mutex_);
+@@ -2036,6 +2230,30 @@ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+   }
+   RenderText(out, kbd_title_, profile_strings_["title"], ppu);
+   RenderText(out, kbd_prompt_, profile_strings_["prompt"], ppu);
++  if (highlight && font_ && !text.empty()) {
++    // vk's default text format: a solid brush 0x64B0DCAB behind the run
++    const float scale =
++        stbtt_ScaleForMappingEmToPixels(font_.get(), kbd_edit_.size * ppu);
++    float width = 0;
++    for (char16_t c : text) {
++      int adv, lsb;
++      stbtt_GetCodepointHMetrics(font_.get(), c, &adv, &lsb);
++      width += adv * scale;
++    }
++    const float top = (kbd_edit_.style & 0x1000)
++                          ? (kbd_edit_.h - kbd_edit_.line_h) / 2 * ppu
++                          : 0.0f;
++    const int x0 = int(std::lround(kbd_edit_.x * ppu));
++    const int x1 = int(std::lround(kbd_edit_.x * ppu + width));
++    const int y0 = int(std::lround(kbd_edit_.y * ppu + top));
++    const int y1 = int(std::lround(kbd_edit_.y * ppu + top + kbd_edit_.line_h * ppu));
++    for (int y = std::max(0, y0); y < std::min(out.height, y1); ++y) {
++      for (int x = std::max(0, x0); x < std::min(out.width, x1); ++x) {
++        BlendPixel(&out.rgba[(size_t(y) * out.width + x) * 4], 0xB0 / 255.0f,
++                   0xDC / 255.0f, 0xAB / 255.0f, 0x64 / 255.0f);
++      }
++    }
++  }
+   RenderText(out, kbd_edit_, text, ppu);
+   // Captions: vk's key table (upper case with Caps), its string table for
+   // Caps/Done/Backspace/Accents, the scene's own for the rest.
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 1f1863619..932ad6ca6 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -61,9 +61,9 @@ class GuideOverlay {
+                            std::function<void(int)> done);
+ 
+   // XamShowCreateProfileUI: createprofile.xex's screens in the Guide (vk.xex's
+-  // keyboard for the name, then "Save Gamer Profile"). False if the Guide is
+-  // busy or the screens' assets are missing.
+-  bool ShowCreateProfile();
++  // keyboard for the name, then "Save Gamer Profile") for the controller
++  // `user_index`. False if the Guide is busy or the assets are missing.
++  bool ShowCreateProfile(uint32_t user_index);
+ 
+  private:
+   class Dialog;
+@@ -252,16 +252,36 @@ class GuideOverlay {
+   std::u16string kbd_text_;
+   int kbd_cursor_ = 0;
+   bool kbd_caps_ = false;
++  // vk's highlighted default text (VKBD flag 0x20000000): the next character,
++  // Backspace or Delete replaces all of it, a cursor key keeps it.
++  bool kbd_default_active_ = false;
+   std::string kbd_focus_, save_focus_;
+   bool create_profile_active_ = false;
++  uint32_t create_user_index_ = 0;  // the controller creating the profile
++  uint64_t created_xuid_ = 0;       // once saved (AddXboxLive), else 0
+   Page profile_box_return_ = Page::kKeyboard;  // after kProfileError
++  // When set, gets the answer to the profile box (button, -1 = B) instead of
++  // returning to profile_box_return_. Called without mutex_.
++  std::function<void(int)> profile_box_done_;
++  // A box to show once the answered one has slid away (ErrorToFull, then
++  // FullToError), for createprofile's boxes that follow one another.
++  struct NextProfileBox;  // guide_overlay.cc
++  std::unique_ptr<NextProfileBox> profile_box_next_;
++  void QueueProfileBox(const kernel::xam::TitleMessageBox& box, Page return_to,
++                       std::function<void(int)> done);  // then dismisses
+   uint64_t page_version_ = 1;  // bumped when the composed page changes
+   void KeyboardPress(const std::string& key);  // A on a key (mutex_ held)
+   void KeyboardSubmit();                       // Done (mutex_ held)
++  // The keyboard (again) with `text` as vk's highlighted default text.
++  void OpenKeyboard(const std::u16string& text);  // mutex_ held
+   // A console message box over the profile pages (FullToError), back to
+   // `return_to` when answered (ErrorToFull). mutex_ held.
+-  void ShowProfileBox(const kernel::xam::TitleMessageBox& box, Page return_to);
++  void ShowProfileBox(const kernel::xam::TitleMessageBox& box, Page return_to,
++                      std::function<void(int)> done = nullptr);
++  void AnswerProfileBox(int choice);           // A / B on a profile box
+   void SaveProfilePress();                     // A on Save Gamer Profile
++  bool SaveProfile();  // AddXboxLive: create, sign in; false if it failed
++  void JoinXboxLive();                         // AddXboxLive's Live checks
+   void EndCreateProfile();                     // leave, closing the Guide
+   // Composition at the screen's pixels per unit (UI thread).
+   std::map<std::string, Pixels> scaled_;  // assets resampled for scaled_ppu_
+diff --git a/src/xenia/kernel/xam/xam_ui.cc b/src/xenia/kernel/xam/xam_ui.cc
+index 3400da516..22795dc91 100644
+--- a/src/xenia/kernel/xam/xam_ui.cc
++++ b/src/xenia/kernel/xam/xam_ui.cc
+@@ -445,7 +445,7 @@ dword_result_t XamIsUIActive_entry() {
+ DECLARE_XAM_EXPORT2(XamIsUIActive, kUI, kImplemented, kHighFrequency);
+ 
+ std::function<bool()> live_upsell_ui_hook;
+-std::function<bool()> create_profile_ui_hook;
++std::function<bool(uint32_t user_index)> create_profile_ui_hook;
+ std::function<bool(const TitleMessageBox&, std::function<void(int)>)>
+     title_message_box_hook;
+ 
+@@ -1015,7 +1015,7 @@ X_RESULT xeXamShowCreateProfileUIEx(uint32_t user_index, dword_t flag,
+     return X_ERROR_SUCCESS;
+   }
+ 
+-  if (create_profile_ui_hook && create_profile_ui_hook()) {
++  if (create_profile_ui_hook && create_profile_ui_hook(user_index)) {
+     return X_ERROR_SUCCESS;  // createprofile.xex's screens in the Guide
+   }
+ 
+diff --git a/src/xenia/kernel/xam/xam_ui.h b/src/xenia/kernel/xam/xam_ui.h
+index e937e1895..e43455fda 100644
+--- a/src/xenia/kernel/xam/xam_ui.h
++++ b/src/xenia/kernel/xam/xam_ui.h
+@@ -24,7 +24,8 @@ extern std::function<bool()> live_upsell_ui_hook;
+ 
+ // Shows the console's profile creation (XamShowCreateProfileUI) when the host
+ // has it (the Blades Guide overlay); returns whether it did.
+-extern std::function<bool()> create_profile_ui_hook;
++// XamShowCreateProfileUI(Ex) with the controller that asked
++extern std::function<bool(uint32_t user_index)> create_profile_ui_hook;
+ 
+ // A message box (XamShowMessageBoxUI) for the host to show as the console
+ // does (the Blades Guide overlay's ErrorHUD). The hook returns false if it
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
+index 82c44f0e5..7b323992c 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h"
+ #include "xenia/base/logging.h"
++#include "xenia/config.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/util/shim_utils.h"
+ #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+@@ -53,6 +54,12 @@ DEFINE_uint32(
+     " optional. Ex) 0x00010001\n",
+     "XConfig");
+ 
++DEFINE_uint32(retail_flags, 0x40,
++              "XCONFIG_USER_RETAIL_FLAGS, kept like the console's own setting "
++              "(ExSetXConfigSetting). 0x4 = information for Xbox Live added "
++              "(createprofile asks once before joining).",
++              "XConfig");
++
+ DECLARE_bool(widescreen);
+ DECLARE_bool(use_50Hz_mode);
+ DECLARE_int32(video_standard);
+@@ -131,8 +138,7 @@ X_STATUS xeExGetXConfigSetting(X_CONFIG_CATEGORY category, uint16_t setting,
+           break;
+         case XCONFIG_USER_RETAIL_FLAGS:
+           setting_size = 4;
+-          // TODO(benvanik): get this value.
+-          xe::store_and_swap<uint32_t>(value, 0x40);
++          xe::store_and_swap<uint32_t>(value, cvars::retail_flags);
+           break;
+         case XCONFIG_USER_COUNTRY:
+           setting_size = 1;
+@@ -340,10 +346,22 @@ dword_result_t ExSetXConfigSetting_entry(word_t category, word_t setting,
+   */
+   XELOGI("ExSetXConfigSetting: category: 0X{:04x}, setting: 0X{:04x}",
+          static_cast<uint16_t>(category), static_cast<uint16_t>(setting));
++  if (category == XCONFIG_USER_CATEGORY &&
++      setting == XCONFIG_USER_RETAIL_FLAGS && buffer_ptr && buffer_size >= 4) {
++    SetRetailFlags(xe::load_and_swap<uint32_t>(buffer_ptr));
++  }
+   return X_STATUS_SUCCESS;
+ }
+ DECLARE_XBOXKRNL_EXPORT1(ExSetXConfigSetting, kModules, kStub);
+ 
++void SetRetailFlags(uint32_t flags) {
++  if (cvars::retail_flags == flags) {
++    return;
++  }
++  OVERRIDE_uint32(retail_flags, flags);
++  config::SaveConfig();  // kept across boots, as in the console's flash
++}
++
+ dword_result_t ExReadModifyWriteXConfigSettingUlong_entry(word_t category,
+                                                           word_t setting,
+                                                           dword_t bit_affected,
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h
+index d9d79c0c7..6b52f45c1 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h
+@@ -388,6 +388,9 @@ enum X_KEYBOARD_LAYOUT : uint16_t {
+   EnglishQWERTY = 0x0001,
+ };
+ 
++// XCONFIG_USER_RETAIL_FLAGS as ExSetXConfigSetting writes it (saved).
++void SetRetailFlags(uint32_t flags);
++
+ }  // namespace xboxkrnl
+ }  // namespace kernel
+ }  // namespace xe
+-- 
+2.55.0.windows.3
+

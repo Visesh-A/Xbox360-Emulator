@@ -1,0 +1,244 @@
+From 3e32da7acfdbc8a13de0a1213679a914010f7671 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 11:29:54 +0530
+Subject: [PATCH 24/51] Guide: frame base, blade and ring of light placed by
+ hudbkgnd's keyframes
+
+The Guide's frame pieces now move by their own keyframes (hud_keys.txt,
+evaluated with xam's easing) at the HUD's current frame, instead of whole
+frame images slid by one distance:
+- full <-> half slides: base and blade move by their own amounts (-409 /
+  -407.5), so the blade no longer jumps 1.5 units at the end;
+- the ring of light is a layer of its own, as in hudbkgnd: hidden while the
+  Guide slides open and fading in at the end (30-44), resting at 618 after
+  ClosedToHalf but 617 after FullToHalf / ErrorToHalf, 1025 after
+  ClosedToFull but 1026 after HalfToFull.
+The page images no longer contain it (the asset generators hide ROL).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 131 ++++++++++++++++++++++++++++++---
+ src/xenia/app/guide_overlay.h  |  15 ++++
+ 2 files changed, 136 insertions(+), 10 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index b6c4e242b..be85d97ed 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -130,6 +130,7 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadMessageBoxLayout();
+   LoadCreateProfileLayout();
+   LoadAddXboxLiveLayout();
++  LoadHudKeys();
+   input_thread_ = std::thread([this]() { InputThread(); });
+   schedule_thread_ = std::thread([this]() { ScheduleThread(); });
+   kernel::xam::create_profile_ui_hook = [this](uint32_t user_index) {
+@@ -908,7 +909,8 @@ void ResampleAxis(const std::vector<float>& in, std::vector<float>& out,
+ // Every image the Guide draws, most urgent (first frames of the slide) first.
+ // Besides one menu_<item> image per focusable menu control (layout.txt).
+ const char* const kImages[] = {
+-    "chrome",         "clock_atlas",     "chrome_full",   "legends_menu",
++    "hud_base",       "hud_blade",       "clock_atlas",   "hud_rol",
++    "legends_menu",
+     "upsell_live",    "legends_upsell",  "battery_1",
+     "battery_2",      "battery_3",       "battery_4",     "error_exit_no",
+     "error_exit_yes", "error_off_no",    "error_off_yes"};
+@@ -966,7 +968,7 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+   // in on the first frames (half or full Guide), then the menu images.
+   std::vector<std::string> names(std::begin(kImages), std::end(kImages));
+   for (size_t i = 0; i < layout_.menu.size(); ++i) {
+-    names.insert(names.begin() + std::min<size_t>(4 + i, names.size()),
++    names.insert(names.begin() + std::min<size_t>(5 + i, names.size()),
+                  "menu_" + layout_.menu[i].id);
+   }
+   if (!axl_spin_.empty()) {
+@@ -1198,6 +1200,52 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   if (!half_visible) {
+     clock_alpha = 0;
+   }
++  // hudbkgnd's frame now: ClosedToHalf 1-44, HalfToClosed 45-74, HalfToFull
++  // 75-119, FullToHalf 120-163, ClosedToFull 164-193, FullToClosed 194-223,
++  // ClosedToError 239-268, ErrorToClosed 269-298, HalfToError 299-358,
++  // ErrorToHalf 359-418, FullToError 419-478, ErrorToFull 479-538; at rest
++  // the end of the last one.
++  float hud_f = hud_rest_;
++  switch (view.mode) {
++    case Mode::kOpening:
++      hud_rest_ = message_box ? 268.0f : full ? 193.0f : 44.0f;
++      hud_f = std::min(hud_rest_, (message_box ? 239.0f
++                                   : full      ? 164.0f
++                                               : 1.0f) +
++                                      view.frames);
++      break;
++    case Mode::kClosing:
++      hud_f = message_box ? 269.0f + std::min(view.frames, 29.0f)
++              : full      ? 194.0f + std::min(view.frames, 29.0f)
++                          : 45.0f + std::min(view.frames, 29.0f);
++      break;
++    case Mode::kOpen: {
++      float t = view.transition_frames;
++      switch (view.transition) {
++        case Transition::kToError:
++          hud_rest_ = full ? 478.0f : 358.0f;
++          hud_f = std::min(hud_rest_, (full ? 419.0f : 299.0f) + t);
++          break;
++        case Transition::kFromError:
++          hud_rest_ = full ? 538.0f : 418.0f;
++          hud_f = std::min(hud_rest_, (full ? 479.0f : 359.0f) + t);
++          break;
++        case Transition::kFullToHalf:
++          hud_rest_ = 163.0f;
++          hud_f = std::min(hud_rest_, 120.0f + t);
++          break;
++        case Transition::kHalfToFull:
++          hud_rest_ = 119.0f;
++          hud_f = std::min(hud_rest_, 75.0f + t);
++          break;
++        default:
++          break;
++      }
++      break;
++    }
++    default:
++      break;
++  }
+ 
+   // The 1120x770 Guide canvas is drawn into the console's frame (720 lines
+   // for the 720p output, times Xenia's resolution scale) where the console
+@@ -1242,7 +1290,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     }
+   };
+ 
+-  if (view.mode == Mode::kOpening && !Texture("chrome", k)) {
++  if (view.mode == Mode::kOpening && !Texture("hud_base", k)) {
+     // First open at this size: the images are still being prepared. Hold
+     // the animation at its start (a few frames) rather than stutter.
+     std::lock_guard<std::mutex> lock(mutex_);
+@@ -1318,13 +1366,13 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   // console: some lines blend additively onto it), so the page fades in as a
+   // crossfade over the chrome and, fully shown, replaces it.
+   bool page_ready = !content.empty() && Texture(content, k);
+-  if (full_to_half >= 0.0f && full_to_half < 1.0f) {
+-    // base 12 -> -397, blade 991 -> 583.5 (the half frame from then on)
+-    layer("chrome_full", -409.0f * full_to_half, 1.0f);
+-  } else if (half_to_full >= 0.0f && content_alpha < 1.0f) {
+-    layer("chrome_full", -409.0f * (1.0f - half_to_full), 1.0f);
+-  } else if (!(page_ready && content_alpha >= 1.0f)) {
+-    layer(full ? "chrome_full" : "chrome", chrome_x, 1.0f);
++  if (!(page_ready && content_alpha >= 1.0f)) {
++    // The frame's base and blade, each where its keyframes put it (the
++    // images show them at rest in the full Guide: base 12, blade 991).
++    HudState base = HudAt("graphic-base", hud_f);
++    HudState blade = HudAt("graphic-blade", hud_f);
++    if (base.show) layer("hud_base", base.x - 12.0f, 1.0f);
++    if (blade.show) layer("hud_blade", blade.x - 991.0f, 1.0f);
+   }
+   if (content_visible) {
+     if (page_ready) {
+@@ -1458,6 +1506,15 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       pen += l.clock_advance.at(*c);
+     }
+   }
++
++  // The ring of light (hudbkgnd ROL, drawn over everything else in the frame)
++  // where its keyframes put it: it rests at 618 after ClosedToHalf but 617
++  // after FullToHalf or ErrorToHalf, and fades in only at the end of
++  // ClosedToHalf. The image shows it at 1025.037109 (the full Guide).
++  HudState rol = HudAt("ROL", hud_f);
++  if (rol.show && rol.opacity > 0.0f) {
++    layer("hud_rol", rol.x - 1025.037109f, rol.opacity);
++  }
+ }
+ 
+ // ------------------------------------------------------ title message boxes
+@@ -2452,6 +2509,60 @@ void GuideOverlay::ScheduleThread() {
+   }
+ }
+ 
++void GuideOverlay::LoadHudKeys() {
++  std::ifstream in(asset_dir_ / "hud_keys.txt");
++  std::string line;
++  while (std::getline(in, line)) {
++    std::istringstream ls(line);
++    std::string kind, id;
++    ls >> kind;
++    if (kind != "key") continue;
++    HudKey key;
++    int show = 1;
++    ls >> id >> key.t >> key.interp >> key.ease_in >> key.ease_out >>
++        key.ease_scale >> key.x >> show >> key.opacity;
++    key.show = show != 0;
++    hud_keys_[id].push_back(key);
++  }
++  if (hud_keys_.empty()) {
++    XELOGW("Guide: hud_keys.txt missing");
++  }
++}
++
++// A timeline value as XUI plays it: interpolation 0 linear to the next key,
++// 1 held, 2 eased (XuiEase); Show is held from the key before.
++GuideOverlay::HudState GuideOverlay::HudAt(const std::string& id,
++                                           float frame) const {
++  HudState state;
++  auto it = hud_keys_.find(id);
++  if (it == hud_keys_.end() || it->second.empty()) {
++    return state;
++  }
++  const std::vector<HudKey>& keys = it->second;
++  const HudKey* prev = &keys.front();
++  const HudKey* next = nullptr;
++  for (const HudKey& key : keys) {
++    if (key.t <= frame) {
++      prev = &key;
++    } else {
++      next = &key;
++      break;
++    }
++  }
++  state.x = prev->x;
++  state.opacity = prev->opacity;
++  state.show = prev->show;
++  if (next && prev->interp != 1 && frame > prev->t && next->t > prev->t) {
++    float u = (frame - prev->t) / float(next->t - prev->t);
++    if (prev->interp == 2) {
++      u = XuiEase(u, prev->ease_in, prev->ease_out, prev->ease_scale);
++    }
++    state.x += (next->x - prev->x) * u;
++    state.opacity += (next->opacity - prev->opacity) * u;
++  }
++  return state;
++}
++
+ void GuideOverlay::LoadAddXboxLiveLayout() {
+   std::ifstream in(asset_dir_ / "axl.txt");
+   std::string line;
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 837078da3..76a46c77f 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -323,6 +323,21 @@ class GuideOverlay {
+   float axl_text_ppu_ = 0;
+   uint64_t axl_text_drawn_ = 0;
+   void LoadAddXboxLiveLayout();
++  // hudbkgnd's own moving pieces (the frame's base and blade, the ring of
++  // light), placed by their keyframes at the HUD's current frame.
++  struct HudKey {
++    int t = 0, interp = 0;
++    float ease_in = 0, ease_out = 0, ease_scale = 50, x = 0, opacity = 1;
++    bool show = true;
++  };
++  struct HudState {
++    float x = 0, opacity = 1;
++    bool show = true;
++  };
++  std::map<std::string, std::vector<HudKey>> hud_keys_;
++  float hud_rest_ = 44;  // the frame the last HUD transition ended on
++  void LoadHudKeys();
++  HudState HudAt(const std::string& id, float frame) const;
+   // Its status line and wait cursor over the page (UI thread, in Draw).
+   void DrawAddXboxLive(float k, float ox, float oy, float up, float alpha);
+   // Later work on its own thread, in time order (the AddXboxLive steps).
+-- 
+2.55.0.windows.3
+

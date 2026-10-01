@@ -1,0 +1,252 @@
+From cf10af89cce392993b6514d252fa21515c9e2a41 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 18:07:02 +0530
+Subject: [PATCH 31/51] Auto Sign-In at power-on; the Guide shows the signed-in
+ gamertag
+
+Power-on (new cvar power_on, set by the launcher for its first dashboard):
+nobody signed in from before, and the Auto Sign-In profile
+(XCONFIG_USER_DEFAULT_PROFILE) signs into slot 0 when retail flag 0x40 is
+set and it is not recovering, as xam's power-on sign-in request does (818C1040
+-> 818EBE88, flags 0xA44; 0x200 handled at 818EA78C). Title switches keep
+who is signed in. Deleting that profile turns Auto Sign-In off (818EA210).
+
+The Guide draws hudbkgnd's GamerTag down the blade: the gamertag of the
+profile on the Guide's controller (xam 818D4218), placed by its keyframes
+and the captured transform (gamertag.txt from make_guide_assets.py).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc          | 72 +++++++++++++++++++++++++
+ src/xenia/app/guide_overlay.h           | 11 ++++
+ src/xenia/kernel/xam/profile_manager.cc | 36 +++++++++++++
+ src/xenia/kernel/xam/profile_manager.h  |  1 +
+ 4 files changed, 120 insertions(+)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 631a85755..c1c661762 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -137,6 +137,18 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadAddXboxLiveLayout();
+   LoadGamerProfileLayout();
+   LoadHudKeys();
++  {
++    std::ifstream in(asset_dir_ / "gamertag.txt");
++    std::string key, color;
++    GamerTagLayout& g = gamertag_layout_;
++    if (in >> key >> g.key_x >> g.tx >> g.ty >> g.m[0] >> g.m[1] >> g.m[2] >>
++        g.m[3] >> g.item.w >> g.item.h >> g.item.size >> g.item.ascent >>
++        g.item.line_h >> g.item.style >> color) {
++      g.item.is_text = true;
++      g.item.color = uint32_t(std::stoul(color, nullptr, 16));
++      g.loaded = true;
++    }
++  }
+   input_thread_ = std::thread([this]() { InputThread(); });
+   schedule_thread_ = std::thread([this]() { ScheduleThread(); });
+   kernel::xam::create_profile_ui_hook = [this](uint32_t user_index) {
+@@ -414,6 +426,10 @@ void GuideOverlay::InputThread() {
+     if (pressed & hid::X_INPUT_GAMEPAD_GUIDE) {
+       guide_down = now;
+       turn_off_shown = false;
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (mode_ == Mode::kClosed) {
++        hud_user_ = active_user;  // the Guide opens for that controller
++      }
+     }
+     if ((buttons & hid::X_INPUT_GAMEPAD_GUIDE) && !turn_off_shown &&
+         now - guide_down >= kHoldToTurnOff) {
+@@ -1706,6 +1722,9 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     }
+   }
+ 
++  // The gamertag on the blade (hidden in the page images, like the clock).
++  DrawGamerTag(k, ox, oy, up, hud_f);
++
+   // The ring of light (hudbkgnd ROL, drawn over everything else in the frame)
+   // where its keyframes put it: it rests at 618 after ClosedToHalf but 617
+   // after FullToHalf or ErrorToHalf, and fades in only at the end of
+@@ -2191,6 +2210,7 @@ bool GuideOverlay::ShowCreateProfile(uint32_t user_index) {
+     }
+     create_profile_active_ = true;
+     create_user_index_ = user_index;
++    hud_user_ = user_index;
+     created_xuid_ = 0;
+     axl_signed_in_ = false;
+     axl_status_key_.clear();
+@@ -2773,6 +2793,57 @@ void GuideOverlay::ScheduleThread() {
+   }
+ }
+ 
++void GuideOverlay::DrawGamerTag(float k, float ox, float oy, float up,
++                                float hud_f) {
++  const GamerTagLayout& g = gamertag_layout_;
++  HudState state = HudAt("GamerTag", hud_f);
++  if (!g.loaded || !state.show || state.opacity <= 0.0f) {
++    return;
++  }
++  std::u16string gamertag;
++  if (auto* user = emulator_->kernel_state()->xam_state()->GetUserProfile(
++          uint32_t(hud_user_))) {
++    gamertag = xe::to_utf16(user->name());
++  }
++  if (gamertag.empty()) {
++    return;
++  }
++  if (gamertag != gamertag_shown_ || gamertag_k_ != k ||
++      !images_.count("gamertag")) {
++    // the text on its own, unrotated, at frame pixels per unit
++    Pixels pixels;
++    pixels.width = std::max(1, int(std::ceil(g.item.w * k)));
++    pixels.height = std::max(1, int(std::ceil(g.item.h * k)));
++    pixels.rgba.assign(size_t(pixels.width) * pixels.height * 4, 0);
++    RenderText(pixels, g.item, gamertag, k);
++    Image& image = images_["gamertag"];
++    image.texture = imgui_drawer_->CreateImGuiTexture(
++        pixels.width, pixels.height, pixels.rgba.data());
++    image.pixels_per_unit = k;
++    image.width = pixels.width;
++    image.height = pixels.height;
++    image.units_w = pixels.width / k;
++    image.units_h = pixels.height / k;
++    gamertag_shown_ = gamertag;
++    gamertag_k_ = k;
++  }
++  const Image& image = images_["gamertag"];
++  auto* draw_list = ImGui::GetForegroundDrawList();
++  // the box's corners through its transform, moved by its keyframed x
++  const float dx = state.x - g.key_x;
++  auto corner = [&](float u, float v) {
++    float x = g.tx + dx + g.m[0] * u + g.m[1] * v;
++    float y = g.ty + g.m[2] * u + g.m[3] * v;
++    return ImVec2((ox + x * k) * up, (oy + y * k) * up);
++  };
++  const float w = image.units_w, hh = image.units_h;
++  draw_list->AddImageQuad(
++      reinterpret_cast<ImTextureID>(image.texture.get()), corner(0, 0),
++      corner(w, 0), corner(w, hh), corner(0, hh), ImVec2(0, 0), ImVec2(1, 0),
++      ImVec2(1, 1), ImVec2(0, 1),
++      IM_COL32(255, 255, 255, int(state.opacity * 255.0f + 0.5f)));
++}
++
+ void GuideOverlay::LoadHudKeys() {
+   std::ifstream in(asset_dir_ / "hud_keys.txt");
+   std::string line;
+@@ -2991,6 +3062,7 @@ bool GuideOverlay::ShowGamerCard(uint32_t user_index) {
+     }
+     gp_active_ = true;
+     gp_xuid_ = user->xuid();
++    hud_user_ = user_index;
+     gp_back_.clear();
+     gp_cell_ = 0;
+     gp_focus_ = gp_pages_["gpcard"].default_focus;
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 04688fbd4..a89627cda 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -406,6 +406,17 @@ class GuideOverlay {
+   std::map<std::string, std::vector<HudKey>> hud_keys_;
+   float hud_rest_ = 44;  // the frame the last HUD transition ended on
+   void LoadHudKeys();
++  // hudbkgnd's GamerTag (gamertag.txt): the gamertag of the profile signed in
++  // on the Guide's controller, down the blade (xam 818D4218, empty if none).
++  struct GamerTagLayout {
++    float key_x = 0, tx = 0, ty = 0, m[4] = {};
++    MessageBoxItem item;
++    bool loaded = false;
++  } gamertag_layout_;
++  std::atomic<uint32_t> hud_user_{0};  // the controller the Guide is for
++  std::u16string gamertag_shown_;      // what "gamertag" holds (UI thread)
++  float gamertag_k_ = 0;
++  void DrawGamerTag(float k, float ox, float oy, float up, float hud_f);
+   HudState HudAt(const std::string& id, float frame) const;
+   // Its status line and wait cursor over the page (UI thread, in Draw).
+   void DrawAddXboxLive(float k, float ox, float oy, float up, float alpha);
+diff --git a/src/xenia/kernel/xam/profile_manager.cc b/src/xenia/kernel/xam/profile_manager.cc
+index 068593d7f..45eed2679 100644
+--- a/src/xenia/kernel/xam/profile_manager.cc
++++ b/src/xenia/kernel/xam/profile_manager.cc
+@@ -16,8 +16,17 @@
+ #include "xenia/hid/input_system.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/util/crypto_utils.h"
++#include "xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h"
+ #include "xenia/vfs/devices/host_path_device.h"
+ 
++DEFINE_bool(power_on, false,
++            "This start is the console's power-on (set by the launcher for "
++            "its first dashboard): nobody is signed in from before, and the "
++            "Auto Sign-In profile signs in.",
++            "Profiles");
++DECLARE_uint32(retail_flags);
++DECLARE_uint64(default_profile_xuid);
++
+ DEFINE_string(logged_profile_slot_0_xuid, "",
+               "XUID of the profile to load on boot in slot 0", "Profiles");
+ DEFINE_string(logged_profile_slot_1_xuid, "",
+@@ -105,6 +114,24 @@ ProfileManager::ProfileManager(KernelState* kernel_state,
+     LoadAccount(account_xuid);
+   }
+ 
++  if (cvars::power_on) {
++    // Power-on: xam 818C1040 -> 818EBE88 asks for sign-in with flags 0xA44
++    // when XCONFIG_USER_RETAIL_FLAGS has 0x40; its 0x200 (818EA78C) signs
++    // the Auto Sign-In profile (XCONFIG_USER_DEFAULT_PROFILE) into slot 0
++    // when nobody is signed in, the profile is found and not recovering.
++    for (uint8_t slot = 0; slot < XUserMaxUserCount; ++slot) {
++      UpdateConfig(0, slot);
++    }
++    const uint64_t xuid = cvars::default_profile_xuid;
++    if ((cvars::retail_flags & 0x40) && xuid && accounts_.count(xuid) &&
++        !(accounts_[xuid].GetReservedFlags() &
++          X_XAMACCOUNTINFO::AccountReservedFlags::kRecovering)) {
++      XELOGI("Auto Sign-In: {:016X}", xuid);
++      Login(xuid, 0);
++    }
++    return;
++  }
++
+   if (!cvars::logged_profile_slot_0_xuid.empty()) {
+     Login(xe::string_util::from_string<uint64_t>(
+               cvars::logged_profile_slot_0_xuid, true),
+@@ -576,7 +603,15 @@ void ProfileManager::UpdateConfig(const uint64_t xuid, const uint8_t slot) {
+   return;
+ }
+ 
++// xam 818EA210: a deleted profile is no longer the Auto Sign-In one.
++void ProfileManager::ClearDefaultProfile(const uint64_t xuid) {
++  if (xuid && cvars::default_profile_xuid == xuid) {
++    xboxkrnl::SetDefaultProfile(0);
++  }
++}
++
+ bool ProfileManager::DeleteProfile(const uint64_t xuid) {
++  ClearDefaultProfile(xuid);
+   const uint8_t user_index = GetUserIndexAssignedToProfile(xuid);
+ 
+   if (user_index < XUserMaxUserCount) {
+@@ -599,6 +634,7 @@ bool ProfileManager::DeleteProfile(const uint64_t xuid) {
+ }
+ 
+ bool ProfileManager::DeleteProfilePackage(const uint64_t xuid) {
++  ClearDefaultProfile(xuid);
+   const uint8_t user_index = GetUserIndexAssignedToProfile(xuid);
+   if (user_index < XUserMaxUserCount) {
+     Logout(user_index);
+diff --git a/src/xenia/kernel/xam/profile_manager.h b/src/xenia/kernel/xam/profile_manager.h
+index 3a1d11420..cc5aee2bc 100644
+--- a/src/xenia/kernel/xam/profile_manager.h
++++ b/src/xenia/kernel/xam/profile_manager.h
+@@ -74,6 +74,7 @@ class ProfileManager {
+   bool CreateProfile(const X_XAMACCOUNTINFO* account_info, uint64_t xuid);
+ 
+   bool DeleteProfile(const uint64_t xuid);
++  void ClearDefaultProfile(const uint64_t xuid);
+   // Only the profile package (Content\<xuid>\FFFE07D1\00010000\<xuid>): the
+   // profile's saves stay (the dashboard's "Delete Profile Only").
+   bool DeleteProfilePackage(const uint64_t xuid);
+-- 
+2.55.0.windows.3
+

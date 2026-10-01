@@ -1,0 +1,495 @@
+From dda4986ca97c57cb691052cd26fdcb6b589d2abc Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 10:36:06 +0530
+Subject: [PATCH 07/51] Guide overlay: the 2.0.2858.0 Guide
+
+- Menu focus follows the scenes' own navigation graph from layout.txt
+  (up/down/left/right; the signed-out menu now hosts the mini media player).
+- Pages are drawn as single-pass composites with the chrome (additive
+  lines), crossfading from the chrome while they fade in.
+- Battery icon for a wireless controller at its charge level, none for a
+  wired one (new InputSystem::GetBatteryLevel, SDL power level).
+- Clock in the host's 12/24-hour format.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc        | 170 ++++++++++++++++++++------
+ src/xenia/app/guide_overlay.h         |  23 +++-
+ src/xenia/hid/input_driver.h          |   4 +
+ src/xenia/hid/input_system.cc         |  10 ++
+ src/xenia/hid/input_system.h          |   2 +
+ src/xenia/hid/sdl/sdl_input_driver.cc |  23 ++++
+ src/xenia/hid/sdl/sdl_input_driver.h  |   1 +
+ 7 files changed, 196 insertions(+), 37 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 9c236e6db..6982b1793 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -55,12 +55,6 @@ constexpr auto kRepeatRate = std::chrono::milliseconds(150);
+ // (Legend_Y 180 -> -550 while the blade moves 583 -> -88).
+ constexpr float kLegendSlide = 730.0f;
+ 
+-// MainMenuSignedOut.xur focus order (NavDown chain, music scene skipped).
+-const char* const kMenuItems[] = {"btnSignIn", "btnNewProfile",
+-                                  "btnRecoverProfile", "btnOptions",
+-                                  "btnGameBanner"};
+-constexpr int kMenuCount = 5;
+-
+ float Clamp01(float v) { return std::min(1.0f, std::max(0.0f, v)); }
+ // XUI keyframe easing (Interpolation 2) at full strength, approximated as
+ // quadratic: EaseIn = slow start, EaseOut = slow end.
+@@ -118,6 +112,7 @@ void GuideOverlay::LoadLayout() {
+   std::ifstream in(asset_dir_ / "layout.txt");
+   std::string key;
+   auto& l = layout_;
++  std::vector<std::array<std::string, 4>> menu_nav_names;
+   while (in >> key) {
+     if (key == "canvas") {
+       in >> l.canvas_w >> l.canvas_h;
+@@ -137,6 +132,19 @@ void GuideOverlay::LoadLayout() {
+       in >> l.dim;
+     } else if (key == "space") {
+       in >> l.clock_advance[' '];
++    } else if (key == "menu") {
++      std::string id, nav[4];
++      in >> id >> nav[0] >> nav[1] >> nav[2] >> nav[3];
++      l.menu.push_back({id});
++      menu_nav_names.push_back({nav[0], nav[1], nav[2], nav[3]});
++    } else if (key == "battery") {
++      std::string page;
++      float x, y;
++      in >> page >> x >> y;
++      (page == "menu" ? l.battery_menu_x : l.battery_dialog_x) = x;
++      (page == "menu" ? l.battery_menu_y : l.battery_dialog_y) = y;
++    } else if (key == "battery_size") {
++      in >> l.battery_size;
+     } else if (key == "clock_box") {
+       in >> l.clock_x >> l.clock_y >> l.clock_w >> l.clock_h;
+     } else if (key == "clock_font") {
+@@ -154,6 +162,27 @@ void GuideOverlay::LoadLayout() {
+       std::getline(in, rest);
+     }
+   }
++  for (size_t i = 0; i < l.menu.size(); ++i) {
++    for (int d = 0; d < 4; ++d) {
++      for (size_t j = 0; j < l.menu.size(); ++j) {
++        if (l.menu[j].id == menu_nav_names[i][d]) {
++          l.menu[i].nav[d] = int(j);
++        }
++      }
++    }
++  }
++  if (l.menu.empty()) {
++    XELOGE("Guide: layout.txt has no menu");
++  }
++
++  // The clock follows the host's short time format (12 or 24 hour).
++  wchar_t format[80] = {};
++  if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_STIMEFORMAT, format,
++                      int(std::size(format)))) {
++    std::wstring f(format);
++    clock_24h_ = f.find(L'H') != std::wstring::npos;
++    clock_pad_hour_ = f.find(clock_24h_ ? L"HH" : L"hh") != std::wstring::npos;
++  }
+ }
+ 
+ // ------------------------------------------------------------------- input
+@@ -161,6 +190,9 @@ void GuideOverlay::LoadLayout() {
+ void GuideOverlay::InputThread() {
+   auto input_system = emulator_->input_system();
+   uint16_t prev = 0;
++  std::array<uint16_t, 4> user_prev = {};
++  uint32_t active_user = 0;
++  Clock::time_point next_battery_check;
+   Clock::time_point guide_down, guide_up;
+   bool turn_off_shown = false;
+ 
+@@ -184,7 +216,9 @@ void GuideOverlay::InputThread() {
+     const std::map<std::string, uint16_t> names = {
+         {"guide", hid::X_INPUT_GAMEPAD_GUIDE}, {"a", hid::X_INPUT_GAMEPAD_A},
+         {"b", hid::X_INPUT_GAMEPAD_B},         {"y", hid::X_INPUT_GAMEPAD_Y},
+-        {"up", hid::X_INPUT_GAMEPAD_DPAD_UP},  {"down", hid::X_INPUT_GAMEPAD_DPAD_DOWN}};
++        {"up", hid::X_INPUT_GAMEPAD_DPAD_UP},  {"down", hid::X_INPUT_GAMEPAD_DPAD_DOWN},
++        {"left", hid::X_INPUT_GAMEPAD_DPAD_LEFT},
++        {"right", hid::X_INPUT_GAMEPAD_DPAD_RIGHT}};
+     auto at = test_at + std::chrono::milliseconds(1500);
+     std::stringstream rest(test_page);
+     while (std::getline(rest, token, ',')) {
+@@ -214,23 +248,36 @@ void GuideOverlay::InputThread() {
+         page_ = test_page[0] == 'e' ? Page::kExit : Page::kTurnOff;
+         choice_ = test_page.find("yes") != std::string::npos ? 0 : 1;
+       } else if (!test_page.empty()) {
+-        focus_ = std::clamp(std::atoi(test_page.c_str()), 0, kMenuCount - 1);
++        focus_ = std::clamp(std::atoi(test_page.c_str()), 0,
++                            std::max(0, int(layout_.menu.size()) - 1));
+       }
+     }
+     uint16_t buttons = 0;
+-    float ly = 0.0f;
++    float lx = 0.0f, ly = 0.0f;
+     if (input_system) {
+       auto lock = input_system->lock();
+       for (uint32_t user = 0; user < 4; ++user) {
+         hid::X_INPUT_STATE state = {};
+         if (input_system->GetState(user, hid::X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD,
+                                    &state) == X_ERROR_SUCCESS) {
+-          buttons |= state.gamepad.buttons;
++          uint16_t user_buttons = state.gamepad.buttons;
++          if (user_buttons & ~user_prev[user]) {
++            active_user = user;  // the controller being used
++          }
++          user_prev[user] = user_buttons;
++          buttons |= user_buttons;
++          if (std::abs(int(state.gamepad.thumb_lx)) > std::abs(lx * 32767)) {
++            lx = state.gamepad.thumb_lx / 32767.0f;
++          }
+           if (std::abs(int(state.gamepad.thumb_ly)) > std::abs(ly * 32767)) {
+             ly = state.gamepad.thumb_ly / 32767.0f;
+           }
+         }
+       }
++      if (Clock::now() >= next_battery_check) {
++        battery_level_ = input_system->GetBatteryLevel(active_user);
++        next_battery_check = Clock::now() + std::chrono::seconds(1);
++      }
+     }
+     auto now = Clock::now();
+     for (const TestPress& press : test_presses) {
+@@ -272,14 +319,14 @@ void GuideOverlay::InputThread() {
+       pressed &= ~hid::X_INPUT_GAMEPAD_GUIDE;
+     }
+ 
+-    OnButtons(pressed, buttons, ly, now);
++    OnButtons(pressed, buttons, lx, ly, now);
+     prev = buttons;
+     std::this_thread::sleep_for(std::chrono::milliseconds(16));
+   }
+ }
+ 
+-void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float ly,
+-                             Clock::time_point now) {
++void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float lx,
++                             float ly, Clock::time_point now) {
+   static int repeat_dir = 0;
+   static Clock::time_point next_repeat;
+ 
+@@ -303,21 +350,25 @@ void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float ly,
+     }
+   }
+ 
+-  // D-pad / left stick with auto-repeat.
++  // D-pad / left stick with auto-repeat (0 = none, else Direction + 1).
+   int dir = 0;
+   if ((held & hid::X_INPUT_GAMEPAD_DPAD_UP) || ly > 0.5f) {
+-    dir = -1;
++    dir = kUp + 1;
+   } else if ((held & hid::X_INPUT_GAMEPAD_DPAD_DOWN) || ly < -0.5f) {
+-    dir = 1;
++    dir = kDown + 1;
++  } else if ((held & hid::X_INPUT_GAMEPAD_DPAD_LEFT) || lx < -0.5f) {
++    dir = kLeft + 1;
++  } else if ((held & hid::X_INPUT_GAMEPAD_DPAD_RIGHT) || lx > 0.5f) {
++    dir = kRight + 1;
+   }
+   if (dir != repeat_dir) {
+     repeat_dir = dir;
+     if (dir) {
+-      Move(dir);
++      Move(Direction(dir - 1));
+       next_repeat = now + kRepeatDelay;
+     }
+   } else if (dir && now >= next_repeat) {
+-    Move(dir);
++    Move(Direction(dir - 1));
+     next_repeat = now + kRepeatRate;
+   }
+ 
+@@ -396,16 +447,23 @@ void GuideOverlay::FinishClose() {
+   }
+ }
+ 
+-void GuideOverlay::Move(int delta) {
++void GuideOverlay::Move(Direction direction) {
+   std::lock_guard<std::mutex> lock(mutex_);
+   if (page_ == Page::kMenu) {
+-    int next = std::clamp(focus_ + delta, 0, kMenuCount - 1);
+-    if (next == focus_) {
++    if (focus_ < 0 || focus_ >= int(layout_.menu.size())) {
++      return;
++    }
++    int next = layout_.menu[focus_].nav[direction];
++    if (next < 0) {
+       return;
+     }
+     focus_ = next;
+   } else {
+-    int next = std::clamp(choice_ + delta, 0, 1);
++    // Yes above No
++    if (direction != kUp && direction != kDown) {
++      return;
++    }
++    int next = direction == kUp ? 0 : 1;
+     if (next == choice_) {
+       return;
+     }
+@@ -523,12 +581,11 @@ void ResampleAxis(const std::vector<float>& in, std::vector<float>& out,
+ }  // namespace
+ 
+ // Every image the Guide draws, most urgent (first frames of the slide) first.
++// Besides one menu_<item> image per focusable menu control (layout.txt).
+ const char* const kImages[] = {
+-    "chrome",         "menu_btnSignIn",   "legends_menu",
+-    "clock_atlas",    "menu_btnNewProfile", "menu_btnRecoverProfile",
+-    "menu_btnOptions", "menu_btnGameBanner", "dialog_exit_no",
+-    "dialog_exit_yes", "dialog_off_no",     "dialog_off_yes",
+-    "legends_dialog"};
++    "chrome",         "legends_menu",    "clock_atlas",   "battery_1",
++    "battery_2",      "battery_3",       "battery_4",     "dialog_exit_no",
++    "dialog_exit_yes", "dialog_off_no",  "dialog_off_yes", "legends_dialog"};
+ 
+ bool GuideOverlay::Decode(const std::string& name, Pixels& out) const {
+   std::ifstream file(asset_dir_ / (name + ".png"), std::ios::binary);
+@@ -579,7 +636,14 @@ GuideOverlay::Pixels GuideOverlay::Resample(const Pixels& in, int out_w,
+ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+   auto start = Clock::now();
+   float f = pixels_per_unit / layout_.scale;
+-  for (const char* name : kImages) {
++  // Most urgent first: the chrome and the default menu image are needed on
++  // the first frames of the slide.
++  std::vector<std::string> names(std::begin(kImages), std::end(kImages));
++  for (size_t i = 0; i < layout_.menu.size(); ++i) {
++    names.insert(names.begin() + std::min<size_t>(1 + i, names.size()),
++                 "menu_" + layout_.menu[i].id);
++  }
++  for (const std::string& name : names) {
+     Pixels pixels;
+     if (!running_ || !Decode(name, pixels)) {
+       continue;
+@@ -729,13 +793,14 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     anim_start_ = Clock::now();
+     return;
+   }
+-  layer("chrome", chrome_x, 1.0f);
++  std::string content;
+   if (content_visible) {
+-    std::string content;
+     const char* choice = view.choice == 0 ? "_yes" : "_no";
+     switch (view.page) {
+       case Page::kMenu:
+-        content = std::string("menu_") + kMenuItems[view.focus];
++        if (view.focus >= 0 && view.focus < int(layout_.menu.size())) {
++          content = "menu_" + layout_.menu[view.focus].id;
++        }
+         break;
+       case Page::kExit:
+         content = std::string("dialog_exit") + choice;
+@@ -744,7 +809,36 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+         content = std::string("dialog_off") + choice;
+         break;
+     }
+-    layer(content, 0.0f, content_alpha);
++  }
++  // The page images include the chrome (rendered in one pass, like the
++  // console: some lines blend additively onto it), so the page fades in as a
++  // crossfade over the chrome and, fully shown, replaces it.
++  bool page_ready = !content.empty() && Texture(content, k);
++  if (!(page_ready && content_alpha >= 1.0f)) {
++    layer("chrome", chrome_x, 1.0f);
++  }
++  if (content_visible) {
++    if (page_ready) {
++      layer(content, 0.0f, content_alpha);
++    }
++
++    // A wireless controller's battery (part of the hosted scene, so it fades
++    // with it); none for a wired one, like the console.
++    int level = battery_level_;
++    if (level >= 0 && content_alpha > 0.0f) {
++      std::string name = "battery_" + std::to_string(std::clamp(level, 0, 3) + 1);
++      if (const Image* icon = Texture(name, k)) {
++        bool menu = view.page == Page::kMenu;
++        float bx = menu ? l.battery_menu_x : l.battery_dialog_x;
++        float by = menu ? l.battery_menu_y : l.battery_dialog_y;
++        draw_list->AddImage(
++            reinterpret_cast<ImTextureID>(icon->texture.get()),
++            ImVec2(ox + bx * k, oy + by * k),
++            ImVec2(ox + (bx + l.battery_size) * k, oy + (by + l.battery_size) * k),
++            ImVec2(0, 0), ImVec2(1, 1),
++            IM_COL32(255, 255, 255, int(content_alpha * 255.0f + 0.5f)));
++      }
++    }
+   }
+   layer(view.page == Page::kMenu ? "legends_menu" : "legends_dialog", legend_x,
+         legend_alpha);
+@@ -760,9 +854,15 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     localtime_s(&local, &now);
+     int hour = local.tm_hour % 12 == 0 ? 12 : local.tm_hour % 12;
+     char text[16];
+-    // as the console shows it: "12:05 PM"
+-    snprintf(text, sizeof(text), "%d:%02d %s", hour, local.tm_min,
+-             local.tm_hour < 12 ? "AM" : "PM");
++    // as the console shows it: "12:05 PM" or "13:00"
++    if (clock_24h_) {
++      snprintf(text, sizeof(text), clock_pad_hour_ ? "%02d:%02d" : "%d:%02d",
++               local.tm_hour, local.tm_min);
++    } else {
++      snprintf(text, sizeof(text),
++               clock_pad_hour_ ? "%02d:%02d %s" : "%d:%02d %s", hour,
++               local.tm_min, local.tm_hour < 12 ? "AM" : "PM");
++    }
+     float width = 0;
+     for (const char* c = text; *c; ++c) {
+       width += l.clock_advance.count(*c) ? l.clock_advance.at(*c) : 0.0f;
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 42d4ca9ee..0c143fc92 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -61,6 +61,17 @@ class GuideOverlay {
+     float clock_line_h = 26, clock_ascent = 21, clock_cell = 40, clock_pad = 6;
+     std::string clock_chars;
+     std::map<char, float> clock_advance;
++    // Signed-out menu: focusable controls in order (first = default focus)
++    // and, per direction (up, down, left, right), the index focus moves to or
++    // -1 (resolved from the scenes' Nav* properties by make_guide_assets.py).
++    struct MenuItem {
++      std::string id;
++      std::array<int, 4> nav = {-1, -1, -1, -1};
++    };
++    std::vector<MenuItem> menu;
++    // Battery icon (hosted scene's imgBatteryIcon), canvas units.
++    float battery_menu_x = 0, battery_menu_y = 0;
++    float battery_dialog_x = 0, battery_dialog_y = 0, battery_size = 32;
+   };
+ 
+   // Snapshot of what to draw, taken under the lock.
+@@ -73,13 +84,14 @@ class GuideOverlay {
+   };
+ 
+   void InputThread();
+-  void OnButtons(uint16_t pressed, uint16_t held, float ly,
++  void OnButtons(uint16_t pressed, uint16_t held, float lx, float ly,
+                  std::chrono::steady_clock::time_point now);
+   void Open();
+   void BeginClose();
+   void Activate();  // A
+   void Back();      // B
+-  void Move(int delta);
++  enum Direction { kUp, kDown, kLeft, kRight };
++  void Move(Direction direction);
+   void HandOff(const std::string& request);
+   void PlaySfx(const char* name);
+   bool DashboardIsRunning() const;
+@@ -133,6 +145,13 @@ class GuideOverlay {
+   std::atomic<bool> prepare_busy_{false};
+   std::thread prepare_thread_;
+ 
++  // Controller that last used the Guide: its battery (0..3, -1 = wired or
++  // unknown; the console shows no icon for a wired controller).
++  std::atomic<int> battery_level_{-1};
++  // Clock like the host's time format (the console's clock setting).
++  bool clock_24h_ = false;
++  bool clock_pad_hour_ = false;
++
+   std::atomic<bool> running_{true};
+   std::thread input_thread_;
+ };
+diff --git a/src/xenia/hid/input_driver.h b/src/xenia/hid/input_driver.h
+index ee8b00cc4..8bde91fda 100644
+--- a/src/xenia/hid/input_driver.h
++++ b/src/xenia/hid/input_driver.h
+@@ -46,6 +46,10 @@ class InputDriver {
+ 
+   virtual InputType GetInputType() const = 0;
+ 
++  // Charge of a wireless controller: 0 (empty) .. 3 (full), or -1 when wired
++  // or unknown.
++  virtual int GetBatteryLevel(uint32_t user_index) { return -1; }
++
+  protected:
+   explicit InputDriver(xe::ui::Window* window, size_t window_z_order)
+       : window_(window), window_z_order_(window_z_order) {}
+diff --git a/src/xenia/hid/input_system.cc b/src/xenia/hid/input_system.cc
+index b5224f596..5a4ed6f41 100644
+--- a/src/xenia/hid/input_system.cc
++++ b/src/xenia/hid/input_system.cc
+@@ -112,6 +112,16 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+   return X_ERROR_DEVICE_NOT_CONNECTED;
+ }
+ 
++int InputSystem::GetBatteryLevel(uint32_t user_index) {
++  for (auto& driver : drivers_) {
++    int level = driver->GetBatteryLevel(user_index);
++    if (level >= 0) {
++      return level;
++    }
++  }
++  return -1;
++}
++
+ X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
+                                X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
+diff --git a/src/xenia/hid/input_system.h b/src/xenia/hid/input_system.h
+index b3a3629aa..12e334b71 100644
+--- a/src/xenia/hid/input_system.h
++++ b/src/xenia/hid/input_system.h
+@@ -46,6 +46,8 @@ class InputSystem {
+   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
+   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
+                         X_INPUT_KEYSTROKE* out_keystroke);
++  // 0 (empty) .. 3 (full) for a wireless controller, -1 if wired or unknown.
++  int GetBatteryLevel(uint32_t user_index);
+ 
+   bool GetVibrationCvar();
+   void ToggleVibration();
+diff --git a/src/xenia/hid/sdl/sdl_input_driver.cc b/src/xenia/hid/sdl/sdl_input_driver.cc
+index 50341a7ad..c5409f64d 100644
+--- a/src/xenia/hid/sdl/sdl_input_driver.cc
++++ b/src/xenia/hid/sdl/sdl_input_driver.cc
+@@ -212,6 +212,29 @@ X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
+   return X_ERROR_SUCCESS;
+ }
+ 
++int SDLInputDriver::GetBatteryLevel(uint32_t user_index) {
++  if (user_index >= HID_SDL_USER_COUNT) {
++    return -1;
++  }
++  auto controller = GetControllerState(user_index);
++  if (!controller) {
++    return -1;
++  }
++  switch (SDL_JoystickCurrentPowerLevel(
++      SDL_GameControllerGetJoystick(controller->sdl))) {
++    case SDL_JOYSTICK_POWER_EMPTY:
++      return 0;
++    case SDL_JOYSTICK_POWER_LOW:
++      return 1;
++    case SDL_JOYSTICK_POWER_MEDIUM:
++      return 2;
++    case SDL_JOYSTICK_POWER_FULL:
++      return 3;
++    default:  // wired or unknown
++      return -1;
++  }
++}
++
+ X_RESULT SDLInputDriver::GetState(uint32_t user_index,
+                                   X_INPUT_STATE* out_state) {
+   assert(sdl_events_initialized_ && sdl_gamecontroller_initialized_);
+diff --git a/src/xenia/hid/sdl/sdl_input_driver.h b/src/xenia/hid/sdl/sdl_input_driver.h
+index db1dc3bc1..cba32c9cd 100644
+--- a/src/xenia/hid/sdl/sdl_input_driver.h
++++ b/src/xenia/hid/sdl/sdl_input_driver.h
+@@ -38,6 +38,7 @@ class SDLInputDriver final : public InputDriver {
+ 
+   void LoadGameControllerDB();
+ 
++  int GetBatteryLevel(uint32_t user_index) override;
+   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
+                            X_INPUT_CAPABILITIES* out_caps) override;
+   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override;
+-- 
+2.55.0.windows.3
+

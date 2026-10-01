@@ -1,0 +1,46 @@
+From a0f4ca43b03ec96176e61b4bb45b7d4bed0bdcca Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 23:56:36 +0530
+Subject: [PATCH 20/51] Guide: shrink the clock and full chrome before the menu
+ images
+
+On the first open after boot the clock was prepared after every menu
+image, so on the full-width profile pages it appeared ~1.3 s late.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 29d54ba98..4994dbbcc 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -864,7 +864,7 @@ void ResampleAxis(const std::vector<float>& in, std::vector<float>& out,
+ // Every image the Guide draws, most urgent (first frames of the slide) first.
+ // Besides one menu_<item> image per focusable menu control (layout.txt).
+ const char* const kImages[] = {
+-    "chrome",         "legends_menu",    "clock_atlas",   "chrome_full",
++    "chrome",         "clock_atlas",     "chrome_full",   "legends_menu",
+     "upsell_live",    "legends_upsell",  "battery_1",
+     "battery_2",      "battery_3",       "battery_4",     "error_exit_no",
+     "error_exit_yes", "error_off_no",    "error_off_yes"};
+@@ -918,11 +918,11 @@ GuideOverlay::Pixels GuideOverlay::Resample(const Pixels& in, int out_w,
+ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+   auto start = Clock::now();
+   float f = pixels_per_unit / layout_.scale;
+-  // Most urgent first: the chrome and the default menu image are needed on
+-  // the first frames of the slide.
++  // Most urgent first: the chrome, the clock and the full-width chrome slide
++  // in on the first frames (half or full Guide), then the menu images.
+   std::vector<std::string> names(std::begin(kImages), std::end(kImages));
+   for (size_t i = 0; i < layout_.menu.size(); ++i) {
+-    names.insert(names.begin() + std::min<size_t>(1 + i, names.size()),
++    names.insert(names.begin() + std::min<size_t>(4 + i, names.size()),
+                  "menu_" + layout_.menu[i].id);
+   }
+   for (const std::string& name : names) {
+-- 
+2.55.0.windows.3
+

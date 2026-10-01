@@ -1,0 +1,146 @@
+From 8e14deca27b852df2b3de1df9a1bd651fd418659 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 13:36:26 +0530
+Subject: [PATCH 45/51] Guide: Recover Gamertag; a new profile becomes the
+ default profile
+
+The signed-out menu's Recover Gamertag (hud 91449490 code 4) calls XamShowLiveSignupUI(user, 1): xam 818EDD78 sends createprofile mode 2 (the second argument picks mode 2, else 1). createprofile's +0x74 is that mode, so like Join Xbox Live it goes to 90103278 (storage device, Family Settings, the Xbox Live question, Checking network status) with nobody signed in; offline that ends at Can't Connect / Exit Session and no profile is made.
+
+xam's profile creation task (818EBF30) ends by making the new profile XCONFIG_USER_DEFAULT_PROFILE (Auto Sign-In) when none is set; ProfileManager::CreateProfile now does the same.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/app/guide_overlay.cc          | 17 ++++++++++++-----
+ src/xenia/app/guide_overlay.h           |  3 ++-
+ src/xenia/kernel/xam/profile_manager.cc | 18 +++++++++++++++++-
+ src/xenia/kernel/xam/profile_manager.h  |  2 ++
+ 4 files changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 090665fef..2d252ca83 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -2577,13 +2577,13 @@ bool GuideOverlay::ShowCreateProfile(uint32_t user_index) {
+   return true;
+ }
+ 
+-bool GuideOverlay::ShowLiveSignup(uint32_t user_index) {
++bool GuideOverlay::ShowLiveSignup(uint32_t user_index, bool recover) {
+   if (!create_profile_ready_) {
+     return false;
+   }
+   auto* user =
+       emulator_->kernel_state()->xam_state()->GetUserProfile(user_index);
+-  if (!user) {
++  if (!user && !recover) {
+     return false;
+   }
+   uint64_t run;
+@@ -2600,8 +2600,12 @@ bool GuideOverlay::ShowLiveSignup(uint32_t user_index) {
+     live_signup_ = true;
+     create_user_index_ = user_index;
+     hud_user_ = user_index;
+-    created_xuid_ = user->xuid();
+-    axl_signed_in_ = true;
++    // Recover Gamertag (hud 91449490 code 4: XamShowLiveSignupUI(user, 1),
++    // mode 2) takes the same path (+0x74 non-zero -> 90103278: storage
++    // device, Family Settings, the Xbox Live question, the network test)
++    // with nobody signed in; no profile is made before Xbox Live answers.
++    created_xuid_ = user ? user->xuid() : 0;
++    axl_signed_in_ = user != nullptr;
+     axl_status_key_.clear();
+     axl_status_.clear();
+     axl_button_ = "getLiveButton";
+@@ -2623,7 +2627,8 @@ bool GuideOverlay::ShowLiveSignup(uint32_t user_index) {
+   }
+   emulator_->kernel_state()->BroadcastNotification(
+       xe::kXNotificationSystemUI, true);
+-  XELOGI("Guide: Xbox Live sign-up (createprofile.xex, mode 1)");
++  XELOGI("Guide: Xbox Live sign-up (createprofile.xex, mode {})",
++         recover ? 2 : 1);
+   Open(Page::kAddXboxLive);  // a half-width scene: ClosedToHalf
+   Schedule(Clock::now() + kToHalfTime, [this, run]() {
+     if (AddXboxLiveRunning(run)) JoinXboxLive(run);
+@@ -4734,6 +4739,8 @@ void GuideOverlay::MenuPress(bool x_button) {
+       RunAfterClose([this, user]() { ShowSignIn(user); });
+     } else if (item == "btnNewProfile") {
+       RunAfterClose([this, user]() { ShowCreateProfile(user); });
++    } else if (item == "btnRecoverProfile") {
++      RunAfterClose([this, user]() { ShowLiveSignup(user, true); });
+     }
+     return;
+   }
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 8de0f6f2d..18cf862d9 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -67,7 +67,8 @@ class GuideOverlay {
+   bool ShowCreateProfile(uint32_t user_index);
+   // XamShowLiveSignupUI: createprofile.xex in mode 1, AddXboxLive's Xbox Live
+   // steps for the profile signed in on that controller.
+-  bool ShowLiveSignup(uint32_t user_index);
++  // recover: the signed-out menu's Recover Gamertag (mode 2, no profile)
++  bool ShowLiveSignup(uint32_t user_index, bool recover = false);
+   // XamShowGamerCardUI: gamerprofile.xex's screens for your own gamer card.
+   bool ShowGamerCard(uint32_t user_index);
+ 
+diff --git a/src/xenia/kernel/xam/profile_manager.cc b/src/xenia/kernel/xam/profile_manager.cc
+index e0d33b0e5..c216ac8da 100644
+--- a/src/xenia/kernel/xam/profile_manager.cc
++++ b/src/xenia/kernel/xam/profile_manager.cc
+@@ -488,12 +488,24 @@ bool ProfileManager::CreateProfile(const std::string gamertag, bool autologin,
+   }
+ 
+   const bool is_account_created = CreateAccount(xuid, gamertag);
++  if (is_account_created) {
++    AdoptAsDefaultProfile(xuid);
++  }
+   if (is_account_created && autologin) {
+     Login(xuid);
+   }
+   return is_account_created;
+ }
+ 
++// xam's profile creation task (818EBF30, XamProfileCreate) ends by reading
++// XCONFIG_USER_DEFAULT_PROFILE: with none set, the new profile becomes the
++// default (Auto Sign-In) profile (ExSetXConfigSetting(3, 8, xuid)).
++void ProfileManager::AdoptAsDefaultProfile(const uint64_t xuid) {
++  if (xuid && xboxkrnl::DefaultProfile() == 0) {
++    xboxkrnl::SetDefaultProfile(xuid);
++  }
++}
++
+ bool ProfileManager::CreateProfile(const X_XAMACCOUNTINFO* account_info,
+                                    uint64_t xuid) {
+   if (!xuid) {
+@@ -508,7 +520,11 @@ bool ProfileManager::CreateProfile(const X_XAMACCOUNTINFO* account_info,
+     return false;
+   }
+ 
+-  return CreateAccount(xuid, account_info);
++  if (!CreateAccount(xuid, account_info)) {
++    return false;
++  }
++  AdoptAsDefaultProfile(xuid);
++  return true;
+ }
+ 
+ const X_XAMACCOUNTINFO* ProfileManager::GetAccount(const uint64_t xuid) {
+diff --git a/src/xenia/kernel/xam/profile_manager.h b/src/xenia/kernel/xam/profile_manager.h
+index da55efcd4..08451d281 100644
+--- a/src/xenia/kernel/xam/profile_manager.h
++++ b/src/xenia/kernel/xam/profile_manager.h
+@@ -75,6 +75,8 @@ class ProfileManager {
+ 
+   bool DeleteProfile(const uint64_t xuid);
+   void ClearDefaultProfile(const uint64_t xuid);
++  // A new profile becomes the default profile when none is set (xam).
++  void AdoptAsDefaultProfile(const uint64_t xuid);
+   // Only the profile package (Content\<xuid>\FFFE07D1\00010000\<xuid>): the
+   // profile's saves stay (the dashboard's "Delete Profile Only").
+   bool DeleteProfilePackage(const uint64_t xuid);
+-- 
+2.55.0.windows.3
+

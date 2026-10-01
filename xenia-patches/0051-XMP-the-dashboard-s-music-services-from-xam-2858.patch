@@ -1,0 +1,330 @@
+From 4e5dbc2d05fdc060053b8a3c9b1345cbbcb62ca8 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 22:06:35 +0530
+Subject: [PATCH 51/51] XMP: the dashboard's music services (from xam 2858)
+
+XMPDashInIt (819A90E0) and XMPSetMediaSourceWorkspace (819A62B0) accept
+the dashboard; DashInIt broadcasts XN 0x8A000009 (1, then 0 once the
+empty hard drive index is enumerated), so its Music area stops waiting.
+Media queries 0x70014 / 0x7001C (819A5628 / 819A5C28: source record
+checked, empty index), playlist song count 0x70031, source by type
+0x70046, clear title playlist 0x70028, now playing queue mode 0x7004A,
+playlist song enumeration 0x70041 and the playback data block 0x70033.
+The media source table is shared by XMPGetMediaSources and 0x70046.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/apu/audio_media_player.h   |  20 +++
+ src/xenia/kernel/xam/apps/xmp_app.cc | 214 +++++++++++++++++++++++----
+ src/xenia/kernel/xam/apps/xmp_app.h  |   8 +
+ 3 files changed, 210 insertions(+), 32 deletions(-)
+
+diff --git a/src/xenia/apu/audio_media_player.h b/src/xenia/apu/audio_media_player.h
+index 293b7f85a..8d0255d9e 100644
+--- a/src/xenia/apu/audio_media_player.h
++++ b/src/xenia/apu/audio_media_player.h
+@@ -78,6 +78,26 @@ class AudioMediaPlayer {
+ 
+   XmpApp::PlaybackClient GetPlaybackClient() const { return playback_client_; }
+   uint32_t GetDashInItState() const { return dash_init_state; }
++  void SetDashInItState(uint32_t state) { dash_init_state = state; }
++  // XMPDashInIt ran (xam +0x1CB8) / the dashboard's now playing queue
++  // mode (XMPSetDashNowPlayingQueueMode, xam +0x1CCC)
++  bool dash_initialized = false;
++  // xam 819AC368 / 819AD398: playback stops if it is this playlist's,
++  // then its songs go
++  void ClearPlaylistSongs(uint32_t handle) {
++    auto it = playlists_.find(handle);
++    if (it == playlists_.end()) return;
++    if (active_playlist_ == it->second.get()) {
++      Stop(true, false);
++    }
++    it->second->songs.clear();
++  }
++  uint32_t dash_queue_mode = 0;
++  uint32_t GetPlaylistSongCount(uint32_t handle) const {
++    auto it = playlists_.find(handle);
++    return it == playlists_.cend() ? 0
++                                   : uint32_t(it->second->songs.size());
++  }
+ 
+   bool IsTitleInPlaybackControl() const {
+     return playback_client_ == XmpApp::PlaybackClient::kTitle ||
+diff --git a/src/xenia/kernel/xam/apps/xmp_app.cc b/src/xenia/kernel/xam/apps/xmp_app.cc
+index 21cb60ef7..621042909 100644
+--- a/src/xenia/kernel/xam/apps/xmp_app.cc
++++ b/src/xenia/kernel/xam/apps/xmp_app.cc
+@@ -176,6 +176,29 @@ X_HRESULT XmpApp::XMPGetTitlePlaylistBufferSize(uint32_t xmp_client,
+   return X_E_SUCCESS;
+ }
+ 
++// xam's 10 media source slots (made in 81A43480): the hard drive's media
++// index (connected: XboxHardwareInfo has a hard disk, 81A47198), then each
++// class with no device - PC (4), three MTP players (3), audio CD (6), data
++// CD (7), three more (2). Names are empty.
++const XmpApp::MediaSource XmpApp::kMediaSources[10] = {
++    {"Media Index", 0, 0x802, 4},  {"", 4, 0x82B, 0},
++    {"some mtp device", 3, 0, 0},  {"some mtp device", 3, 0, 0},
++    {"some mtp device", 3, 0, 0},  {"CDDA", 6, 0x802, 0},
++    {"some data cd", 7, 0x113, 0}, {"", 2, 0x113, 0},
++    {"", 2, 0x113, 0},             {"", 2, 0x113, 0}};
++
++// A slot's 0xB4-byte record (xam 81A3FE68): +0 slot, +4 id (0x24 bytes),
++// +0x28 type, +0x2C flags, +0x30 state (4 = connected), +0x34 name
++void XmpApp::WriteMediaSource(uint8_t* record, uint32_t slot) {
++  const MediaSource& source = kMediaSources[slot];
++  std::memset(record, 0, 0xB4);
++  xe::store_and_swap<uint32_t>(record + 0x00, slot);
++  std::memcpy(record + 0x04, source.id, std::strlen(source.id));
++  xe::store_and_swap<uint32_t>(record + 0x28, source.type);
++  xe::store_and_swap<uint32_t>(record + 0x2C, source.flags);
++  xe::store_and_swap<uint32_t>(record + 0x30, source.state);
++}
++
+ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                       uint32_t buffer_length) {
+   // NOTE: buffer_length may be zero or valid.
+@@ -466,16 +489,6 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       // 0, connected when XboxHardwareInfo has a hard disk, 81A47198); the
+       // others are their classes with no device: PC (4), three MTP players
+       // (3), audio CD (6), data CD (7), three more (2). Names are empty.
+-      struct Slot {
+-        const char* id;
+-        uint32_t type, flags, state;
+-      };
+-      static const Slot kSlots[10] = {
+-          {"Media Index", 0, 0x802, 4},  {"", 4, 0x82B, 0},
+-          {"some mtp device", 3, 0, 0},  {"some mtp device", 3, 0, 0},
+-          {"some mtp device", 3, 0, 0},  {"CDDA", 6, 0x802, 0},
+-          {"some data cd", 7, 0x113, 0}, {"", 2, 0x113, 0},
+-          {"", 2, 0x113, 0},             {"", 2, 0x113, 0}};
+       if (!args->sources_ptr) {
+         if (args->count_ptr) {
+           xe::store_and_swap<uint32_t>(
+@@ -489,17 +502,10 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint8_t* out = memory_->TranslateVirtual(args->sources_ptr);
+       uint32_t count = 0;
+       for (uint32_t slot = 0; slot < 10; ++slot) {
+-        const Slot& source = kSlots[slot];
+-        if (args->unk1 && source.state != 4) {
++        if (args->unk1 && kMediaSources[slot].state != 4) {
+           continue;
+         }
+-        uint8_t* record = out + count * 0xB4;
+-        std::memset(record, 0, 0xB4);
+-        xe::store_and_swap<uint32_t>(record + 0x00, slot);
+-        std::memcpy(record + 0x04, source.id, std::strlen(source.id));
+-        xe::store_and_swap<uint32_t>(record + 0x28, source.type);
+-        xe::store_and_swap<uint32_t>(record + 0x2C, source.flags);
+-        xe::store_and_swap<uint32_t>(record + 0x30, source.state);
++        WriteMediaSource(out + count * 0xB4, slot);
+         ++count;
+       }
+       if (args->count_ptr) {
+@@ -524,13 +530,28 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+ 
+       assert_true(args->xmp_client == 0x00000002 ||
+                   args->xmp_client == 0x00000000);
+-      XELOGD(
+-          "XMPDashInIt({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}), "
+-          "unimplemented",
+-          args->xmp_client.get(), args->buffer_ptr.get(),
+-          args->buffer_length.get(), args->unk1.get(), args->unk2.get(),
+-          args->storage_ptr.get());
+-      return X_E_INVALIDARG;
++      XELOGD("XMPDashInIt({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
++             args->xmp_client.get(), args->buffer_ptr.get(),
++             args->buffer_length.get(), args->unk1.get(), args->unk2.get(),
++             args->storage_ptr.get());
++      // xam 819A90E0: the dashboard client (0) with a workspace and a buffer;
++      // it opens the hard drive's media index and enumerates it into the
++      // buffer asynchronously: "initializing" (1) is broadcast while that
++      // runs (XN 0x8A000009, value = the state XMPGetDashInItState returns),
++      // then 0 when it completes (819A9238). No media is emulated on the hard
++      // drive, so the enumeration finds nothing and completes at once.
++      if (args->xmp_client != 0 || !args->storage_ptr || !args->buffer_ptr) {
++        return X_E_INVALIDARG;
++      }
++      auto* player = kernel_state_->emulator()->audio_media_player();
++      player->dash_initialized = true;
++      player->SetDashInItState(1);
++      kernel_state_->BroadcastNotification(kXNotificationXmpDashInItChanged,
++                                           1);
++      player->SetDashInItState(0);
++      kernel_state_->BroadcastNotification(kXNotificationXmpDashInItChanged,
++                                           0);
++      return X_E_SUCCESS;
+     }
+     case 0x0007003D: {
+       // XMPCaptureOutput
+@@ -558,12 +579,141 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       assert_true(args->xmp_client == 0x00000002 ||
+                   args->xmp_client == 0x00000001 ||
+                   args->xmp_client == 0x00000000);
+-      XELOGD(
+-          "XMPSetMediaSourceWorkspace({:08X}, {:08X}, {:08X}, {:08X}), "
+-          "unimplemented",
+-          args->xmp_client.get(), args->unk1.get(), args->storage_ptr.get(),
+-          args->unk2.get());
+-      return X_E_INVALIDARG;
++      XELOGD("XMPSetMediaSourceWorkspace({:08X}, {:08X}, {:08X}, {:08X})",
++             args->xmp_client.get(), args->unk1.get(), args->storage_ptr.get(),
++             args->unk2.get());
++      // xam 819A62B0: client 0 or 1, a workspace (or unk1), its pointer and
++      // size both given or both 0; the media manager keeps it (81A3FA60)
++      if (args->xmp_client > 1 || (!args->storage_ptr && !args->unk1) ||
++          (!args->storage_ptr) != (!args->unk2)) {
++        return X_E_INVALIDARG;
++      }
++      return X_E_SUCCESS;
++    }
++    case 0x00070014:
++    case 0x0007001C: {
++      // A media query into the dashboard's enumerator (its XamCreate-
++      // EnumeratorHandle with open/close messages 0x70015 / 0x70016 for
++      // songs, 0x7001D / 0x7001E for the other lists): xam 819A5628 /
++      // 819A5C28 check the arguments, then 81A400C8 finds the source the
++      // record (+4, else +8) names - connected, with the same id
++      // (81A3FD90; else 0x800704B1) - and queries its media index. The hard
++      // drive's index is empty, so the enumerator gets no items.
++      const auto* a = reinterpret_cast<const xe::be<uint32_t>*>(buffer);
++      const uint32_t out = message == 0x00070014 ? 6 : 7;
++      if (!buffer || (a[1] && a[2]) || (!a[1] && !a[2]) || !a[out]) {
++        return X_E_INVALIDARG;
++      }
++      const uint32_t record_ptr = a[1] ? uint32_t(a[1]) : uint32_t(a[2]);
++      const uint8_t* record = memory_->TranslateVirtual(record_ptr);
++      const bool hard_drive =
++          record_ptr && xe::load_and_swap<uint32_t>(record) == 0 &&
++          std::memcmp(record + 4, "Media Index", 12) == 0;
++      XELOGD("XMP media query ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
++             "{:08X}){}",
++             uint32_t(a[1]), uint32_t(a[2]), uint32_t(a[3]), uint32_t(a[4]),
++             uint32_t(a[5]), uint32_t(a[6]), uint32_t(a[7]),
++             hard_drive ? "" : ": source not connected");
++      return hard_drive ? X_E_SUCCESS : X_HRESULT_FROM_WIN32(0x4B1);
++    }
++    case 0x00070046: {
++      // xam 81A41060: one source's record (81A3FE68) by type at +4: 0 the
++      // hard drive, 4 the PC, 6 the audio CD, 7 the data CD
++      const auto* a = reinterpret_cast<const xe::be<uint32_t>*>(buffer);
++      if (!buffer || !a[2]) {
++        return X_E_INVALIDARG;
++      }
++      uint32_t slot;
++      switch (uint32_t(a[1])) {
++        case 0: slot = 0; break;
++        case 4: slot = 1; break;
++        case 6: slot = 5; break;
++        case 7: slot = 6; break;
++        default: return X_E_INVALIDARG;
++      }
++      WriteMediaSource(memory_->TranslateVirtual(a[2]), slot);
++      return X_E_SUCCESS;
++    }
++    case 0x00070028: {
++      // xam 819A5820: the title playlist at *(+4) is emptied (playback
++      // stops if it is playing it), then XN 0x8A000005 (0)
++      const auto* a = reinterpret_cast<const xe::be<uint32_t>*>(buffer);
++      if (!buffer || !a[1]) {
++        return X_E_INVALIDARG;
++      }
++      const uint32_t handle =
++          xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(a[1]));
++      kernel_state_->emulator()->audio_media_player()->ClearPlaylistSongs(
++          handle);
++      kernel_state_->BroadcastNotification(
++          kXNotificationXmpTitlePlayListContentChanged, 0);
++      return X_E_SUCCESS;
++    }
++    case 0x00070033: {
++      // xam 819A9EAC -> 819AA528: client 0 gets xam's playback data block
++      // (0x81B200A0; 819ACCC8 sets +0x60 = 48000, the sample rate; the
++      // rest comes from playback - zero while nothing plays)
++      const auto* a = reinterpret_cast<const xe::be<uint32_t>*>(buffer);
++      if (!buffer || a[0] != 0 || !a[1]) {
++        return X_E_INVALIDARG;
++      }
++      if (!visualization_ptr_) {
++        visualization_ptr_ = memory_->SystemHeapAlloc(0x1000);
++        uint8_t* block = memory_->TranslateVirtual(visualization_ptr_);
++        std::memset(block, 0, 0x1000);
++        xe::store_and_swap<uint32_t>(block + 0x60, 48000);
++      }
++      xe::store_and_swap<uint32_t>(memory_->TranslateVirtual(a[1]),
++                                   visualization_ptr_);
++      return X_E_SUCCESS;
++    }
++    case 0x00070041: {
++      // xam 819A5548: a title playlist's song enumeration state into +8
++      // (the dashboard's enumerator): the playlist, then for one that has
++      // never started (state 0) zeros - the enumerator stays empty
++      const auto* a = reinterpret_cast<const xe::be<uint32_t>*>(buffer);
++      if (!buffer || a[0] > 1 || !a[1] || !a[2]) {
++        return X_E_INVALIDARG;
++      }
++      uint8_t* out = memory_->TranslateVirtual(a[2]);
++      std::memset(out, 0, 0x14);
++      xe::store_and_swap<uint32_t>(out, a[1]);
++      return X_E_SUCCESS;
++    }
++    case 0x0007004A: {
++      // XMPSetDashNowPlayingQueueMode (xam 819A5AB8): after XMPDashInIt; a
++      // changed mode is broadcast (XN 0x8A000007, 0)
++      const auto* a = reinterpret_cast<const xe::be<uint32_t>*>(buffer);
++      if (!buffer) {
++        return X_E_INVALIDARG;
++      }
++      auto* player = kernel_state_->emulator()->audio_media_player();
++      if (!player->dash_initialized) {
++        return X_HRESULT_FROM_WIN32(0x139F);
++      }
++      const uint32_t mode = a[1];
++      XELOGD("XMPSetDashNowPlayingQueueMode({})", mode);
++      if (player->dash_queue_mode != mode) {
++        player->dash_queue_mode = mode;
++        kernel_state_->BroadcastNotification(
++            kXNotificationXmpDashNowPlayingQueueModeChanged, 0);
++      }
++      return X_E_SUCCESS;
++    }
++    case 0x00070031: {
++      // xam 819A5E08: the title playlist's song count (819ACF20) for the
++      // handle at +4, written to +8
++      const auto* a = reinterpret_cast<const xe::be<uint32_t>*>(buffer);
++      if (!buffer || !a[1] || !a[2]) {
++        return X_E_INVALIDARG;
++      }
++      const uint32_t handle =
++          xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(a[1]));
++      xe::store_and_swap<uint32_t>(
++          memory_->TranslateVirtual(a[2]),
++          kernel_state_->emulator()->audio_media_player()->GetPlaylistSongCount(
++              handle));
++      return X_E_SUCCESS;
+     }
+     case 0x00070053: {
+       // Called on the blades dashboard Version 4532-5787 after clicking on the
+diff --git a/src/xenia/kernel/xam/apps/xmp_app.h b/src/xenia/kernel/xam/apps/xmp_app.h
+index df927364e..96018ef83 100644
+--- a/src/xenia/kernel/xam/apps/xmp_app.h
++++ b/src/xenia/kernel/xam/apps/xmp_app.h
+@@ -246,6 +246,14 @@ class XmpApp : public App {
+ 
+   explicit XmpApp(KernelState* kernel_state);
+ 
++  struct MediaSource {
++    const char* id;
++    uint32_t type, flags, state;
++  };
++  static const MediaSource kMediaSources[10];
++  static void WriteMediaSource(uint8_t* record, uint32_t slot);
++  uint32_t visualization_ptr_ = 0;  // xam's 0x81B200A0 (message 0x70033)
++
+   X_HRESULT XMPGetStatus(uint32_t status_ptr);
+ 
+   X_HRESULT XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count,
+-- 
+2.55.0.windows.3
+

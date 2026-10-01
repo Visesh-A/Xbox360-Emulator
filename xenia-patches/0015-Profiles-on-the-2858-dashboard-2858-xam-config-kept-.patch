@@ -1,0 +1,252 @@
+From 18896622de0336d4f582f6402fb0a6db65e33954 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 15:18:48 +0530
+Subject: [PATCH 15/51] Profiles on the 2858 dashboard: 2858 xam, config kept
+ across hand-offs
+
+- The console's xam.xex (loaded for its resources) now gets the system
+  update's xam.xexp like the dashboard does. With the 1888 xam, the 2858
+  dashboard's gamercard scene (GamerCard.xur) failed to build and its
+  Format setter dereferenced a null object: black screen with a profile
+  signed in, frozen dashboard after creating one.
+- Dashboard/Guide hand-off exits save the config first, so the signed-in
+  profile is remembered when a game starts.
+- Debug: --debug_stack_dump_ms logs guest call stacks and registers;
+  XexGetModuleSection logs its result at debug level.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc                |  4 +
+ src/xenia/emulator.cc                         | 79 +++++++++++++++++++
+ src/xenia/kernel/kernel_state.cc              | 18 +++++
+ src/xenia/kernel/kernel_state.h               |  4 +
+ src/xenia/kernel/xam/xam_info.cc              |  4 +
+ src/xenia/kernel/xboxkrnl/xboxkrnl_modules.cc |  5 ++
+ 6 files changed, 114 insertions(+)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index fadf07787..81b7456d2 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -18,6 +18,7 @@
+ #include "third_party/imgui/imgui.h"
+ #include "third_party/stb/stb_image.h"
+ #include "xenia/base/cvar.h"
++#include "xenia/config.h"
+ #include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/platform_win.h"
+@@ -593,6 +594,9 @@ void GuideOverlay::HandOff(const std::string& request) {
+     fclose(file);
+   }
+   // Let the select sound play briefly, then leave like a title exit.
++  // Keep what was changed while running, e.g. the profile signed in on
++  // the dashboard, as closing the window normally would.
++  config::SaveConfig();
+   std::this_thread::sleep_for(std::chrono::milliseconds(250));
+   xe::ShutdownLogging();
+   std::quick_exit(0);
+diff --git a/src/xenia/emulator.cc b/src/xenia/emulator.cc
+index 6b9006e37..62bc44f46 100644
+--- a/src/xenia/emulator.cc
++++ b/src/xenia/emulator.cc
+@@ -9,6 +9,7 @@
+ 
+ #include <ranges>
+ #include <sstream>
++#include <thread>
+ 
+ #include "xenia/emulator.h"
+ 
+@@ -35,6 +36,9 @@
+ #include "xenia/cpu/backend/code_cache.h"
+ #include "xenia/cpu/backend/null_backend.h"
+ #include "xenia/cpu/cpu_flags.h"
++#include "xenia/cpu/debug_listener.h"
++#include "xenia/cpu/processor.h"
++#include "xenia/cpu/thread_debug_info.h"
+ #include "xenia/cpu/thread_state.h"
+ #include "xenia/gpu/command_processor.h"
+ #include "xenia/gpu/graphics_system.h"
+@@ -109,6 +113,11 @@ DEFINE_string(dump_patched_system_modules, "",
+               "update patches to the Guide's modules and write the images.",
+               "General");
+ 
++DEFINE_int32(debug_stack_dump_ms, 0,
++             "Debug: this long after a title starts, pause the guest and log "
++             "every thread's guest call stack (0 = off).",
++             "General");
++
+ DEFINE_bool(load_guide_module, false,
+             "Research: also load and link hud.xex (the Guide) when launching a "
+             "dashboard, without running it.",
+@@ -720,6 +729,9 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
+   }
+ 
+   if (module) {
++    // A console's xam is updated with its dashboard: the system update's
++    // xam.xexp applies here too, as for modules titles load themselves.
++    kernel_state_->ApplySystemUpdate(module, kernel_state_->title_id());
+     result = kernel_state_->FinishLoadingUserModule(module, false);
+   }
+ 
+@@ -1685,6 +1697,73 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
+   // Allow xam to request module loads.
+   auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+ 
++  if (cvars::debug_stack_dump_ms > 0) {
++    std::thread([this]() {
++      struct QuietListener : cpu::DebugListener {
++        void OnFocus() override {}
++        void OnDetached() override {}
++        void OnExecutionPaused() override {}
++        void OnExecutionContinued() override {}
++        void OnExecutionEnded() override {}
++        void OnStepCompleted(cpu::ThreadDebugInfo*) override {}
++        void OnBreakpointHit(cpu::Breakpoint*, cpu::ThreadDebugInfo*) override {}
++      };
++      static QuietListener listener;
++      std::this_thread::sleep_for(
++          std::chrono::milliseconds(cvars::debug_stack_dump_ms));
++      auto* cpu = processor();
++      cpu->set_debug_listener(&listener);
++      for (int sample = 0; sample < 3; ++sample) {
++      if (sample) std::this_thread::sleep_for(std::chrono::seconds(1));
++      cpu->Pause();
++      XELOGI("Stack dump: sample {}", sample);
++      for (auto* info : cpu->QueryThreadDebugInfos()) {
++        if (info->state == cpu::ThreadDebugInfo::State::kZombie ||
++            info->state == cpu::ThreadDebugInfo::State::kExited) {
++          continue;
++        }
++        XELOGI("Stack dump: thread {:X} state {} lr {:08X}", info->thread_id,
++               int(info->state), uint32_t(info->guest_context.lr));
++        auto& g = info->guest_context;
++        for (int r = 0; r < 32; r += 8) {
++          XELOGI("Stack dump:  r{:<2} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
++                 "{:08X} {:08X}",
++                 r, uint32_t(g.r[r]), uint32_t(g.r[r + 1]), uint32_t(g.r[r + 2]),
++                 uint32_t(g.r[r + 3]), uint32_t(g.r[r + 4]),
++                 uint32_t(g.r[r + 5]), uint32_t(g.r[r + 6]),
++                 uint32_t(g.r[r + 7]));
++        }
++        // 64 bytes at every register that points into guest memory
++        for (int r = 0; r < 32; ++r) {
++          uint32_t a = uint32_t(g.r[r]);
++          if (a < 0x40000000 || a >= 0xA0000000) continue;
++          auto* heap = memory()->LookupHeap(a);
++          uint32_t protect = 0, protect_end = 0;
++          if (!heap || !heap->QueryProtect(a, &protect) ||
++              !heap->QueryProtect(a + 63, &protect_end) ||
++              !(protect & kMemoryProtectRead) ||
++              !(protect_end & kMemoryProtectRead)) {
++            continue;
++          }
++          auto* m = memory()->TranslateVirtual<uint8_t*>(a);
++          std::string hex;
++          for (int i = 0; i < 64; i += 4) {
++            hex += fmt::format(" {:08X}", xe::load_and_swap<uint32_t>(m + i));
++          }
++          XELOGI("Stack dump:  [r{}={:08X}]{}", r, a, hex);
++        }
++        for (auto& frame : info->frames) {
++          if (frame.guest_pc) {
++            XELOGI("Stack dump:    {:08X} in function {:08X}", frame.guest_pc,
++                   frame.guest_function_address);
++          }
++        }
++      }
++      cpu->Continue();
++      }
++    }).detach();
++  }
++
+   XELOGI("Loading module {}", module_path);
+   auto module = kernel_state_->LoadUserModule(module_path);
+   if (!module) {
+diff --git a/src/xenia/kernel/kernel_state.cc b/src/xenia/kernel/kernel_state.cc
+index 8f9afb8c6..3f5d25fb7 100644
+--- a/src/xenia/kernel/kernel_state.cc
++++ b/src/xenia/kernel/kernel_state.cc
+@@ -563,6 +563,24 @@ X_RESULT KernelState::FinishLoadingUserModule(
+   return result;
+ }
+ 
++X_RESULT KernelState::ApplySystemUpdate(const object_ref<UserModule> module,
++                                        uint32_t update_title_id) {
++  const auto updates = FindTitleUpdate(update_title_id);
++  if (updates.empty()) {
++    return X_STATUS_SUCCESS;
++  }
++  auto patch_module = LoadTitleUpdate(&updates.front(), module);
++  if (!patch_module || !patch_module->xex_module()->is_patch()) {
++    return X_STATUS_SUCCESS;
++  }
++  if (!IsPatchSignatureProper(module, patch_module)) {
++    XELOGW("Skipping system update for {}: made for a different base",
++           module->name());
++    return X_STATUS_SUCCESS;
++  }
++  return ApplyTitleUpdate(module, patch_module);
++}
++
+ X_RESULT KernelState::ApplyTitleUpdate(
+     const object_ref<UserModule> title_module) {
+   const auto title_updates = FindTitleUpdate(title_module->title_id());
+diff --git a/src/xenia/kernel/kernel_state.h b/src/xenia/kernel/kernel_state.h
+index 2e1a99a76..3b532cdc0 100644
+--- a/src/xenia/kernel/kernel_state.h
++++ b/src/xenia/kernel/kernel_state.h
+@@ -261,6 +261,10 @@ class KernelState {
+   }
+ 
+   X_RESULT ApplyTitleUpdate(const object_ref<UserModule> title_module);
++  // A system module (title ID 0, e.g. xam.xex) patched by the system update
++  // installed for the given title (the dashboard's).
++  X_RESULT ApplySystemUpdate(const object_ref<UserModule> module,
++                             uint32_t update_title_id);
+   // Terminates a title: Unloads all modules, and kills all guest threads.
+   // This DOES NOT RETURN if called from a guest thread!
+   void TerminateTitle();
+diff --git a/src/xenia/kernel/xam/xam_info.cc b/src/xenia/kernel/xam/xam_info.cc
+index 00b93ecef..fa187fdc4 100644
+--- a/src/xenia/kernel/xam/xam_info.cc
++++ b/src/xenia/kernel/xam/xam_info.cc
+@@ -10,6 +10,7 @@
+ #include <cstdlib>
+ 
+ #include "xenia/base/cvar.h"
++#include "xenia/config.h"
+ #include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/string_util.h"
+@@ -390,6 +391,9 @@ DECLARE_XAM_EXPORT1(XamLoaderGetLaunchData, kNone, kSketchy);
+     fwrite(launch_path.data(), 1, launch_path.size(), file);
+     fclose(file);
+   }
++  // Keep what was changed while running, e.g. the profile signed in on
++  // the dashboard, as closing the window normally would.
++  config::SaveConfig();
+   xe::ShutdownLogging();  // flushes the log before the hard exit
+   std::quick_exit(0);
+ }
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_modules.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_modules.cc
+index 42e737bc3..fd5a3a4df 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_modules.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_modules.cc
+@@ -81,6 +81,11 @@ dword_result_t XexGetModuleSection_entry(lpvoid_t hmodule, lpstring_t name,
+       *data_ptr = section_data;
+       *size_ptr = section_size;
+     }
++    XELOGD("XexGetModuleSection({}, {}) = {:08X}: {:08X}, {} bytes, starts {:08X}",
++           module->name(), name.value(), result, section_data, section_size,
++           section_data ? xe::load_and_swap<uint32_t>(
++                              kernel_memory()->TranslateVirtual(section_data))
++                        : 0);
+   } else {
+     result = X_STATUS_INVALID_HANDLE;
+   }
+-- 
+2.55.0.windows.3
+

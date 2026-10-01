@@ -1,0 +1,139 @@
+From 64a39f4d5d2f1e9a6a0114626d5730d722d9e63d Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 00:52:40 +0530
+Subject: [PATCH 05/51] Guide overlay: match real console footage
+
+Measured against a frame of the real Guide: the console dims the screen behind
+it (layout dim, ~72% black, faded with the slide), draws the canvas further
+left than fitting it to the left edge (layout offset, in canvas units), and
+shows the clock as 12:05 PM.
+---
+ src/xenia/app/guide_overlay.cc | 37 +++++++++++++++++++++++++++-------
+ src/xenia/app/guide_overlay.h  |  2 ++
+ 2 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 22119d731..9c236e6db 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -131,6 +131,12 @@ void GuideOverlay::LoadLayout() {
+       in >> l.fade_frames;
+     } else if (key == "fps") {
+       in >> l.fps;
++    } else if (key == "offset") {
++      in >> l.offset_x >> l.offset_y;
++    } else if (key == "dim") {
++      in >> l.dim;
++    } else if (key == "space") {
++      in >> l.clock_advance[' '];
+     } else if (key == "clock_box") {
+       in >> l.clock_x >> l.clock_y >> l.clock_w >> l.clock_h;
+     } else if (key == "clock_font") {
+@@ -646,6 +652,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+ 
+   float chrome_x = 0, legend_x = 0;  // canvas units
+   float content_alpha = 1, legend_alpha = 1;
++  float dim_amount = 1;  // of layout_.dim
+   bool content_visible = true;
+   switch (view.mode) {
+     case Mode::kOpening: {
+@@ -654,6 +661,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       // and legends are invisible, then they fade in (30-44).
+       float slide = EaseOut(Clamp01(view.frames / l.slide_frames));
+       chrome_x = -l.slide * (1.0f - slide);
++      dim_amount = slide;
+       content_alpha = legend_alpha =
+           Clamp01((view.frames - l.slide_frames) / l.fade_frames);
+       break;
+@@ -667,6 +675,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       float slide = EaseIn(progress);
+       chrome_x = -l.slide * slide;
+       legend_x = -kLegendSlide * slide;
++      dim_amount = 1.0f - slide;
+       content_visible = false;
+       if (progress >= 1.0f) {
+         FinishClose();
+@@ -678,13 +687,23 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       return;
+   }
+ 
+-  // The 1120x770 Guide canvas fills the screen height from the left edge.
++  // The 1120x770 Guide canvas is scaled to the screen height and placed where
++  // the console puts it (layout offset, measured on real footage). Whole
++  // pixels, so the resampled images stay one texel per pixel.
+   const float k = display_h / l.canvas_h;
++  const float ox = std::round(l.offset_x * k), oy = std::round(l.offset_y * k);
+   ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+-  if (cvars::blades_guide_test.find("black") != std::string::npos) {
++  bool test_backdrop =
++      cvars::blades_guide_test.find("black") != std::string::npos;
++  if (test_backdrop) {
+     // Known backdrop for pixel comparisons against the reference renders.
+     draw_list->AddRectFilled(ImVec2(0, 0), ImVec2(display_w, display_h),
+                              IM_COL32(0, 0, 0, 255));
++  } else if (l.dim > 0.0f) {
++    // The console darkens the screen behind the Guide.
++    draw_list->AddRectFilled(
++        ImVec2(0, 0), ImVec2(display_w, display_h),
++        IM_COL32(0, 0, 0, int(l.dim * dim_amount * 255.0f + 0.5f)));
+   }
+   auto layer = [&](const std::string& name, float x, float alpha) {
+     if (alpha <= 0.0f) {
+@@ -697,7 +716,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       float w = exact ? float(image->width) : l.canvas_w * k;
+       float h = exact ? float(image->height) : display_h;
+       draw_list->AddImage(reinterpret_cast<ImTextureID>(image->texture.get()),
+-                          ImVec2(x * k, 0), ImVec2(x * k + w, h),
++                          ImVec2(ox + x * k, oy), ImVec2(ox + x * k + w, oy + h),
+                           ImVec2(0, 0), ImVec2(1, 1),
+                           IM_COL32(255, 255, 255, int(alpha * 255.0f + 0.5f)));
+     }
+@@ -741,8 +760,9 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     localtime_s(&local, &now);
+     int hour = local.tm_hour % 12 == 0 ? 12 : local.tm_hour % 12;
+     char text[16];
+-    snprintf(text, sizeof(text), "%d:%02d%s", hour, local.tm_min,
+-             local.tm_hour < 12 ? "am" : "pm");
++    // as the console shows it: "12:05 PM"
++    snprintf(text, sizeof(text), "%d:%02d %s", hour, local.tm_min,
++             local.tm_hour < 12 ? "AM" : "PM");
+     float width = 0;
+     for (const char* c = text; *c; ++c) {
+       width += l.clock_advance.count(*c) ? l.clock_advance.at(*c) : 0.0f;
+@@ -754,6 +774,8 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     for (const char* c = text; *c; ++c) {
+       size_t index = l.clock_chars.find(*c);
+       if (index == std::string::npos) {
++        // no glyph (the space): just its advance
++        pen += l.clock_advance.count(*c) ? l.clock_advance.at(*c) : 0.0f;
+         continue;
+       }
+       float u0 = index * l.clock_cell / atlas.units_w;
+@@ -761,8 +783,9 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       float cx = pen - l.clock_pad;
+       float cy = baseline - (l.clock_pad + l.clock_ascent);
+       draw_list->AddImage(reinterpret_cast<ImTextureID>(atlas.texture.get()),
+-                          ImVec2(cx * k, cy * k),
+-                          ImVec2((cx + l.clock_cell) * k, (cy + cell_h) * k),
++                          ImVec2(ox + cx * k, oy + cy * k),
++                          ImVec2(ox + (cx + l.clock_cell) * k,
++                                 oy + (cy + cell_h) * k),
+                           ImVec2(u0, 0), ImVec2(u1, cell_h / atlas.units_h),
+                           tint);
+       pen += l.clock_advance.at(*c);
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 2f534b8fc..42d4ca9ee 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -55,6 +55,8 @@ class GuideOverlay {
+   struct Layout {
+     float canvas_w = 1120, canvas_h = 770, scale = 2;
+     float slide = 672, slide_frames = 29, fade_frames = 14, fps = 60;
++    // canvas position on screen (units) and darkening of the screen behind
++    float offset_x = 0, offset_y = 0, dim = 0;
+     float clock_x = 402, clock_y = 64, clock_w = 170, clock_h = 40;
+     float clock_line_h = 26, clock_ascent = 21, clock_cell = 40, clock_pad = 6;
+     std::string clock_chars;
+-- 
+2.55.0.windows.3
+

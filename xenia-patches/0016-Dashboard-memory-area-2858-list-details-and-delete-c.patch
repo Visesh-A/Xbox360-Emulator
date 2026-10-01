@@ -1,0 +1,602 @@
+From 6efb879cb72714baaa5b93f4a34f2874a9a69f2f Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 16:26:53 +0530
+Subject: [PATCH 16/51] Dashboard memory area (2858): list, details and delete
+ content and profiles
+
+Read from 2858 xam and the dashboard:
+- XamContentAggregateCreateEnumerator for system titles walks
+  Content\<xuid>\<title>\<type>\<package> as xam does (xuid 0 = all users,
+  title 0 = all, type -1 = all) and returns xam's 0x148-byte records
+  (content data, owner at 0x138, title at 0x140).
+- XamContentGetAttributesInternal: {attributes, 3 times, size} (0x24).
+- XamContentGetMetaDataInternal: the package header's metadata block
+  (0x93D6 bytes from offset 0x344): type, size, title, creator, display
+  name, thumbnail, and the game's name/icon from a profile's GPD for it.
+- XamProfileLoadAccountInfo, XamGetDefaultSystemImage (xam's own
+  defaultsystemimage.png), XamUniSortCmpString (runs xam's own code).
+- Delete: "Delete Profile Only" = XamContentDeleteInternal of the profile
+  package (saves stay, profile signed out); "Delete Profile and Items" =
+  XamProfileDelete (profile and all it owns).
+- The hard drive is called "Hard Drive", as the console does.
+- XamShowMessageBoxUI logs the chosen button.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/kernel/xam/content_manager.h        |  13 ++
+ src/xenia/kernel/xam/profile_manager.cc       |  16 ++
+ src/xenia/kernel/xam/profile_manager.h        |   3 +
+ src/xenia/kernel/xam/xam_content.cc           | 190 ++++++++++++++++++
+ src/xenia/kernel/xam/xam_content_aggregate.cc |  87 ++++++++
+ src/xenia/kernel/xam/xam_content_device.cc    |   2 +-
+ src/xenia/kernel/xam/xam_info.cc              |  73 +++++++
+ src/xenia/kernel/xam/xam_profile.cc           |  30 +++
+ src/xenia/kernel/xam/xam_ui.cc                |   2 +
+ 9 files changed, 415 insertions(+), 1 deletion(-)
+
+diff --git a/src/xenia/kernel/xam/content_manager.h b/src/xenia/kernel/xam/content_manager.h
+index 02b03c19f..a49d91353 100644
+--- a/src/xenia/kernel/xam/content_manager.h
++++ b/src/xenia/kernel/xam/content_manager.h
+@@ -125,6 +125,19 @@ struct XCONTENT_CROSS_TITLE_DATA {
+ };
+ static_assert_size(XCONTENT_CROSS_TITLE_DATA, 0x138);
+ 
++// What the system's content enumerator and the *Internal content calls use
++// (2858 xam, 0x148 bytes). What the system (2858 xam) take:
++// the content data, then
++// the owner and the title of each package.
++struct XCONTENT_AGGREGATE_DATA_SYSTEM {
++  XCONTENT_DATA content_data;  // 0x0
++  uint8_t padding0[4];         // 0x134
++  xe::be<uint64_t> xuid;       // 0x138
++  xe::be<uint32_t> title_id;   // 0x140
++  uint8_t padding1[4];         // 0x144
++};
++static_assert_size(XCONTENT_AGGREGATE_DATA_SYSTEM, 0x148);
++
+ struct XCONTENT_DATA_MEDIA {
+   be<uint8_t> series_id[0x10];  // 0x0 sz:0x10
+   be<uint8_t> seasonid[0x10];   // 0x10 sz:0x10
+diff --git a/src/xenia/kernel/xam/profile_manager.cc b/src/xenia/kernel/xam/profile_manager.cc
+index 33bb26479..068593d7f 100644
+--- a/src/xenia/kernel/xam/profile_manager.cc
++++ b/src/xenia/kernel/xam/profile_manager.cc
+@@ -598,6 +598,22 @@ bool ProfileManager::DeleteProfile(const uint64_t xuid) {
+   return true;
+ }
+ 
++bool ProfileManager::DeleteProfilePackage(const uint64_t xuid) {
++  const uint8_t user_index = GetUserIndexAssignedToProfile(xuid);
++  if (user_index < XUserMaxUserCount) {
++    Logout(user_index);
++  }
++  DismountProfile(xuid);
++  accounts_.erase(xuid);
++  std::error_code ec;
++  std::filesystem::remove_all(GetProfilePath(xuid), ec);
++  if (ec) {
++    XELOGE("Cannot remove profile package: {}", ec.message());
++    return false;
++  }
++  return true;
++}
++
+ bool ProfileManager::IsGamertagValid(const std::string gamertag) {
+   std::regex pattern(R"(^[A-Za-z][A-Za-z0-9]*( [A-Za-z0-9]+)*$)");
+ 
+diff --git a/src/xenia/kernel/xam/profile_manager.h b/src/xenia/kernel/xam/profile_manager.h
+index ad9bf5321..3a1d11420 100644
+--- a/src/xenia/kernel/xam/profile_manager.h
++++ b/src/xenia/kernel/xam/profile_manager.h
+@@ -74,6 +74,9 @@ class ProfileManager {
+   bool CreateProfile(const X_XAMACCOUNTINFO* account_info, uint64_t xuid);
+ 
+   bool DeleteProfile(const uint64_t xuid);
++  // Only the profile package (Content\<xuid>\FFFE07D1\00010000\<xuid>): the
++  // profile's saves stay (the dashboard's "Delete Profile Only").
++  bool DeleteProfilePackage(const uint64_t xuid);
+ 
+   bool MountProfile(const uint64_t xuid, std::string mount_path = "");
+   bool DismountProfile(const uint64_t xuid);
+diff --git a/src/xenia/kernel/xam/xam_content.cc b/src/xenia/kernel/xam/xam_content.cc
+index 180bd9d5a..4b8bf9d45 100644
+--- a/src/xenia/kernel/xam/xam_content.cc
++++ b/src/xenia/kernel/xam/xam_content.cc
+@@ -7,14 +7,19 @@
+  ******************************************************************************
+  */
+ 
++#include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/math.h"
+ #include "xenia/base/string_util.h"
++#include "xenia/emulator.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/smc.h"
++#include "xenia/kernel/title_id_utils.h"
+ #include "xenia/kernel/user_module.h"
+ #include "xenia/kernel/util/shim_utils.h"
++#include "xenia/kernel/xam/profile_manager.h"
+ #include "xenia/kernel/xam/xam_content_device.h"
++#include "xenia/kernel/xam/xdbf/gpd_info.h"
+ #include "xenia/kernel/xam/xam_module.h"
+ #include "xenia/kernel/xam/xam_private.h"
+ #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
+@@ -505,6 +510,160 @@ dword_result_t XamContentGetCreator_entry(
+ }
+ DECLARE_XAM_EXPORT1(XamContentGetCreator, kContent, kImplemented);
+ 
++// The dashboard's memory area (2858). A package is a folder here, not the
++// console's single package file: its size is the size of the files in it.
++static std::filesystem::path SystemPackagePath(
++    const XCONTENT_AGGREGATE_DATA_SYSTEM& data) {
++  return kernel_state()->emulator()->content_root() /
++         fmt::format("{:016X}", uint64_t(data.xuid)) /
++         fmt::format("{:08X}", uint32_t(data.title_id)) /
++         fmt::format("{:08X}", static_cast<uint32_t>(static_cast<XContentType>(data.content_data.content_type))) /
++         data.content_data.file_name();
++}
++
++static uint64_t PackageSize(const std::filesystem::path& path) {
++  uint64_t size = 0;
++  std::error_code ec;
++  for (auto& entry :
++       std::filesystem::recursive_directory_iterator(path, ec)) {
++    if (entry.is_regular_file(ec)) {
++      size += entry.file_size(ec);
++    }
++  }
++  return size;
++}
++
++static X_RESULT CompleteContentCall(pointer_t<XAM_OVERLAPPED> overlapped,
++                                    X_RESULT result) {
++  if (overlapped) {
++    kernel_state()->CompleteOverlappedImmediate(overlapped, result);
++    return X_ERROR_IO_PENDING;
++  }
++  return result;
++}
++
++// 2858 xam (message 0x2001A): the package file's attributes, as
++// {u32 attributes; u64 creation, last access, last write time; u64 size}.
++dword_result_t XamContentGetAttributesInternal_entry(
++    pointer_t<XCONTENT_AGGREGATE_DATA_SYSTEM> data, lpvoid_t attributes,
++    pointer_t<XAM_OVERLAPPED> overlapped) {
++  if (!data || !attributes) {
++    return CompleteContentCall(overlapped, X_ERROR_INVALID_PARAMETER);
++  }
++  auto path = SystemPackagePath(*data);
++  XELOGD("XamContentGetAttributesInternal: xuid {:016X} title {:08X} type {:08X} "
++         "file '{}' -> {}",
++         uint64_t(data->xuid), uint32_t(data->title_id),
++         static_cast<uint32_t>(
++             static_cast<XContentType>(data->content_data.content_type)),
++         data->content_data.file_name(), xe::path_to_utf8(path));
++  std::error_code ec;
++  if (!std::filesystem::is_directory(path, ec)) {
++    return CompleteContentCall(overlapped, X_ERROR_FILE_NOT_FOUND);
++  }
++  // On Windows the file clock counts FILETIME units from 1601.
++  uint64_t time = std::filesystem::last_write_time(path, ec)
++                      .time_since_epoch()
++                      .count();
++  uint8_t* out = attributes.as<uint8_t*>();
++  std::memset(out, 0, 0x24);
++  xe::store_and_swap<uint32_t>(out + 0x00, 0x80);  // FILE_ATTRIBUTE_NORMAL
++  xe::store_and_swap<uint64_t>(out + 0x04, time);
++  xe::store_and_swap<uint64_t>(out + 0x0C, time);
++  xe::store_and_swap<uint64_t>(out + 0x14, time);
++  xe::store_and_swap<uint64_t>(out + 0x1C, PackageSize(path));
++  return CompleteContentCall(overlapped, X_ERROR_SUCCESS);
++}
++DECLARE_XAM_EXPORT1(XamContentGetAttributesInternal, kContent, kImplemented);
++
++// 2858 xam (message 0x20011): the package header's metadata block, as it is
++// stored from offset 0x344 of a package (0x93D6 bytes).
++dword_result_t XamContentGetMetaDataInternal_entry(
++    pointer_t<XCONTENT_AGGREGATE_DATA_SYSTEM> data, lpvoid_t metadata,
++    pointer_t<XAM_OVERLAPPED> overlapped) {
++  if (!data || !metadata) {
++    return CompleteContentCall(overlapped, X_ERROR_INVALID_PARAMETER);
++  }
++  auto path = SystemPackagePath(*data);
++  XELOGD("XamContentGetMetaDataInternal: xuid {:016X} title {:08X} type {:08X} "
++         "file '{}' -> {}",
++         uint64_t(data->xuid), uint32_t(data->title_id),
++         static_cast<uint32_t>(
++             static_cast<XContentType>(data->content_data.content_type)),
++         data->content_data.file_name(), xe::path_to_utf8(path));
++  std::error_code ec;
++  if (!std::filesystem::is_directory(path, ec)) {
++    return CompleteContentCall(overlapped, X_ERROR_FILE_NOT_FOUND);
++  }
++  uint8_t* out = metadata.as<uint8_t*>();
++  std::memset(out, 0, 0x93D6);
++  xe::store_and_swap<uint32_t>(out + 0x0000,
++                               static_cast<uint32_t>(static_cast<XContentType>(data->content_data.content_type)));
++  xe::store_and_swap<uint64_t>(out + 0x0008, PackageSize(path));
++  xe::store_and_swap<uint32_t>(out + 0x001C, uint32_t(data->title_id));
++  // Profile ID of the package's creator (header offset 0x371).
++  xe::store_and_swap<uint64_t>(out + 0x002D, uint64_t(data->xuid));
++  // Display name (first language), UTF-16, 0x80 bytes.
++  auto name = data->content_data.display_name();
++  for (size_t i = 0; i < name.size() && i < 0x3F; ++i) {
++    xe::store_and_swap<uint16_t>(out + 0x00CD + i * 2, uint16_t(name[i]));
++  }
++  // The game's name and icon, which a console finds in the package header
++  // (written with the save): here from a profile's GPD for that game, the
++  // package owner's first.
++  {
++    const auto root = kernel_state()->emulator()->content_root();
++    const auto title = fmt::format("{:08X}", uint32_t(data->title_id));
++    std::vector<std::string> owners{fmt::format("{:016X}", uint64_t(data->xuid))};
++    for (auto& info : xe::filesystem::ListDirectories(root)) {
++      owners.push_back(xe::path_to_utf8(info.name));
++    }
++    for (auto& owner : owners) {
++      auto gpd_path =
++          root / owner / "FFFE07D1" / "00010000" / owner / (title + ".gpd");
++      std::error_code gpd_ec;
++      if (!std::filesystem::is_regular_file(gpd_path, gpd_ec)) {
++        continue;
++      }
++      std::vector<uint8_t> bytes(std::filesystem::file_size(gpd_path, gpd_ec));
++      if (FILE* file = xe::filesystem::OpenFile(gpd_path, "rb")) {
++        fread(bytes.data(), 1, bytes.size(), file);
++        fclose(file);
++      }
++      GpdInfo gpd(uint32_t(data->title_id), bytes);
++      auto title_name = gpd.GetString(kXdbfIdTitle);
++      auto icon = gpd.GetImage(kXdbfIdTitle);
++      for (size_t i = 0; i < title_name.size() && i < 0x3F; ++i) {
++        xe::store_and_swap<uint16_t>(out + 0x134D + i * 2,
++                                     uint16_t(title_name[i]));
++      }
++      if (!icon.empty() && icon.size() <= 0x4000) {
++        xe::store_and_swap<uint32_t>(out + 0x13D2, uint32_t(icon.size()));
++        std::memcpy(out + 0x53D6, icon.data(), icon.size());
++      }
++      if (!title_name.empty()) {
++        break;
++      }
++    }
++  }
++  XCONTENT_AGGREGATE_DATA content;
++  content.device_id = data->content_data.device_id;
++  content.content_type = data->content_data.content_type;
++  content.set_display_name(name);
++  content.set_file_name(data->content_data.file_name());
++  content.xuid = data->xuid;
++  content.title_id = data->title_id;
++  std::vector<uint8_t> thumbnail;
++  if (XSUCCEEDED(kernel_state()->content_manager()->GetContentThumbnail(
++          data->xuid, content, &thumbnail)) &&
++      !thumbnail.empty() && thumbnail.size() <= 0x4000) {
++    xe::store_and_swap<uint32_t>(out + 0x13CE, uint32_t(thumbnail.size()));
++    std::memcpy(out + 0x13D6, thumbnail.data(), thumbnail.size());
++  }
++  return CompleteContentCall(overlapped, X_ERROR_SUCCESS);
++}
++DECLARE_XAM_EXPORT1(XamContentGetMetaDataInternal, kContent, kImplemented);
++
+ dword_result_t XamContentGetThumbnail_entry(
+     dword_t user_index, lpvoid_t content_data_ptr, lpvoid_t buffer_ptr,
+     lpdword_t buffer_size_ptr, pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+@@ -614,6 +773,37 @@ DECLARE_XAM_EXPORT1(XamContentDelete, kContent, kImplemented);
+ 
+ dword_result_t XamContentDeleteInternal_entry(
+     lpvoid_t content_data_ptr, pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
++  if (IsSystemTitle(kernel_state()->title_id())) {
++    // The dashboard's memory area passes xam's 0x148-byte records, which
++    // carry the package's owner.
++    auto* data = content_data_ptr.as<XCONTENT_AGGREGATE_DATA_SYSTEM*>();
++    auto path = SystemPackagePath(*data);
++    auto header = path.parent_path().parent_path() / "Headers" /
++                  path.parent_path().filename() /
++                  (data->content_data.file_name() + ".header");
++    std::error_code ec;
++    X_RESULT result;
++    if (static_cast<XContentType>(data->content_data.content_type) ==
++        XContentType::kProfile) {
++      // A profile's package: sign it out and forget it too.
++      result = kernel_state()->xam_state()->profile_manager()
++                       ->DeleteProfilePackage(data->xuid)
++                   ? X_ERROR_SUCCESS
++                   : X_ERROR_FILE_NOT_FOUND;
++    } else {
++      result = std::filesystem::remove_all(path, ec) > 0
++                   ? X_ERROR_SUCCESS
++                   : X_ERROR_FILE_NOT_FOUND;
++    }
++    std::filesystem::remove(header, ec);
++    XELOGI("XamContentDeleteInternal: {} -> {:08X}", xe::path_to_utf8(path),
++           result);
++    if (overlapped_ptr) {
++      kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);
++      return X_ERROR_IO_PENDING;
++    }
++    return result;
++  }
+   // INFO: Analysis of xam.xex shows that "internal" functions are wrappers with
+   // 0xFE as user_index.
+   // In XAM content size is set to 0x200.
+diff --git a/src/xenia/kernel/xam/xam_content_aggregate.cc b/src/xenia/kernel/xam/xam_content_aggregate.cc
+index ad7d5fb45..6d2ab685e 100644
+--- a/src/xenia/kernel/xam/xam_content_aggregate.cc
++++ b/src/xenia/kernel/xam/xam_content_aggregate.cc
+@@ -7,10 +7,13 @@
+  ******************************************************************************
+  */
+ 
++#include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/math.h"
+ #include "xenia/base/string_util.h"
++#include "xenia/emulator.h"
+ #include "xenia/kernel/kernel_state.h"
++#include "xenia/kernel/title_id_utils.h"
+ #include "xenia/kernel/user_module.h"
+ #include "xenia/kernel/util/shim_utils.h"
+ #include "xenia/kernel/xam/xam_content_device.h"
+@@ -76,6 +79,55 @@ void AddODDContentTest(object_ref<XStaticEnumerator<XCONTENT_AGGREGATE_DATA>> e,
+   }
+ }
+ 
++// As xam's content enumerator (0xFE message 0x2000F) walks
++// Content\<xuid>\<title>\<type>\<package>: xuid 0 = every user (-1 = common
++// content only), title 0 = every title, type -1 = every type.
++static std::vector<XCONTENT_AGGREGATE_DATA> ListAllContent(
++    uint64_t xuid, uint32_t title_id, uint32_t content_type) {
++  std::vector<XCONTENT_AGGREGATE_DATA> result;
++  auto hex_dirs = [](const std::filesystem::path& dir, size_t digits) {
++    std::vector<std::pair<uint64_t, std::string>> out;
++    for (auto& info : xe::filesystem::ListDirectories(dir)) {
++      auto name = xe::path_to_utf8(info.name);
++      if (name.size() != digits ||
++          name.find_first_not_of("0123456789ABCDEFabcdef") !=
++              std::string::npos) {
++        continue;
++      }
++      out.emplace_back(string_util::from_string<uint64_t>(name, true), name);
++    }
++    return out;
++  };
++  const auto root = kernel_state()->emulator()->content_root();
++  for (auto& [owner, owner_name] : hex_dirs(root, 16)) {
++    if (xuid != 0 && xuid != owner && !(xuid == ~0ull && owner == 0)) {
++      continue;
++    }
++    for (auto& [title, title_name] : hex_dirs(root / owner_name, 8)) {
++      if (title_id != 0 && title_id != title) {
++        continue;
++      }
++      for (auto& [type, type_name] :
++           hex_dirs(root / owner_name / title_name, 8)) {
++        if (content_type != 0xFFFFFFFF && content_type != type) {
++          continue;
++        }
++        auto items = kernel_state()->content_manager()->ListContent(
++            static_cast<uint32_t>(DummyDeviceId::HDD), owner,
++            static_cast<uint32_t>(title), XContentType(uint32_t(type)));
++        for (auto& item : items) {
++          // The walk knows where each package lives; a header file's own
++          // fields do not carry the owner.
++          item.xuid = owner;
++          item.title_id = static_cast<uint32_t>(title);
++          result.push_back(item);
++        }
++      }
++    }
++  }
++  return result;
++}
++
+ // Alias XContentCreateCrossTitleEnumerator
+ dword_result_t XamContentAggregateCreateEnumerator_entry(qword_t xuid,
+                                                          dword_t device_id,
+@@ -89,6 +141,41 @@ dword_result_t XamContentAggregateCreateEnumerator_entry(qword_t xuid,
+     return X_E_INVALIDARG;
+   }
+ 
++  if (IsSystemTitle(kernel_state()->title_id())) {
++    // The dashboard's memory area: everything on the hard drive.
++    auto e = make_object<XStaticEnumerator<XCONTENT_AGGREGATE_DATA_SYSTEM>>(
++        kernel_state(), 1);
++    X_KENUMERATOR_CONTENT_AGGREGATE* extra;
++    auto result =
++        e->Initialize(XUserIndexAny, 0xFE, 0x2000E, 0x20010, 0, &extra);
++    if (XFAILED(result)) {
++      return result;
++    }
++    extra->magic = kXObjSignature;
++    extra->handle = e->handle();
++    if (!device_info || device_info->device_type == DeviceType::HDD) {
++      for (auto& data :
++           ListAllContent(xuid, title_id, content_type.value())) {
++        auto item = e->AppendItem();
++        if (!item) {
++          continue;
++        }
++        std::memset(item, 0, sizeof(*item));
++        item->content_data.device_id = data.device_id;
++        item->content_data.content_type = data.content_type;
++        item->content_data.display_name_raw = data.display_name_raw;
++        std::memcpy(item->content_data.file_name_raw, data.file_name_raw,
++                    sizeof(data.file_name_raw));
++        item->xuid = data.xuid;
++        item->title_id = data.title_id;
++      }
++    }
++    XELOGD("XamContentAggregateCreateEnumerator: {} items on the drive",
++           e->item_count());
++    *handle_out = e->handle();
++    return X_ERROR_SUCCESS;
++  }
++
+   auto e = make_object<XStaticEnumerator<XCONTENT_CROSS_TITLE_DATA>>(
+       kernel_state(), 1);
+   X_KENUMERATOR_CONTENT_AGGREGATE* extra;
+diff --git a/src/xenia/kernel/xam/xam_content_device.cc b/src/xenia/kernel/xam/xam_content_device.cc
+index 52988bed1..070b6f305 100644
+--- a/src/xenia/kernel/xam/xam_content_device.cc
++++ b/src/xenia/kernel/xam/xam_content_device.cc
+@@ -37,7 +37,7 @@ static constexpr DummyDeviceInfo dummy_hdd_device_info_ = {
+     DummyDeviceId::HDD, DeviceType::HDD,
+     20ull * ONE_GB,  // 20GB
+     10ull * ONE_GB,  // 10GB.
+-    u"Dummy HDD",
++    u"Hard Drive",  // the console's own name for it (2858 dash strings)
+ };
+ static constexpr DummyDeviceInfo dummy_odd_device_info_ = {
+     DummyDeviceId::ODD, DeviceType::ODD,
+diff --git a/src/xenia/kernel/xam/xam_info.cc b/src/xenia/kernel/xam/xam_info.cc
+index fa187fdc4..70f280c22 100644
+--- a/src/xenia/kernel/xam/xam_info.cc
++++ b/src/xenia/kernel/xam/xam_info.cc
+@@ -14,6 +14,7 @@
+ #include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/string_util.h"
++#include "xenia/base/utf8.h"
+ #include "xenia/emulator.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/title_id_utils.h"
+@@ -177,6 +178,78 @@ dword_result_t XamBuildGamercardResourceLocator_entry(lpu16string_t filename,
+ }
+ DECLARE_XAM_EXPORT1(XamBuildGamercardResourceLocator, kNone, kImplemented);
+ 
++// 2858 xam: defaultsystemimage.png from xam's own "xam" resource (an XUIZ
++// package: u32 table size at 0x10, u16 count at 0x14, entries {u32 size,
++// u32 offset, u8 name length, UTF-16 name} from 0x16, file data after the
++// table), loaded once and handed to every caller.
++dword_result_t XamGetDefaultSystemImage_entry(lpdword_t image_ptr,
++                                              lpdword_t size_ptr) {
++  static uint32_t cached_ptr = 0, cached_size = 0;
++  if (!cached_ptr) {
++    auto xam_module = kernel_state()->GetModule("xam", true);
++    uint32_t section = 0, section_size = 0;
++    if (!xam_module ||
++        XFAILED(xam_module->GetSection("xam", &section, &section_size))) {
++      return X_E_FAIL;
++    }
++    auto* base = kernel_memory()->TranslateVirtual<uint8_t*>(section);
++    if (section_size < 0x16 || xe::load_and_swap<uint32_t>(base) != 'XUIZ') {
++      return X_E_FAIL;
++    }
++    uint32_t table_size = xe::load_and_swap<uint32_t>(base + 0x10);
++    uint16_t count = xe::load_and_swap<uint16_t>(base + 0x14);
++    uint32_t p = 0x16;
++    for (uint16_t i = 0; i < count && p + 9 <= section_size; ++i) {
++      uint32_t file_size = xe::load_and_swap<uint32_t>(base + p);
++      uint32_t file_offset = xe::load_and_swap<uint32_t>(base + p + 4);
++      uint8_t name_length = base[p + 8];
++      std::string name;
++      for (uint8_t c = 0; c < name_length; ++c) {
++        name += char(xe::load_and_swap<uint16_t>(base + p + 9 + c * 2));
++      }
++      p += 9 + name_length * 2;
++      if (xe::utf8::equal_case(name, "defaultsystemimage.png")) {
++        cached_ptr = section + 0x16 + table_size + file_offset;
++        cached_size = file_size;
++        break;
++      }
++    }
++    if (!cached_ptr) {
++      return X_E_FAIL;
++    }
++  }
++  if (image_ptr) *image_ptr = cached_ptr;
++  if (size_ptr) *size_ptr = cached_size;
++  return X_ERROR_SUCCESS;
++}
++DECLARE_XAM_EXPORT1(XamGetDefaultSystemImage, kNone, kImplemented);
++
++// Collation of the console's xam (its own sort-weight tables): run the loaded
++// xam.xex's export, which is pure computation.
++dword_result_t XamUniSortCmpString_entry(lpvoid_t string1, lpvoid_t string2,
++                                         dword_t count) {
++  auto xam_module = kernel_state()->GetModule("xam", true);
++  uint32_t address =
++      xam_module ? xam_module->GetProcAddressByOrdinal(0x1E6) : 0;
++  if (!address) {
++    // No console xam: plain UTF-16 order.
++    auto* a = string1.as<uint16_t*>();
++    auto* b = string2.as<uint16_t*>();
++    for (uint32_t i = 0; i < count; ++i) {
++      uint16_t ca = xe::byte_swap(a[i]), cb = xe::byte_swap(b[i]);
++      if (ca != cb || !ca) {
++        return ca < cb ? uint32_t(-1) : ca > cb ? 1 : 0;
++      }
++    }
++    return 0;
++  }
++  uint64_t args[] = {string1.guest_address(), string2.guest_address(),
++                     count.value()};
++  return uint32_t(kernel_state()->processor()->Execute(
++      XThread::GetCurrentThread()->thread_state(), address, args, 3));
++}
++DECLARE_XAM_EXPORT1(XamUniSortCmpString, kNone, kImplemented);
++
+ dword_result_t XamBuildSharedSystemResourceLocator_entry(lpu16string_t filename,
+                                                          lpvoid_t buffer_ptr,
+                                                          dword_t buffer_count) {
+diff --git a/src/xenia/kernel/xam/xam_profile.cc b/src/xenia/kernel/xam/xam_profile.cc
+index 300bded50..16be54d38 100644
+--- a/src/xenia/kernel/xam/xam_profile.cc
++++ b/src/xenia/kernel/xam/xam_profile.cc
+@@ -108,6 +108,36 @@ dword_result_t XamProfileCreate_entry(
+ }
+ DECLARE_XAM_EXPORT1(XamProfileCreate, kNone, kSketchy);
+ 
++// 2858 xam (message 0x23004): a profile's account (gamertag, flags, ...) as
++// stored in its Account file, for the dashboard's memory area.
++dword_result_t XamProfileLoadAccountInfo_entry(
++    dword_t device_id, qword_t xuid, pointer_t<X_XAMACCOUNTINFO> account) {
++  if (!account) {
++    return X_ERROR_INVALID_PARAMETER;
++  }
++  auto* found =
++      kernel_state()->xam_state()->profile_manager()->GetAccount(xuid);
++  if (!found) {
++    return X_ERROR_FILE_NOT_FOUND;
++  }
++  std::memcpy(static_cast<X_XAMACCOUNTINFO*>(account), found, sizeof(X_XAMACCOUNTINFO));
++  return X_ERROR_SUCCESS;
++}
++DECLARE_XAM_EXPORT1(XamProfileLoadAccountInfo, kNone, kImplemented);
++
++// 2858 xam (message 0x23006): the profile and everything it owns. (The
++// dashboard's "Delete Profile and Items"; "Delete Profile Only" deletes the
++// profile's package with XamContentDeleteInternal instead.)
++dword_result_t XamProfileDelete_entry(dword_t device_id, qword_t xuid) {
++  auto* profile_manager = kernel_state()->xam_state()->profile_manager();
++  if (!profile_manager->GetAccount(xuid)) {
++    return X_ERROR_FILE_NOT_FOUND;
++  }
++  return profile_manager->DeleteProfile(xuid) ? X_ERROR_SUCCESS
++                                              : X_ERROR_FUNCTION_FAILED;
++}
++DECLARE_XAM_EXPORT1(XamProfileDelete, kNone, kImplemented);
++
+ dword_result_t XamProfileClose_entry(lpstring_t mount_name) {
+   std::string guest_name = mount_name.value();
+   const bool result =
+diff --git a/src/xenia/kernel/xam/xam_ui.cc b/src/xenia/kernel/xam/xam_ui.cc
+index e3eefa82f..bb1cc7c42 100644
+--- a/src/xenia/kernel/xam/xam_ui.cc
++++ b/src/xenia/kernel/xam/xam_ui.cc
+@@ -376,6 +376,8 @@ static dword_result_t XamShowMessageBoxUi(
+     } else {
+       auto close = [result_ptr](MessageBoxDialog* dialog) -> X_RESULT {
+         result_ptr->ButtonPressed = dialog->chosen_button();
++        XELOGI("XamShowMessageBoxUI: button {} chosen",
++               dialog->chosen_button());
+         return X_ERROR_SUCCESS;
+       };
+ 
+-- 
+2.55.0.windows.3
+

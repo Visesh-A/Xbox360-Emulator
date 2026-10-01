@@ -1,0 +1,203 @@
+From ad3621cfb58e4a0dd204c5165c75768b2232ec3b Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 19:14:35 +0530
+Subject: [PATCH 35/51] Guide: Change Personal Picture; no Take Personal
+ Picture without a camera
+
+Edit Gamer Picture's Change Personal Picture (PressPath
+ChangePersonalTile.xur) is the same picture grid as Change Gamer Picture
+(list filler 90117E80), focus previewing on the card. A writes the
+personal picture (90105990, XamWriteGamerTileEx type 2: the gamercard's
+personal picture key) and goes back.
+
+807's init (90106030) unlinks Take Personal Picture unless a Vision
+camera was ever connected (XCONFIG_CONSOLE_CAMERA_SETTINGS 0x4000) or is
+now (XUsbcamGetState), so this console's Edit Gamer Picture has three
+buttons.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc   | 36 ++++++++++++++++++++++----------
+ src/xenia/app/guide_overlay.h    |  3 ++-
+ src/xenia/kernel/xam/xam_ui.h    |  2 ++
+ src/xenia/kernel/xam/xam_user.cc | 20 ++++++++++++++++++
+ 4 files changed, 49 insertions(+), 12 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index a00d913bf..6ed9df34b 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -1289,6 +1289,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kGpEdit:
+       case Page::kGpEditPic:
+       case Page::kGpPics:
++      case Page::kGpPersonal:
+         return "gp";
+       default:
+         return nullptr;
+@@ -1556,7 +1557,8 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kGpCard:
+       case Page::kGpEdit:
+       case Page::kGpEditPic:
+-      case Page::kGpPics: {
++      case Page::kGpPics:
++      case Page::kGpPersonal: {
+         // Composed from createprofile's page images with the name and the
+         // captions in the console font; again whenever it changes.
+         uint64_t version;
+@@ -3179,6 +3181,8 @@ const char* GuideOverlay::GpKey(Page page) {
+       return "gpeditp";
+     case Page::kGpPics:
+       return "gppics";
++    case Page::kGpPersonal:
++      return "gppers";
+     default:
+       return nullptr;
+   }
+@@ -3226,7 +3230,7 @@ void GuideOverlay::LoadGamerProfileLayout() {
+       gp_strings_[line.substr(0, space)] = Unescape(line.substr(space + 1));
+     }
+   }
+-  gp_ready_ = gp_pages_.size() == 4 && gp_cells_[4] > 0;
++  gp_ready_ = gp_pages_.size() == 5 && gp_cells_[4] > 0;
+   if (!gp_ready_) {
+     XELOGW("Guide: gamerprofile assets missing (gamerprofile.txt)");
+   }
+@@ -3289,7 +3293,7 @@ void GuideOverlay::GpGoTo(Page page) {
+   // XuiSceneNavigateForward to another full-width scene: the frame stays.
+   gp_back_.push_back({page_, gp_focus_});
+   page_ = page;
+-  if (page == Page::kGpPics) {
++  if (page == Page::kGpPics || page == Page::kGpPersonal) {
+     gp_cell_ = 0;  // 90117CE0: the list selects its first item
+     gp_focus_.clear();
+   } else {
+@@ -3299,7 +3303,7 @@ void GuideOverlay::GpGoTo(Page page) {
+ }
+ 
+ void GuideOverlay::GpMove(Direction direction) {
+-  if (page_ == Page::kGpPics) {
++  if (page_ == Page::kGpPics || page_ == Page::kGpPersonal) {
+     // the list's grid, 3 columns of 12 items
+     const int cols = int(gp_cells_[4]), count = int(gp_cells_[5]);
+     int next = gp_cell_;
+@@ -3387,18 +3391,27 @@ void GuideOverlay::GpActivate() {
+       box.buttons = {profile_strings_["ok"]};
+       box.icon = 1;
+       ShowProfileBox(box, Page::kGpEditPic);
++    } else if (focus == "changePersonalTileButton") {
++      GpGoTo(Page::kGpPersonal);  // PressPath ChangePersonalTile.xur
+     } else {
+       XELOGW("Guide: Edit Gamer Picture {} is not built yet", focus);
+     }
+     return;
+   }
+-  if (page == Page::kGpPics) {
+-    // 90105990: XamWriteGamerTileEx with the item's title and ids, then
+-    // 901052A8 back to Edit Gamer Picture
++  if (page == Page::kGpPics || page == Page::kGpPersonal) {
++    // 809 (90105368): XamWriteGamerTile with the item's title and ids;
++    // ChangePersonalTile (90105990): XamWriteGamerTileEx, type 2 (the
++    // personal picture). Then 901052A8, back to Edit Gamer Picture.
+     const int n = gp_cell_ + 1;
+     const uint64_t xuid = gp_xuid_;
+     lock.unlock();
+-    kernel::xam::WriteGamerPicture(xuid, 0xFFFE07D1, 0x20000 + n, 0x10000 + n);
++    if (page == Page::kGpPics) {
++      kernel::xam::WriteGamerPicture(xuid, 0xFFFE07D1, 0x20000 + n,
++                                     0x10000 + n);
++    } else {
++      kernel::xam::WritePersonalPicture(xuid, 0xFFFE07D1, 0x20000 + n,
++                                        0x10000 + n);
++    }
+     lock.lock();
+     if (!gp_back_.empty()) {
+       page_ = gp_back_.back().first;
+@@ -3522,7 +3535,8 @@ bool GuideOverlay::ComposeGamerProfilePage(Page page, float ppu, Pixels& out) {
+   if (!scaled_ready_ || scaled_ppu_ != ppu) {
+     return false;
+   }
+-  auto base = scaled_.find(page == Page::kGpPics ? key : key + "_" + focus);
++  const bool grid = page == Page::kGpPics || page == Page::kGpPersonal;
++  auto base = scaled_.find(grid ? key : key + "_" + focus);
+   if (base == scaled_.end()) return false;
+   out = base->second;
+   auto text = [&](const char* name, const std::u16string& value) {
+@@ -3540,13 +3554,13 @@ bool GuideOverlay::ComposeGamerProfilePage(Page page, float ppu, Pixels& out) {
+   // the card's picture: on Change Gamer Picture the focused item's (its
+   // focus change sets it on the card, 901056C8), else the profile's own
+   const Pixels* picture = own_picture.rgba.empty() ? nullptr : &own_picture;
+-  if (page == Page::kGpPics) picture = GamerPicture(cell + 1);
++  if (grid) picture = GamerPicture(cell + 1);
+   auto tile = layout.images.find("tile");
+   if (picture && tile != layout.images.end()) {
+     const auto& r = tile->second;
+     DrawPictureInto(out, *picture, r[0], r[1], r[2], r[3], ppu);
+   }
+-  if (page == Page::kGpPics) {
++  if (grid) {
+     const float x0 = gp_cells_[0], y0 = gp_cells_[1], dx = gp_cells_[2],
+                 dy = gp_cells_[3];
+     const int cols = int(gp_cells_[4]), count = int(gp_cells_[5]);
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index a881d2add..80e5ed484 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -105,7 +105,8 @@ class GuideOverlay {
+     kGpCard,
+     kGpEdit,
+     kGpEditPic,
+-    kGpPics
++    kGpPics,
++    kGpPersonal  // ChangePersonalTile.xur
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+diff --git a/src/xenia/kernel/xam/xam_ui.h b/src/xenia/kernel/xam/xam_ui.h
+index 0e8b27035..34bd59bf9 100644
+--- a/src/xenia/kernel/xam/xam_ui.h
++++ b/src/xenia/kernel/xam/xam_ui.h
+@@ -34,6 +34,8 @@ extern std::function<bool(uint32_t user_index)> live_signup_ui_hook;
+ // e.g. FFFE07D1 / 0002000N / 0001000N) into the profile.
+ X_RESULT WriteGamerPicture(uint64_t xuid, uint32_t title_id, uint32_t big_id,
+                            uint32_t small_id);
++X_RESULT WritePersonalPicture(uint64_t xuid, uint32_t title_id,
++                              uint32_t big_id, uint32_t small_id);
+ 
+ // A message box (XamShowMessageBoxUI) for the host to show as the console
+ // does (the Blades Guide overlay's ErrorHUD). The hook returns false if it
+diff --git a/src/xenia/kernel/xam/xam_user.cc b/src/xenia/kernel/xam/xam_user.cc
+index 6d30f544b..8068843fa 100644
+--- a/src/xenia/kernel/xam/xam_user.cc
++++ b/src/xenia/kernel/xam/xam_user.cc
+@@ -940,6 +940,26 @@ X_RESULT WriteGamerPicture(uint64_t xuid, uint32_t title_id, uint32_t big_id,
+   return X_ERROR_SUCCESS;
+ }
+ 
++// The personal picture (XamWriteGamerTileEx type 2, gamerprofile 90105990):
++// its key, the gamercard's personal picture setting.
++X_RESULT WritePersonalPicture(uint64_t xuid, uint32_t title_id,
++                              uint32_t big_id, uint32_t small_id) {
++  if (!kernel_state()->xam_state()->GetUserProfile(xuid)) {
++    return X_ERROR_NO_SUCH_USER;
++  }
++  const UserSetting setting(
++      UserSettingId::XPROFILE_GAMERCARD_PERSONAL_PICTURE,
++      xe::string_util::read_u16string_and_swap(
++          xe::to_utf16(fmt::format("{:08X}{:08X}{:08X}", title_id, big_id,
++                                   small_id))
++              .c_str()));
++  kernel_state()->xam_state()->user_tracker()->UpsertSetting(
++      xuid, kDashboardID, &setting);
++  XELOGI("Personal picture {:08x}{:08x}{:08x} written for {:016X}", title_id,
++         big_id, small_id, xuid);
++  return X_ERROR_SUCCESS;
++}
++
+ // As createprofile calls it (90108970): (user index, title, big tile id,
+ // small tile id, 0, overlapped); xam stores the picture's two sizes in the
+ // profile and sets its gamercard picture key.
+-- 
+2.55.0.windows.3
+

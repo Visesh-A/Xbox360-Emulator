@@ -1,0 +1,567 @@
+From 463c165481ab56a29ad39f94c51e4431d1df2d3b Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 10:04:40 +0530
+Subject: [PATCH 13/51] Dashboard DVD tray: open/close the tray and pick a disc
+
+HalOpenCloseODDTray now opens and closes the emulated tray. Opening it
+shows a small Windows window (--disc_folder) listing the .iso files; the
+chosen disc is mounted at \Device\Cdrom0 when the dashboard closes the
+tray, and is remembered in dvd_drive.txt. The launch handoff carries the
+disc image path so the launcher can start the game the dashboard chose.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/disc_picker.cc              | 244 ++++++++++++++++++++++
+ src/xenia/app/disc_picker.h               |  45 ++++
+ src/xenia/app/emulator_window.cc          |   6 +
+ src/xenia/app/emulator_window.h           |   2 +
+ src/xenia/emulator.cc                     |  74 ++++++-
+ src/xenia/emulator.h                      |  17 ++
+ src/xenia/kernel/xam/xam_info.cc          |  12 +-
+ src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc |  10 +-
+ 8 files changed, 403 insertions(+), 7 deletions(-)
+ create mode 100644 src/xenia/app/disc_picker.cc
+ create mode 100644 src/xenia/app/disc_picker.h
+
+diff --git a/src/xenia/app/disc_picker.cc b/src/xenia/app/disc_picker.cc
+new file mode 100644
+index 000000000..c0368ca02
+--- /dev/null
++++ b/src/xenia/app/disc_picker.cc
+@@ -0,0 +1,244 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include "xenia/app/disc_picker.h"
++
++#include <algorithm>
++#include <chrono>
++#include <string>
++#include <vector>
++
++#include "xenia/base/cvar.h"
++#include "xenia/base/logging.h"
++#include "xenia/base/platform_win.h"
++#include "xenia/base/filesystem.h"
++#include "xenia/base/utf8.h"
++#include "xenia/emulator.h"
++#include "xenia/hid/input.h"
++#include "xenia/hid/input_system.h"
++#include "xenia/kernel/kernel_state.h"
++#include "xenia/kernel/xam/xam_state.h"
++
++DEFINE_path(disc_folder, "",
++            "Folder of disc images (.iso) offered when a dashboard opens the "
++            "DVD tray; the chosen one is read when the tray closes.",
++            "General");
++
++namespace xe {
++namespace app {
++
++namespace {
++constexpr int kIdList = 100, kIdInsert = 101, kIdCancel = 102;
++constexpr UINT kClose = WM_APP + 1;
++
++struct PickerState {
++  std::vector<std::filesystem::path> discs;  // [0] = no disc
++  int result = -1;                           // index, -1 = leave as is
++  HWND list = nullptr;
++  bool done = false;
++};
++
++LRESULT CALLBACK PickerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
++  auto* st = reinterpret_cast<PickerState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
++  switch (msg) {
++    case WM_COMMAND:
++      if (!st) break;
++      if (LOWORD(wp) == kIdInsert ||
++          (LOWORD(wp) == kIdList && HIWORD(wp) == LBN_DBLCLK)) {
++        st->result = int(SendMessageW(st->list, LB_GETCURSEL, 0, 0));
++        st->done = true;
++      } else if (LOWORD(wp) == kIdCancel) {
++        st->done = true;
++      }
++      return 0;
++    case WM_CLOSE:
++      if (st) st->done = true;
++      return 0;
++  }
++  return DefWindowProcW(hwnd, msg, wp, lp);
++}
++}  // namespace
++
++bool DiscPicker::IsEnabled() { return !cvars::disc_folder.empty(); }
++
++DiscPicker::DiscPicker(Emulator* emulator, void* owner_hwnd)
++    : emulator_(emulator), owner_hwnd_(owner_hwnd) {}
++
++DiscPicker::~DiscPicker() {
++  if (thread_.joinable()) {
++    thread_.join();
++  }
++}
++
++void DiscPicker::Show() {
++  if (open_.exchange(true)) {
++    return;
++  }
++  if (thread_.joinable()) {
++    thread_.join();
++  }
++  thread_ = std::thread([this]() {
++    Run();
++    open_ = false;
++  });
++}
++
++void DiscPicker::Run() {
++  PickerState st;
++  st.discs.push_back({});
++  std::error_code ec;
++  for (auto& entry : std::filesystem::directory_iterator(cvars::disc_folder, ec)) {
++    auto ext = xe::utf8::lower_ascii(xe::path_to_utf8(entry.path().extension()));
++    if (entry.is_regular_file() && ext == ".iso") {
++      st.discs.push_back(entry.path());
++    }
++  }
++  std::sort(st.discs.begin() + 1, st.discs.end());
++  auto in_tray = emulator_->tray_disc();
++  int selected = 0;
++  for (size_t i = 1; i < st.discs.size(); ++i) {
++    if (st.discs[i] == in_tray) selected = int(i);
++  }
++
++  HINSTANCE inst = GetModuleHandleW(nullptr);
++  WNDCLASSW wc = {};
++  wc.lpfnWndProc = PickerProc;
++  wc.hInstance = inst;
++  wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
++  wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
++  wc.lpszClassName = L"XeniaDiscPicker";
++  RegisterClassW(&wc);  // fails harmlessly when already registered
++
++  const int w = 560, h = 380;
++  RECT owner = {0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
++  if (owner_hwnd_) GetWindowRect(HWND(owner_hwnd_), &owner);
++  int x = owner.left + (owner.right - owner.left - w) / 2;
++  int y = owner.top + (owner.bottom - owner.top - h) / 2;
++  HWND hwnd = CreateWindowExW(
++      WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, wc.lpszClassName,
++      L"Xbox 360 DVD drive \x2014 insert a disc",
++      WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, w, h, HWND(owner_hwnd_),
++      nullptr, inst, nullptr);
++  if (!hwnd) {
++    XELOGE("Disc picker: CreateWindowEx failed");
++    return;
++  }
++  SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
++  HFONT font = CreateFontW(-18, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
++                           CLEARTYPE_QUALITY, 0, L"Segoe UI");
++  auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int cx,
++                   int cy, int cw, int ch, int id) {
++    HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, cx, cy,
++                             cw, ch, hwnd, HMENU(INT_PTR(id)), inst, nullptr);
++    SendMessageW(c, WM_SETFONT, WPARAM(font), TRUE);
++    return c;
++  };
++  child(L"STATIC",
++        L"Choose a disc, then select Close Tray on the dashboard.\nController: D-pad to choose, A insert, B leave as is.",
++        0, 16, 10, w - 48, 52, 0);
++  st.list = child(L"LISTBOX", L"",
++                  WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, 16,
++                  70, w - 48, h - 166, kIdList);
++  for (size_t i = 0; i < st.discs.size(); ++i) {
++    std::wstring name = i == 0 ? std::wstring(L"(No disc)")
++                               : st.discs[i].stem().wstring();
++    SendMessageW(st.list, LB_ADDSTRING, 0, LPARAM(name.c_str()));
++  }
++  SendMessageW(st.list, LB_SETCURSEL, selected, 0);
++  child(L"BUTTON", L"Insert disc", BS_DEFPUSHBUTTON | WS_TABSTOP, w - 272,
++        h - 86, 120, 34, kIdInsert);
++  child(L"BUTTON", L"Cancel", WS_TABSTOP, w - 144, h - 86, 112, 34, kIdCancel);
++  ShowWindow(hwnd, SW_SHOW);
++  SetForegroundWindow(hwnd);
++  SetFocus(st.list);
++
++  // While the picker is open the dashboard gets no controller input, like
++  // while the Guide is up.
++  auto* xam_state = emulator_->kernel_state()->xam_state();
++  xam_state->xam_dialogs_shown_++;
++  auto input = emulator_->input_system();
++  uint16_t prev = 0xFFFF;  // ignore buttons already held when it opened
++  auto next_repeat = std::chrono::steady_clock::now();
++  while (!st.done) {
++    MSG m;
++    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
++      if (m.message == WM_KEYDOWN && m.wParam == VK_RETURN) {
++        st.result = int(SendMessageW(st.list, LB_GETCURSEL, 0, 0));
++        st.done = true;
++      } else if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) {
++        st.done = true;
++      } else if (!IsDialogMessageW(hwnd, &m)) {
++        TranslateMessage(&m);
++        DispatchMessageW(&m);
++      }
++    }
++    uint16_t buttons = 0;
++    float ly = 0;
++    if (input) {
++      auto lock = input->lock();
++      for (uint32_t user = 0; user < 4; ++user) {
++        hid::X_INPUT_STATE state = {};
++        if (input->GetState(user, hid::X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD,
++                            &state) == X_ERROR_SUCCESS) {
++          buttons |= state.gamepad.buttons;
++          if (std::abs(int(state.gamepad.thumb_ly)) > std::abs(ly * 32767)) {
++            ly = state.gamepad.thumb_ly / 32767.0f;
++          }
++        }
++      }
++    }
++    if (prev == 0xFFFF) prev = buttons;
++    uint16_t pressed = buttons & ~prev;
++    prev = buttons;
++    int dir = (buttons & hid::X_INPUT_GAMEPAD_DPAD_UP) || ly > 0.5f     ? -1
++              : (buttons & hid::X_INPUT_GAMEPAD_DPAD_DOWN) || ly < -0.5f ? 1
++                                                                           : 0;
++    auto now = std::chrono::steady_clock::now();
++    bool fresh = pressed & (hid::X_INPUT_GAMEPAD_DPAD_UP | hid::X_INPUT_GAMEPAD_DPAD_DOWN);
++    if (dir && (fresh || now >= next_repeat)) {
++      int cur = int(SendMessageW(st.list, LB_GETCURSEL, 0, 0));
++      int count = int(SendMessageW(st.list, LB_GETCOUNT, 0, 0));
++      SendMessageW(st.list, LB_SETCURSEL, std::clamp(cur + dir, 0, count - 1), 0);
++      next_repeat = now + std::chrono::milliseconds(fresh ? 400 : 150);
++    }
++    if (pressed & hid::X_INPUT_GAMEPAD_A) {
++      st.result = int(SendMessageW(st.list, LB_GETCURSEL, 0, 0));
++      st.done = true;
++    } else if (pressed & hid::X_INPUT_GAMEPAD_B) {
++      st.done = true;
++    }
++    Sleep(16);
++  }
++  if (st.result >= 0 && st.result < int(st.discs.size())) {
++    emulator_->SetTrayDisc(st.discs[st.result]);
++  }
++  DestroyWindow(hwnd);
++  DeleteObject(font);
++  if (owner_hwnd_) SetForegroundWindow(HWND(owner_hwnd_));
++  // Let go of the buttons before the dashboard sees input again (A would
++  // otherwise also press the dashboard's selected item).
++  for (int i = 0; i < 60 && input; ++i) {
++    uint16_t held = 0;
++    {
++      auto lock = input->lock();
++      for (uint32_t user = 0; user < 4; ++user) {
++        hid::X_INPUT_STATE state = {};
++        if (input->GetState(user, hid::X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD,
++                            &state) == X_ERROR_SUCCESS) {
++          held |= state.gamepad.buttons;
++        }
++      }
++    }
++    if (!(held & (hid::X_INPUT_GAMEPAD_A | hid::X_INPUT_GAMEPAD_B))) break;
++    Sleep(16);
++  }
++  xam_state->xam_dialogs_shown_--;
++}
++
++}  // namespace app
++}  // namespace xe
+diff --git a/src/xenia/app/disc_picker.h b/src/xenia/app/disc_picker.h
+new file mode 100644
+index 000000000..4d0f4f5ae
+--- /dev/null
++++ b/src/xenia/app/disc_picker.h
+@@ -0,0 +1,45 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_APP_DISC_PICKER_H_
++#define XENIA_APP_DISC_PICKER_H_
++
++#include <atomic>
++#include <filesystem>
++#include <thread>
++
++namespace xe {
++class Emulator;
++namespace app {
++
++// Plays the part of the player's hand at the DVD drive: when a dashboard
++// opens the tray, a small Windows window (not part of the console's UI) lists
++// the disc images in --disc_folder. The chosen one goes in the tray and is
++// read when the dashboard closes it. Works with the controller (D-pad/stick to
++// choose, A insert, B leave as is), the keyboard or the mouse.
++class DiscPicker {
++ public:
++  DiscPicker(Emulator* emulator, void* owner_hwnd);
++  ~DiscPicker();
++
++  static bool IsEnabled();
++  void Show();  // any thread; ignored while already open
++
++ private:
++  void Run();
++
++  Emulator* emulator_;
++  void* owner_hwnd_;
++  std::atomic<bool> open_{false};
++  std::thread thread_;
++};
++
++}  // namespace app
++}  // namespace xe
++
++#endif  // XENIA_APP_DISC_PICKER_H_
+diff --git a/src/xenia/app/emulator_window.cc b/src/xenia/app/emulator_window.cc
+index ad0a0f50b..2060ff8f0 100644
+--- a/src/xenia/app/emulator_window.cc
++++ b/src/xenia/app/emulator_window.cc
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include "xenia/app/emulator_window.h"
++#include "xenia/ui/window_win.h"
+ 
+ #include "third_party/imgui/imgui.h"
+ #include "third_party/stb/stb_image_write.h"
+@@ -279,6 +280,11 @@ void EmulatorWindow::OnEmulatorInitialized() {
+     guide_overlay_ = std::make_unique<GuideOverlay>(
+         emulator_, imgui_drawer_.get(), app_context_);
+   }
++  if (DiscPicker::IsEnabled() && !disc_picker_) {
++    disc_picker_ = std::make_unique<DiscPicker>(
++        emulator_, static_cast<ui::Win32Window*>(window_.get())->hwnd());
++    emulator_->on_tray_opened = [this]() { disc_picker_->Show(); };
++  }
+ 
+   // Create a thread to listen for controller hotkeys.
+   if (cvars::controller_hotkeys) {
+diff --git a/src/xenia/app/emulator_window.h b/src/xenia/app/emulator_window.h
+index 632a43d02..d33563930 100644
+--- a/src/xenia/app/emulator_window.h
++++ b/src/xenia/app/emulator_window.h
+@@ -13,6 +13,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include "xenia/app/disc_picker.h"
+ #include "xenia/app/guide_overlay.h"
+ #include "xenia/app/profile_dialogs.h"
+ #include "xenia/emulator.h"
+@@ -304,6 +305,7 @@ class EmulatorWindow {
+   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
+   // After imgui_drawer_ so it is destroyed first.
+   std::unique_ptr<GuideOverlay> guide_overlay_;
++  std::unique_ptr<DiscPicker> disc_picker_;
+   std::unique_ptr<DisplayConfigGameConfigLoadCallback>
+       display_config_game_config_load_callback_;
+   // Creation may fail, in this case immediate drawer UI must not be drawn.
+diff --git a/src/xenia/emulator.cc b/src/xenia/emulator.cc
+index 8abd04ed5..149b3c097 100644
+--- a/src/xenia/emulator.cc
++++ b/src/xenia/emulator.cc
+@@ -388,6 +388,71 @@ X_STATUS Emulator::TerminateTitle() {
+   return X_STATUS_SUCCESS;
+ }
+ 
++bool Emulator::InsertDisc(const std::filesystem::path& path) {
++  if (file_system_->HasDevice("\\Device\\Cdrom0")) {
++    file_system_->UnregisterDevice("\\Device\\Cdrom0");
++  }
++  disc_path_.clear();
++  if (path.empty()) {
++    return true;
++  }
++  auto disc = CreateVfsDevice(path, "\\Device\\Cdrom0");
++  if (!disc || !disc->Initialize() ||
++      !file_system_->RegisterDevice(std::move(disc))) {
++    return false;
++  }
++  disc_path_ = path;
++  return true;
++}
++
++void Emulator::OpenTray() {
++  {
++    std::lock_guard<std::mutex> lock(disc_mutex_);
++    tray_disc_ = disc_path_;  // the disc stays in the tray until swapped
++  }
++  kernel_state_->smc()->SetTrayState(X_DVD_TRAY_STATE::OPEN);
++  XELOGI("DVD tray opened");
++  if (on_tray_opened) {
++    on_tray_opened();
++  }
++}
++
++void Emulator::CloseTray() {
++  {
++    std::lock_guard<std::mutex> lock(disc_mutex_);
++    if (tray_disc_ != disc_path_ && !InsertDisc(tray_disc_)) {
++      XELOGE("Unable to load disc: {}", xe::path_to_utf8(tray_disc_));
++    }
++    XELOGI("DVD tray closed with {}",
++           disc_path_.empty() ? std::string("no disc")
++                              : xe::path_to_utf8(disc_path_));
++    // Remembered like a disc left in a switched-off console.
++    if (FILE* file = xe::filesystem::OpenFile("dvd_drive.txt", "wb")) {
++      std::string p = xe::path_to_utf8(disc_path_);
++      fwrite(p.data(), 1, p.size(), file);
++      fclose(file);
++    }
++  }
++  kernel_state_->smc()->SetTrayState(X_DVD_TRAY_STATE::CLOSED);
++}
++
++void Emulator::SetTrayDisc(const std::filesystem::path& path) {
++  std::lock_guard<std::mutex> lock(disc_mutex_);
++  tray_disc_ = path;
++  XELOGI("Disc put in the tray: {}",
++         path.empty() ? std::string("none") : xe::path_to_utf8(path));
++}
++
++std::filesystem::path Emulator::disc_path() {
++  std::lock_guard<std::mutex> lock(disc_mutex_);
++  return disc_path_;
++}
++
++std::filesystem::path Emulator::tray_disc() {
++  std::lock_guard<std::mutex> lock(disc_mutex_);
++  return tray_disc_;
++}
++
+ const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
+     const std::filesystem::path& path, const std::string_view mount_path) {
+   // Must check if the type has changed e.g. XamSwapDisc
+@@ -605,9 +670,12 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
+   // Put a disc in the drive for dashboards. Registered directly instead of
+   // through MountPath, which would repoint game: away from the .xex folder.
+   if (!cvars::dashboard_disc.empty()) {
+-    auto disc = CreateVfsDevice(cvars::dashboard_disc, "\\Device\\Cdrom0");
+-    if (disc && disc->Initialize() &&
+-        file_system_->RegisterDevice(std::move(disc))) {
++    bool inserted;
++    {
++      std::lock_guard<std::mutex> lock(disc_mutex_);
++      inserted = InsertDisc(cvars::dashboard_disc);
++    }
++    if (inserted) {
+       kernel_state_->smc()->SetTrayState(X_DVD_TRAY_STATE::CLOSED);
+       XELOGI("Dashboard disc in drive: {}",
+              xe::path_to_utf8(cvars::dashboard_disc));
+diff --git a/src/xenia/emulator.h b/src/xenia/emulator.h
+index 4d88f84af..b3f15cd86 100644
+--- a/src/xenia/emulator.h
++++ b/src/xenia/emulator.h
+@@ -13,6 +13,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
++#include <mutex>
+ #include <optional>
+ #include <string>
+ #include <vector>
+@@ -200,6 +201,17 @@ class Emulator {
+   X_STATUS MountPath(const std::filesystem::path& path,
+                      const std::string_view mount_path);
+ 
++  // The DVD drive (dashboards' Open Tray / Close Tray, HalOpenCloseODDTray).
++  // While the tray is open, SetTrayDisc says which disc image the player puts
++  // in (empty = none); closing the tray loads it at \Device\Cdrom0.
++  void OpenTray();
++  void CloseTray();
++  void SetTrayDisc(const std::filesystem::path& path);
++  std::filesystem::path disc_path();
++  std::filesystem::path tray_disc();
++  // Called (on the guest thread) when the tray opens, e.g. to show a picker.
++  std::function<void()> on_tray_opened;
++
+   enum class FileSignatureType {
+     XEX1,
+     XEX2,
+@@ -328,6 +340,11 @@ class Emulator {
+ 
+   std::filesystem::path command_line_;
+   std::filesystem::path storage_root_;
++
++  std::mutex disc_mutex_;
++  std::filesystem::path disc_path_;   // image in the drive
++  std::filesystem::path tray_disc_;   // what the open tray holds
++  bool InsertDisc(const std::filesystem::path& path);  // disc_mutex_ held
+   std::filesystem::path content_root_;
+   std::filesystem::path cache_root_;
+ 
+diff --git a/src/xenia/kernel/xam/xam_info.cc b/src/xenia/kernel/xam/xam_info.cc
+index 42c22a502..00b93ecef 100644
+--- a/src/xenia/kernel/xam/xam_info.cc
++++ b/src/xenia/kernel/xam/xam_info.cc
+@@ -13,6 +13,7 @@
+ #include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/string_util.h"
++#include "xenia/emulator.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/title_id_utils.h"
+ #include "xenia/kernel/user_module.h"
+@@ -441,8 +442,15 @@ void XamLoaderLaunchTitleEx_entry(lpstring_t launch_path, lpstring_t mount_path,
+          static_cast<uint32_t>(flags));
+ 
+   if (cvars::dashboard_handoff) {
+-    // The dashboard's disc tile passes no path: boot whatever is in the drive.
+-    HandOffLaunch(path.empty() ? "\\Device\\Cdrom0\\default.xex" : path);
++    // The dashboard's disc tile passes no path: boot whatever is in the drive,
++    // telling the launcher which disc image that is ("<path>|<image>").
++    std::string request =
++        path.empty() ? std::string("\\Device\\Cdrom0\\default.xex") : path;
++    auto disc = kernel_state()->emulator()->disc_path();
++    if (!disc.empty() && request.find("Cdrom0") != std::string::npos) {
++      request += "|" + xe::path_to_utf8(disc);
++    }
++    HandOffLaunch(request);
+   }
+   XamLoaderLaunchTitle_entry(launch_path, flags);
+ }
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc
+index 40a46048e..a8fc50243 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc
+@@ -7,6 +7,7 @@
+  ******************************************************************************
+  */
+ 
++#include "xenia/emulator.h"
+ #include "xenia/kernel/smc.h"
+ #include "xenia/kernel/util/shim_utils.h"
+ #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+@@ -59,9 +60,14 @@ DECLARE_XBOXKRNL_EXPORT3(HalSendSMCMessage, kNone, kStub, kImportant,
+ // 1 opens the tray, 0 closes it: the blades dashboard's disc tile calls it
+ // with 1 when XamLoaderGetDvdTrayState says closed (0), labelled "Open Tray",
+ // and with 0 when it says open (2), labelled "Close Tray".
++// The emulator swaps the disc image while the tray is open (a picker plays the
++// part of the player's hand).
+ void HalOpenCloseODDTray_entry(dword_t open_close) {
+-  kernel_state()->smc()->SetTrayState(open_close ? X_DVD_TRAY_STATE::OPEN
+-                                                 : X_DVD_TRAY_STATE::CLOSED);
++  if (open_close) {
++    kernel_state()->emulator()->OpenTray();
++  } else {
++    kernel_state()->emulator()->CloseTray();
++  }
+ }
+ DECLARE_XBOXKRNL_EXPORT1(HalOpenCloseODDTray, kNone, kStub);
+ 
+-- 
+2.55.0.windows.3
+

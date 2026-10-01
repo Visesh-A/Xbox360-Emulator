@@ -1,0 +1,41 @@
+From 374b53ae38f4d101419942cfdb078721539c368d Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 17:04:57 +0530
+Subject: [PATCH 12/51] Guide overlay: the clock sits at the top of its box
+
+DateTimeTextId's TextStyle 0x210 does not center vertically: on a 720p
+and a 480-line real frame the clock, like the legends, is 5.5 units above
+a centered line (only TextStyle 0x1000 centers).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 91675e2d3..fadf07787 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -1003,7 +1003,8 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   layer(full ? "legends_upsell" : "legends_menu", legend_x, legend_alpha);
+ 
+   // Clock (hudbkgnd DateTimeTextId): glyphs rendered with the same font and
+-  // metrics as the Guide images, right aligned and vertically centered.
++  // metrics as the Guide images, right aligned at the top of its box
++  // (TextStyle 0x210; real footage has it 5.5 units above a centered line).
+   const Image* clock_atlas =
+       clock_alpha > 0.0f ? Texture("clock_atlas", k) : nullptr;
+   if (clock_atlas) {
+@@ -1027,7 +1028,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       width += l.clock_advance.count(*c) ? l.clock_advance.at(*c) : 0.0f;
+     }
+     float pen = clock_x + l.clock_w - width + clock_dx;
+-    float baseline = l.clock_y + (l.clock_h - l.clock_line_h) / 2 + l.clock_ascent;
++    float baseline = l.clock_y + l.clock_ascent;
+     float cell_h = l.clock_line_h + 2 * l.clock_pad;
+     ImU32 tint = IM_COL32(255, 255, 255, int(clock_alpha * 255.0f + 0.5f));
+     for (const char* c = text; *c; ++c) {
+-- 
+2.55.0.windows.3
+

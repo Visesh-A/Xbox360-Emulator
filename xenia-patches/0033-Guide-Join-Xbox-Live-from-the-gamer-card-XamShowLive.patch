@@ -1,0 +1,297 @@
+From c72a93118f8d216a47c0a98fe879d3a4656ae41c Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 18:53:23 +0530
+Subject: [PATCH 33/51] Guide: Join Xbox Live from the gamer card
+ (XamShowLiveSignupUI)
+
+The gamer card's Join Xbox Live (9010CB28) closes gamerprofile and calls
+XamShowLiveSignupUI (9010C898). xam 818EDD78 sends message 0x2100E:
+createprofile.xex in mode 1, whose first scene is AddXboxLive.xur
+(90105388). It goes straight to the Xbox Live steps (90103880 -> 90103278)
+for the signed-in profile. Cancel, No or B there end createprofile, since
+it is the first scene. Titles calling XamShowLiveSignupUI get the same.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 125 ++++++++++++++++++++++++++++-----
+ src/xenia/app/guide_overlay.h  |   6 +-
+ src/xenia/kernel/xam/xam_ui.cc |  11 ++-
+ src/xenia/kernel/xam/xam_ui.h  |   2 +
+ 4 files changed, 124 insertions(+), 20 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 58562fa3d..9ba992d9b 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -75,6 +75,15 @@ constexpr uint32_t kDashboardTitleId = 0xFFFE07D1;
+ constexpr auto kHoldToTurnOff = std::chrono::milliseconds(1500);
+ constexpr auto kRepeatDelay = std::chrono::milliseconds(400);
+ constexpr auto kRepeatRate = std::chrono::milliseconds(150);
++// How long a step's status shows. On the console it is as long as the work
++// takes on its hard drive or network, which the files can't say; here one
++// loop of the wait cursor (Loading_Large, 86 frames).
++constexpr auto kStepTime = std::chrono::milliseconds(1433);
++// FullToHalf until the page is fully shown (hudbkgnd 120-163); ClosedToHalf
++// (1-44) takes as long.
++constexpr auto kToHalfTime = std::chrono::milliseconds(717);
++// ErrorToHalf: the ErrorHUD out, then the half Guide back (2 x 29 frames).
++constexpr auto kFromErrorTime = std::chrono::milliseconds(967);
+ // Legends and the clock start this far left of the chrome in hudbkgnd.xur
+ // (Legend_Y 180 -> -550 while the blade moves 583 -> -88).
+ constexpr float kLegendSlide = 730.0f;
+@@ -157,6 +166,9 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   kernel::xam::gamer_card_ui_hook = [this](uint32_t user_index) {
+     return ShowGamerCard(user_index);
+   };
++  kernel::xam::live_signup_ui_hook = [this](uint32_t user_index) {
++    return ShowLiveSignup(user_index);
++  };
+   kernel::xam::title_message_box_hook =
+       [this](const kernel::xam::TitleMessageBox& box,
+              std::function<void(int)> done) {
+@@ -176,6 +188,7 @@ GuideOverlay::~GuideOverlay() {
+   kernel::xam::title_message_box_hook = nullptr;
+   kernel::xam::create_profile_ui_hook = nullptr;
+   kernel::xam::gamer_card_ui_hook = nullptr;
++  kernel::xam::live_signup_ui_hook = nullptr;
+   running_ = false;
+   {
+     std::lock_guard<std::mutex> lock(schedule_mutex_);
+@@ -2209,6 +2222,7 @@ bool GuideOverlay::ShowCreateProfile(uint32_t user_index) {
+       return false;
+     }
+     create_profile_active_ = true;
++    live_signup_ = false;
+     create_user_index_ = user_index;
+     hud_user_ = user_index;
+     created_xuid_ = 0;
+@@ -2241,6 +2255,60 @@ bool GuideOverlay::ShowCreateProfile(uint32_t user_index) {
+   return true;
+ }
+ 
++bool GuideOverlay::ShowLiveSignup(uint32_t user_index) {
++  if (!create_profile_ready_) {
++    return false;
++  }
++  auto* user =
++      emulator_->kernel_state()->xam_state()->GetUserProfile(user_index);
++  if (!user) {
++    return false;
++  }
++  uint64_t run;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (mode_ != Mode::kClosed || create_profile_active_ || gp_active_) {
++      return false;
++    }
++    // xam 818EDD78: system UI message 0x2100E (createprofile.xex) with mode 1
++    // (flags 0); createprofile's first scene for modes 1 and 2 is
++    // AddXboxLive.xur (90105388), which goes straight to its Xbox Live steps
++    // (90103880 -> 90103278) for the signed-in profile.
++    create_profile_active_ = true;
++    live_signup_ = true;
++    create_user_index_ = user_index;
++    hud_user_ = user_index;
++    created_xuid_ = user->xuid();
++    axl_signed_in_ = true;
++    axl_status_key_.clear();
++    axl_status_.clear();
++    axl_button_ = "getLiveButton";
++    profile_box_done_ = nullptr;
++    profile_box_next_.reset();
++    run = ++axl_run_;
++    axl_start_ = Clock::now();
++    ++page_version_;
++  }
++  if (display_h_ > 0) {
++    float ppu = display_h_ / layout_.canvas_h;
++    if (scaling_for_ != ppu) {
++      scaling_for_ = ppu;
++      scaled_ready_ = false;
++      if (scale_thread_.joinable()) scale_thread_.join();
++      scale_thread_ =
++          std::thread([this, ppu]() { PrepareCreateProfileImages(ppu); });
++    }
++  }
++  emulator_->kernel_state()->BroadcastNotification(
++      xe::kXNotificationSystemUI, true);
++  XELOGI("Guide: Xbox Live sign-up (createprofile.xex, mode 1)");
++  Open(Page::kAddXboxLive);  // a half-width scene: ClosedToHalf
++  Schedule(Clock::now() + kToHalfTime, [this, run]() {
++    if (AddXboxLiveRunning(run)) JoinXboxLive(run);
++  });
++  return true;
++}
++
+ void GuideOverlay::EndCreateProfile() {
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+@@ -2483,17 +2551,6 @@ void GuideOverlay::SaveProfilePress() {
+   StartAddXboxLive(focus);
+ }
+ 
+-namespace {
+-// How long a step's status shows. On the console it is as long as the work
+-// takes on its hard drive or network, which the files can't say; here one
+-// loop of the wait cursor (Loading_Large, 86 frames).
+-constexpr auto kStepTime = std::chrono::milliseconds(1433);
+-// FullToHalf until the page is fully shown (hudbkgnd 120-163).
+-constexpr auto kToHalfTime = std::chrono::milliseconds(717);
+-// ErrorToHalf: the ErrorHUD out, then the half Guide back (2 x 29 frames).
+-constexpr auto kFromErrorTime = std::chrono::milliseconds(967);
+-}  // namespace
+-
+ void GuideOverlay::SetAddXboxLiveStatus(const char* key) {
+   axl_status_ = profile_strings_[key];
+   axl_status_key_ = key;
+@@ -2618,18 +2675,28 @@ void GuideOverlay::AddXboxLiveBack() {
+   // 90103980 -> 90102CE8: nothing while the profile is being created; after
+   // that the pending request is cancelled and the scene goes back to Save
+   // Gamer Profile (hudbkgnd HalfToFull).
++  bool first_scene;
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+     if (axl_status_key_ == "st_creating") {
+       return;
+     }
+     ++axl_run_;
+-    page_ = Page::kSaveProfile;
+-    ++page_version_;
+-    transition_ = Transition::kHalfToFull;
+-    transition_start_ = Clock::now();
++    // Xbox Live sign-up (mode 1): AddXboxLive is the first scene, so
++    // XuiSceneNavigateBack ends createprofile.
++    first_scene = live_signup_;
++    if (!first_scene) {
++      page_ = Page::kSaveProfile;
++      ++page_version_;
++      transition_ = Transition::kHalfToFull;
++      transition_start_ = Clock::now();
++    }
+   }
+   PlaySfx("btn_Back");
++  if (first_scene) {
++    EndCreateProfile();
++    return;
++  }
+   PlaySfx("HUD_open");  // hudbkgnd HalfToFull, frame 75
+ }
+ 
+@@ -2682,13 +2749,23 @@ void GuideOverlay::SignInStep() {
+ 
+ void GuideOverlay::JoinXboxLive(uint64_t run) {
+   using kernel::xam::TitleMessageBox;
+-  // Cancel / No / B: 90102CE8, XuiSceneNavigateBack to Save Gamer Profile.
++  // Cancel / No / B: 90102CE8, XuiSceneNavigateBack to Save Gamer Profile,
++  // or in the Xbox Live sign-up (mode 1, AddXboxLive the first scene) the
++  // end of createprofile.
+   auto back = [this](int) {
++    bool first_scene;
+     {
+       std::lock_guard<std::mutex> lock(mutex_);
+-      profile_box_return_ = Page::kSaveProfile;
++      first_scene = live_signup_;
++      if (!first_scene) {
++        profile_box_return_ = Page::kSaveProfile;
++      }
+       ++axl_run_;
+     }
++    if (first_scene) {
++      EndCreateProfile();
++      return;
++    }
+     DismissMessageBox();
+   };
+   // 901028F8: "Checking network status"; offline, 901030D8 "Can't Connect".
+@@ -3172,6 +3249,20 @@ void GuideOverlay::GpActivate() {
+       kernel::xboxkrnl::SetDefaultProfile(xuid);
+       XELOGI("Guide: auto sign-in {:016X}", xuid);
+       ++page_version_;
++    } else if (focus == "addLiveButton") {
++      // 9010CB28: +0x444 = 1 and the scene closes; then (9010C898)
++      // XamShowLiveSignupUI(the user, 0): createprofile's Xbox Live steps.
++      const uint32_t user_index = hud_user_;
++      lock.unlock();
++      EndGamerProfile();
++      std::thread([this, user_index]() {
++        for (int i = 0; i < 100; ++i) {
++          std::this_thread::sleep_for(std::chrono::milliseconds(50));
++          std::lock_guard<std::mutex> lock(mutex_);
++          if (mode_ == Mode::kClosed) break;
++        }
++        ShowLiveSignup(user_index);
++      }).detach();
+     } else {
+       XELOGW("Guide: gamer card {} is not built yet", focus);
+     }
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index a89627cda..092a5e1c5 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -65,6 +65,9 @@ class GuideOverlay {
+   // keyboard for the name, then "Save Gamer Profile") for the controller
+   // `user_index`. False if the Guide is busy or the assets are missing.
+   bool ShowCreateProfile(uint32_t user_index);
++  // XamShowLiveSignupUI: createprofile.xex in mode 1, AddXboxLive's Xbox Live
++  // steps for the profile signed in on that controller.
++  bool ShowLiveSignup(uint32_t user_index);
+   // XamShowGamerCardUI: gamerprofile.xex's screens for your own gamer card.
+   bool ShowGamerCard(uint32_t user_index);
+ 
+@@ -344,7 +347,8 @@ class GuideOverlay {
+   uint64_t axl_run_ = 0;       // bumped per AddXboxLive (a stale step stops)
+   std::u16string axl_status_;  // under mutex_
+   std::string axl_status_key_;  // which status (st_creating: B does nothing)
+-  bool axl_signed_in_ = false;  // the new profile's sign-in went through
++  bool axl_signed_in_ = false;
++  bool live_signup_ = false;  // mode 1: AddXboxLive is the first scene  // the new profile's sign-in went through
+   // The gamer picture Save Gamer Profile picked (1-12 of title FFFE07D1:
+   // big tile 0x0002000N, small 0x0001000N), 0 = none yet; under mutex_.
+   int save_picture_ = 0;
+diff --git a/src/xenia/kernel/xam/xam_ui.cc b/src/xenia/kernel/xam/xam_ui.cc
+index 6048d5ac9..1a90b0e57 100644
+--- a/src/xenia/kernel/xam/xam_ui.cc
++++ b/src/xenia/kernel/xam/xam_ui.cc
+@@ -447,6 +447,7 @@ DECLARE_XAM_EXPORT2(XamIsUIActive, kUI, kImplemented, kHighFrequency);
+ std::function<bool()> live_upsell_ui_hook;
+ std::function<bool(uint32_t user_index)> create_profile_ui_hook;
+ std::function<bool(uint32_t user_index)> gamer_card_ui_hook;
++std::function<bool(uint32_t user_index)> live_signup_ui_hook;
+ std::function<bool(const TitleMessageBox&, std::function<void(int)>)>
+     title_message_box_hook;
+ 
+@@ -464,9 +465,15 @@ DECLARE_XAM_EXPORT1(XamShowLiveUpsellUI, kUI, kSketchy);
+ // Xbox Live account sign-up / gamertag recovery: needs the Xbox Live service,
+ // which is not emulated. (Defined so callers get a failure rather than an
+ // undefined import; the dashboard's Recover Gamertag ignores the result.)
++// xam 818EDD78: system UI message 0x2100E, createprofile.xex with mode 1
++// (flags 0) or 2, whose first scene is then AddXboxLive.xur: its Xbox Live
++// steps for the profile signed in on `user_index`.
+ dword_result_t XamShowLiveSignupUI_entry(dword_t user_index, dword_t flags) {
+-  XELOGI("XamShowLiveSignupUI({}, {:X}): Xbox Live is not available",
+-         uint32_t(user_index), uint32_t(flags));
++  XELOGI("XamShowLiveSignupUI({}, {:X})", uint32_t(user_index),
++         uint32_t(flags));
++  if (live_signup_ui_hook && live_signup_ui_hook(user_index)) {
++    return X_ERROR_SUCCESS;
++  }
+   return X_ERROR_FUNCTION_FAILED;
+ }
+ DECLARE_XAM_EXPORT1(XamShowLiveSignupUI, kUI, kStub);
+diff --git a/src/xenia/kernel/xam/xam_ui.h b/src/xenia/kernel/xam/xam_ui.h
+index c319697bd..0e8b27035 100644
+--- a/src/xenia/kernel/xam/xam_ui.h
++++ b/src/xenia/kernel/xam/xam_ui.h
+@@ -28,6 +28,8 @@ extern std::function<bool()> live_upsell_ui_hook;
+ extern std::function<bool(uint32_t user_index)> create_profile_ui_hook;
+ // XamShowGamerCardUI: gamerprofile.xex's own gamer card and its screens
+ extern std::function<bool(uint32_t user_index)> gamer_card_ui_hook;
++// XamShowLiveSignupUI: createprofile.xex in mode 1 (AddXboxLive).
++extern std::function<bool(uint32_t user_index)> live_signup_ui_hook;
+ // XamWriteGamerTile's work: a gamer picture (title, big and small tile id,
+ // e.g. FFFE07D1 / 0002000N / 0001000N) into the profile.
+ X_RESULT WriteGamerPicture(uint64_t xuid, uint32_t title_id, uint32_t big_id,
+-- 
+2.55.0.windows.3
+

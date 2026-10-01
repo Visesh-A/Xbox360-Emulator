@@ -1,0 +1,54 @@
+From e4db880e47bbae9f4321802555a77a99fd3dd824 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 18:47:09 +0530
+Subject: [PATCH 32/51] Guide: Customize Profile opens Edit Gamer Profile
+
+createprofile's Customize (90104AA8) loads gamerprofile.xex with mode 3
+and ends. gamerprofile's start scene for mode 3 (0x9011B360[6]) is
+808_EditProfile, on its own: the Guide goes HalfToFull into it, and B
+there ends it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index c1c661762..58562fa3d 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -2585,8 +2585,28 @@ void GuideOverlay::AddXboxLiveStep(uint64_t run, int step) {
+         return;
+       }
+       if (button == "editProfileButton") {
+-        // 90104AA8: XamAppLoad("gamerprofile.xex", mode 3), Edit Gamer Profile.
+-        XELOGW("Guide: Edit Gamer Profile (gamerprofile.xex) is not built yet");
++        // Customize Profile, 90104AA8: XamAppLoad("gamerprofile.xex", the
++        // user, {mode 3}) and createprofile ends. gamerprofile's start scene
++        // for mode 3 without a XUID (0x9011B360[6]) is 808_EditProfile, on
++        // its own (no scene stack: +0x258 is 0), full width: HalfToFull.
++        {
++          std::lock_guard<std::mutex> lock(mutex_);
++          create_profile_active_ = false;
++          ++axl_run_;
++          gp_active_ = true;
++          gp_xuid_ = xuid;
++          gp_back_.clear();
++          gp_cell_ = 0;
++          hud_user_ = create_user_index_;
++          page_ = Page::kGpEdit;
++          gp_focus_ = gp_pages_["gpedit"].default_focus;
++          ++page_version_;
++          transition_ = Transition::kHalfToFull;
++          transition_start_ = Clock::now();
++        }
++        XELOGI("Guide: Edit Gamer Profile (gamerprofile.xex, mode 3)");
++        PlaySfx("HUD_open");  // hudbkgnd HalfToFull, frame 75
++        return;
+       }
+       EndCreateProfile();
+       break;
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,377 @@
+From 1a59ad1db2f3af32143766f99160b156e46f5b15 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 14:00:23 +0530
+Subject: [PATCH 46/51] Guide: Select Music (minimediaplayer.xex) for a hard
+ drive without music
+
+hud action 5 (91447EA8) loads minimediaplayer.xex; its full-width scenes are pages of the Personal Settings framework (make_music_assets.py, music.txt), entered HalfToFull with trans_FadeOut / trans_FadeIn between them. Music Sources: XMPGetMediaSources (0x7002B, xam 81A410F8) lists sources in state 4, and the hard drive's slot (81A47198) is in state 4 whenever XboxHardwareInfo reports a hard disk, so one row, Hard Drive; LegendY Play All Music on a source row, LegendX Return Control to Game. Music Library: Play All and the five categories (two columns, NavLeft / NavRight). The categories with nothing found (901051F8): list hidden, Play All disabled, No ... found., LegendY cleared. Play All / Y: BeginPlayback finds no songs and the app unloads at its first 50 ms timer (90108A60), back to hud's menu on Select Music (FullToHalf). X (Return Control to Game / Xbox Guide) and B on the first scene unload the app too.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/app/guide_options.cc | 140 ++++++++++++++++++++++++++++++++-
+ src/xenia/app/guide_overlay.cc |  38 ++++++++-
+ src/xenia/app/guide_overlay.h  |  22 +++++-
+ 3 files changed, 192 insertions(+), 8 deletions(-)
+
+diff --git a/src/xenia/app/guide_options.cc b/src/xenia/app/guide_options.cc
+index ec581ebf5..5c5636e8c 100644
+--- a/src/xenia/app/guide_options.cc
++++ b/src/xenia/app/guide_options.cc
+@@ -36,6 +36,8 @@ DECLARE_uint32(retail_flags);
+ namespace xe {
+ namespace app {
+ 
++using Clock = std::chrono::steady_clock;
++
+ namespace {
+ // hud's profile settings (XamUserRead/WriteProfileSettings, title FFFE07D1)
+ constexpr uint32_t kVibration = 0x10040003;  // 9144B828 / 9144B6C0
+@@ -77,13 +79,34 @@ const char* GuideOverlay::OptKey(Page page) {
+       return "optvoice";
+     case Page::kOptDl:
+       return "optdl";
++    case Page::kMus579:
++      return "mus579";
++    case Page::kMus570:
++      return "mus570";
++    case Page::kMus572Al:
++      return "mus572al";
++    case Page::kMus572Ar:
++      return "mus572ar";
++    case Page::kMus572Pl:
++      return "mus572pl";
++    case Page::kMus572Ge:
++      return "mus572ge";
++    case Page::kMus576:
++      return "mus576";
++    case Page::kMusPlay:
++      return "musplay";
+     default:
+       return nullptr;
+   }
+ }
+ 
+-void GuideOverlay::LoadOptionsLayout() {
+-  std::ifstream in(asset_dir_ / "options.txt");
++bool GuideOverlay::IsMusicPage(Page page) {
++  const char* key = OptKey(page);
++  return key && key[0] == 'm';
++}
++
++void GuideOverlay::LoadOptionsLayout(const char* file) {
++  std::ifstream in(asset_dir_ / file);
+   std::string line;
+   while (std::getline(in, line)) {
+     if (!line.empty() && line.back() == '\r') line.pop_back();
+@@ -100,6 +123,7 @@ void GuideOverlay::LoadOptionsLayout() {
+     } else if (kind == "ctrl") {
+       OptCtrl c;
+       ls >> c.id >> c.kind >> c.up >> c.down;
++      if (!(ls >> c.left >> c.right)) c.left = c.right = "-";
+       p.ctrls.push_back(c);
+     } else if (kind == "layer") {
+       std::string id, state;
+@@ -108,7 +132,8 @@ void GuideOverlay::LoadOptionsLayout() {
+       p.layers[id + "_" + state] = {x, y};
+     }
+   }
+-  opt_ready_ = opt_pages_.size() == 5;
++  if (std::string(file) != "options.txt") return;
++  opt_ready_ = true;
+   for (const char* key : {"opt", "optvib", "optnot", "optonl", "optvoice"}) {
+     if (!opt_pages_.count(key) || opt_pages_[key].ctrls.empty()) {
+       opt_ready_ = false;
+@@ -207,6 +232,8 @@ bool GuideOverlay::OptEnabled(const std::string& id) const {
+ // focus its first enabled child in the scene's order.
+ std::string GuideOverlay::OptFirstFocus(Page page) const {
+   if (page == Page::kOptDl) return "";  // lstDownloads, empty
++  auto it = opt_pages_.find(OptKey(page));
++  if (it == opt_pages_.end() || it->second.default_focus == "-") return "";
+   const OptPage& p = opt_pages_.at(OptKey(page));
+   if (page != Page::kOpt || OptEnabled(p.default_focus)) return p.default_focus;
+   for (const auto& id : p.order) {
+@@ -318,6 +345,10 @@ void GuideOverlay::OptGoTo(Page page) {
+ }
+ 
+ void GuideOverlay::OptNavigateBack() {
++  if (IsMusicPage(page_) && opt_back_.empty()) {
++    MusicClose();  // navBack from the first scene: the app unloads
++    return;
++  }
+   opt_fade_from_ = "opt_prev";
+   opt_fade_capture_ = true;
+   opt_fading_ = true;
+@@ -349,8 +380,15 @@ void GuideOverlay::OptMove(Direction direction) {
+   };
+   const OptCtrl* cur = find(opt_focus_);
+   if (!cur) return;
++  if ((direction == kLeft || direction == kRight) && cur->kind != "slider") {
++    std::string target = direction == kLeft ? cur->left : cur->right;
++    if (target == "-" || target.empty() || !find(target)) return;
++    opt_focus_ = target;
++    ++page_version_;
++    PlaySfx("btn_Focus");
++    return;
++  }
+   if (direction == kLeft || direction == kRight) {
+-    if (cur->kind != "slider") return;
+     // XuiSlider (8192DC08): a step (1) toward the end, within 0-10
+     const int next =
+         std::clamp(opt_volume_ + (direction == kRight ? 1 : -1), 0, 10);
+@@ -421,6 +459,36 @@ void GuideOverlay::OptActivate() {
+     XELOGW("Guide: Personal Settings {} is not available", focus);
+     return;
+   }
++  if (page == Page::kMus579) {
++    // MediaSourceSelectScene: the Hard Drive row -> 570_MusicLibrary
++    if (focus == "listSources") {
++      OptGoTo(Page::kMus570);
++      lock.unlock();
++      PlaySfx("btn_Select");  // btn_standard's Press
++    }
++    return;
++  }
++  if (page == Page::kMus570) {
++    // MusicLibraryScene (90105898): Play All -> BeginPlayback; the
++    // categories -> 572_SelectMediaContainer (576_SelectSong for Songs)
++    static const std::pair<const char*, Page> kPress[] = {
++        {"btnAlbums", Page::kMus572Al},   {"btnArtists", Page::kMus572Ar},
++        {"btnPlaylists", Page::kMus572Pl}, {"btnAllSongs", Page::kMus576},
++        {"btnGenres", Page::kMus572Ge},   {"btnPlayAll", Page::kMusPlay}};
++    for (const auto& [id, next] : kPress) {
++      if (focus != id) continue;
++      OptGoTo(next);
++      const bool play = next == Page::kMusPlay;
++      lock.unlock();
++      PlaySfx("btn_Select");
++      if (play) MusicPlayEmpty();
++      return;
++    }
++    return;
++  }
++  if (IsMusicPage(page)) {
++    return;  // the category lists are empty; BeginPlayback has no A
++  }
+   if (page == Page::kOptVib && focus == "chkVibration") {
+     // 9144B6C0: the setting follows the box (3 on, 0 off)
+     opt_vib_ = !opt_vib_;
+@@ -566,5 +634,69 @@ void GuideOverlay::OptWriteSetting(uint32_t id, int32_t value) {
+   XELOGI("Guide: profile setting {:08X} = {}", id, value);
+ }
+ 
++// hud action 5 (91447EA8): XamAppLoad("minimediaplayer.xex", user). Its
++// first scene is full width, so the Guide goes HalfToFull.
++void GuideOverlay::MusicOpen() {
++  opt_user_ = hud_user_;
++  opt_back_.clear();
++  opt_fading_ = false;
++  opt_fade_capture_ = false;
++  page_ = Page::kMus579;
++  opt_focus_ = OptFirstFocus(Page::kMus579);
++  transition_ = Transition::kHalfToFull;
++  transition_start_ = Clock::now();
++  ++page_version_;
++}
++
++// The app's running flag cleared (901022E0): it unloads and the Guide is
++// back on hud's menu, on Select Music (FullToHalf).
++void GuideOverlay::MusicClose() {
++  opt_back_.clear();
++  opt_fading_ = false;
++  opt_fade_capture_ = false;
++  page_ = Page::kMenu;
++  const auto& menu = menu_signed_in_ ? layout_.menu_si : layout_.menu;
++  for (size_t i = 0; i < menu.size(); ++i) {
++    if (menu[i].id == "btnPlaylist") focus_ = int(i);
++  }
++  transition_ = Transition::kFullToHalf;
++  transition_start_ = Clock::now();
++  ++page_version_;
++  PlaySfx("HUD_close");  // hudbkgnd FullToHalf, frame 120
++}
++
++// BeginPlayback (90107A20): its query of the library finds no songs, so the
++// timer (50 ms, 90108A60 -> 90108458) ends it and the app unloads.
++void GuideOverlay::MusicPlayEmpty() {
++  Schedule(Clock::now() + std::chrono::milliseconds(50), [this]() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (page_ == Page::kMusPlay) MusicClose();
++  });
++}
++
++// X: Music Sources' "Return Control to Game" (90104798: the title's own
++// music back, then the app unloads); the other scenes' "Xbox Guide" (the
++// app unloads).
++void GuideOverlay::OptX() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (!IsMusicPage(page_) || opt_fading_) return;
++  MusicClose();
++}
++
++// Y: "Play All Music" on Music Sources (a source row focused) and on the
++// Music Library; cleared on the empty category lists.
++void GuideOverlay::OptY() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (opt_fading_) return;
++    if (!(page_ == Page::kMus579 && opt_focus_ == "listSources") &&
++        page_ != Page::kMus570) {
++      return;
++    }
++    OptGoTo(Page::kMusPlay);
++  }
++  MusicPlayEmpty();
++}
++
+ }  // namespace app
+ }  // namespace xe
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 2d252ca83..aa106373e 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -149,6 +149,7 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadSignedInLayout();
+   LoadSignInLayout();
+   LoadOptionsLayout();
++  LoadOptionsLayout("music.txt");
+   LoadHudKeys();
+   {
+     std::ifstream in(asset_dir_ / "gamertag.txt");
+@@ -583,6 +584,12 @@ void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float lx,
+     Back();
+   } else if (pressed & hid::X_INPUT_GAMEPAD_X) {
+     std::unique_lock<std::mutex> lock(mutex_);
++    if (IsMusicPage(page_) && transition_ == Transition::kNone &&
++        mode_ == Mode::kOpen) {
++      lock.unlock();
++      OptX();
++      return;
++    }
+     if (page_ == Page::kMenu && transition_ == Transition::kNone &&
+         mode_ == Mode::kOpen) {
+       lock.unlock();
+@@ -590,6 +597,12 @@ void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float lx,
+     }
+   } else if (pressed & hid::X_INPUT_GAMEPAD_Y) {
+     std::unique_lock<std::mutex> lock(mutex_);
++    if (IsMusicPage(page_) && transition_ == Transition::kNone &&
++        mode_ == Mode::kOpen) {
++      lock.unlock();
++      OptY();
++      return;
++    }
+     if (GpKey(page_) && transition_ == Transition::kNone) {
+       lock.unlock();
+       GpY();
+@@ -1323,6 +1336,12 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+                              "dl_legends_a", "dl_legends_b", "dl_legends_xy"}) {
+       names.push_back(name);
+     }
++    for (const auto& [key, page] : opt_pages_) {
++      if (key[0] != 'm') continue;
++      for (const char* part : {"_legends_a", "_legends_b", "_legends_xy"}) {
++        names.push_back(key + part);
++      }
++    }
+   }
+   if (sn_ready_) {  // signin1.xur's legends
+     for (const char* name : {"si_legends_a", "si_legends_b", "si_legends_xy"}) {
+@@ -1443,7 +1462,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   const bool profile_page = view.page == Page::kKeyboard ||
+                             view.page == Page::kSaveProfile ||
+                             GpKey(view.page) != nullptr;
+-  const bool full = view.base == Page::kUpsell ||
++  const bool full = IsMusicPage(view.base) || view.base == Page::kUpsell ||
+                     view.base == Page::kKeyboard ||
+                     view.base == Page::kSaveProfile ||
+                     GpKey(view.base) != nullptr;
+@@ -1451,6 +1470,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   // Legend layers per page: <prefix>_legends_a / _b / _xy.
+   const bool signed_in_menu = view.signed_in;
+   auto legend_prefix = [signed_in_menu](Page page) -> const char* {
++    if (IsMusicPage(page)) return OptKey(page);  // <page>_legends_*
+     switch (page) {
+       case Page::kSigningOut:
+         return "status";
+@@ -1792,6 +1812,14 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kOptOnl:
+       case Page::kOptVoice:
+       case Page::kOptDl:
++      case Page::kMus579:
++      case Page::kMus570:
++      case Page::kMus572Al:
++      case Page::kMus572Ar:
++      case Page::kMus572Pl:
++      case Page::kMus572Ge:
++      case Page::kMus576:
++      case Page::kMusPlay:
+       case Page::kSignIn:
+       case Page::kKeyboard:
+       case Page::kSaveProfile:
+@@ -4725,6 +4753,14 @@ void GuideOverlay::MenuPress(bool x_button) {
+   const std::string item = menu[focus_].id;
+   const bool signed_in = menu_signed_in_;
+   const uint32_t user = hud_user_;
++  if (!x_button && item == "btnPlaylist" && opt_pages_.count("mus579")) {
++    // hud action 5 (91447EA8): XamAppLoad("minimediaplayer.xex")
++    MusicOpen();
++    lock.unlock();
++    PlaySfx("btn_Select");
++    PlaySfx("HUD_open");  // hudbkgnd HalfToFull, frame 75
++    return;
++  }
+   if (!x_button && item == "btnOptions" && opt_ready_) {
+     // btnOptions' PressPath: Options.xur (both menus)
+     OptOpen();
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 18cf862d9..94831b406 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -134,7 +134,17 @@ class GuideOverlay {
+     kOptVoice,
+     // marketplace.xex's ActiveDownloads.xur (Personal Settings > Active
+     // Downloads, XamShowMarketplaceUI type 0xA)
+-    kOptDl
++    kOptDl,
++    // Select Music: minimediaplayer.xex's scenes (full width): Music
++    // Sources, Music Library, the categories (nothing found), BeginPlayback
++    kMus579,
++    kMus570,
++    kMus572Al,
++    kMus572Ar,
++    kMus572Pl,
++    kMus572Ge,
++    kMus576,
++    kMusPlay
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+@@ -462,7 +472,7 @@ class GuideOverlay {
+   // Personal Settings (guide_options.cc). Each page is its base image and a
+   // layer per control state (make_options_assets.py, options.txt).
+   struct OptCtrl {
+-    std::string id, kind, up, down;
++    std::string id, kind, up, down, left = "-", right = "-";
+   };
+   struct OptPage {
+     std::string default_focus;
+@@ -479,7 +489,13 @@ class GuideOverlay {
+   // Under prepare_mutex_ ("<page>_<id>_<state>"), for scaled_ppu_
+   std::map<std::string, OptLayer> opt_layers_;
+   static const char* OptKey(Page page);
+-  void LoadOptionsLayout();
++  void LoadOptionsLayout(const char* file = "options.txt");
++  static bool IsMusicPage(Page page);
++  void MusicOpen();   // the menu's Select Music; mutex_ held
++  void MusicClose();  // the app unloads: back to the Guide menu; mutex_ held
++  void OptX();
++  void OptY();
++  void MusicPlayEmpty();  // BeginPlayback with nothing to play
+   void PrepareOptionsLayers(float ppu, float f);  // the scale thread
+   bool ComposeOptionsPage(Page page, float ppu, Pixels& out);
+   bool OptEnabled(const std::string& id) const;  // mutex_ held
+-- 
+2.55.0.windows.3
+

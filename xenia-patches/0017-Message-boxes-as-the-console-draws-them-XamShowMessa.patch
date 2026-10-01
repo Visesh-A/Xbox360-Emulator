@@ -1,0 +1,702 @@
+From f6ca926845cd9ad0ed4d77d232a5aaa0e9171283 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 17:01:56 +0530
+Subject: [PATCH 17/51] Message boxes as the console draws them
+ (XamShowMessageBoxUI)
+
+Games' and the dashboard's message boxes are xam's XuiMessageBox<n+1> in
+the Guide frame's ErrorHUD, like the console: slid in over the dimmed
+screen (ClosedToError), buttons stacked, up/down, A = the button, B = xam's
+hidden cancel button (ERROR_CANCELLED), slid out (ErrorToClosed) before
+the answer goes back. The frame and box come pre-rendered without texts
+(guide/msgbox<n>_f<focus>.png from make_msgbox_assets.py, which also
+records where each text and the icon go, msgbox.txt); the overlay composes
+the title, message, buttons and icon (error/warning/alert) at run time in
+the console font (XenonCLatin) with xui_render's text rules.
+
+Passcode boxes and more than three buttons still use Xenia's dialog.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 370 ++++++++++++++++++++++++++++++++-
+ src/xenia/app/guide_overlay.h  |  43 +++-
+ src/xenia/kernel/xam/xam_ui.cc |  50 +++++
+ src/xenia/kernel/xam/xam_ui.h  |  13 ++
+ 4 files changed, 468 insertions(+), 8 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 81b7456d2..97e562771 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -17,10 +17,15 @@
+ 
+ #include "third_party/imgui/imgui.h"
+ #include "third_party/stb/stb_image.h"
++// Our own copy of ImGui's stb_truetype (ImGui keeps its copy private).
++#define STBTT_STATIC
++#define STB_TRUETYPE_IMPLEMENTATION
++#include "third_party/imgui/imstb_truetype.h"
+ #include "xenia/base/cvar.h"
+ #include "xenia/config.h"
+ #include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
++#include "xenia/base/utf8.h"
+ #include "xenia/base/platform_win.h"
+ // platform_win.h is lean; the sound API lives in mmsystem.h
+ #include <mmsystem.h>
+@@ -95,7 +100,13 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+       app_context_(app_context),
+       asset_dir_(xe::filesystem::GetExecutableFolder() / "guide") {
+   LoadLayout();
++  LoadMessageBoxLayout();
+   input_thread_ = std::thread([this]() { InputThread(); });
++  kernel::xam::title_message_box_hook =
++      [this](const kernel::xam::TitleMessageBox& box,
++             std::function<void(int)> done) {
++        return ShowTitleMessageBox(box, std::move(done));
++      };
+   // XamShowLiveUpsellUI (the dashboard's Join Xbox Live) is a Guide page.
+   kernel::xam::live_upsell_ui_hook = [this]() {
+     Open(Page::kUpsell);
+@@ -107,6 +118,7 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+ 
+ GuideOverlay::~GuideOverlay() {
+   kernel::xam::live_upsell_ui_hook = nullptr;
++  kernel::xam::title_message_box_hook = nullptr;
+   running_ = false;
+   if (input_thread_.joinable()) {
+     input_thread_.join();
+@@ -337,7 +349,7 @@ void GuideOverlay::InputThread() {
+         std::lock_guard<std::mutex> lock(mutex_);
+         open = mode_ == Mode::kOpen || mode_ == Mode::kOpening;
+       }
+-      if (open) {
++      if (open && page_ != Page::kTitleMessage) {
+         ShowMessageBox(Page::kTurnOff);
+       }
+       pressed &= ~hid::X_INPUT_GAMEPAD_GUIDE;
+@@ -357,6 +369,9 @@ void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float lx,
+   if (pressed & hid::X_INPUT_GAMEPAD_GUIDE) {
+     std::unique_lock<std::mutex> lock(mutex_);
+     Mode mode = mode_;
++    if (page_ == Page::kTitleMessage && mode != Mode::kClosed) {
++      return;  // the message box has to be answered first
++    }
+     lock.unlock();
+     if (mode == Mode::kClosed || mode == Mode::kClosing) {
+       Open();
+@@ -471,12 +486,20 @@ void GuideOverlay::BeginClose() {
+ void GuideOverlay::FinishClose() {
+   // Called from Draw (UI thread) once the chrome has slid away.
+   Dialog* dialog = nullptr;
++  std::function<void(int)> title_done;
++  int title_result = -1;
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+     if (mode_ != Mode::kClosing) {
+       return;
+     }
+     mode_ = Mode::kClosed;
++    if (page_ == Page::kTitleMessage) {
++      title_done = std::move(title_done_);
++      title_done_ = nullptr;
++      title_result = title_result_;
++      page_ = Page::kMenu;
++    }
+     if (blocking_title_input_) {
+       emulator_->kernel_state()->xam_state()->xam_dialogs_shown_--;
+       blocking_title_input_ = false;
+@@ -486,6 +509,9 @@ void GuideOverlay::FinishClose() {
+   if (dialog) {
+     dialog->Finish();
+   }
++  if (title_done) {
++    title_done(title_result);
++  }
+ }
+ 
+ void GuideOverlay::Move(Direction direction) {
+@@ -502,6 +528,17 @@ void GuideOverlay::Move(Direction direction) {
+       return;
+     }
+     focus_ = next;
++  } else if (page_ == Page::kTitleMessage) {
++    // the buttons, stacked top to bottom
++    if (direction != kUp && direction != kDown) {
++      return;
++    }
++    int next = std::clamp(choice_ + (direction == kUp ? -1 : 1), 0,
++                          title_buttons_ - 1);
++    if (next == choice_) {
++      return;
++    }
++    choice_ = next;
+   } else {
+     // Yes above No
+     if (direction != kUp && direction != kDown) {
+@@ -529,6 +566,13 @@ void GuideOverlay::Activate() {
+     PlaySfx("btn_Select");
+     return;
+   }
++  if (page == Page::kTitleMessage) {
++    title_result_ = choice;
++    lock.unlock();
++    PlaySfx("btn_Select");
++    BeginClose();  // ErrorToClosed; the answer goes back when it has closed
++    return;
++  }
+   if (choice == 1) {  // No: the message box closes, back to the Guide
+     lock.unlock();
+     PlaySfx("btn_Select");
+@@ -549,6 +593,13 @@ void GuideOverlay::Back() {
+   if (transition_ != Transition::kNone) {
+     return;
+   }
++  if (page_ == Page::kTitleMessage) {
++    title_result_ = -1;  // xam's hidden cancel button
++    lock.unlock();
++    PlaySfx("btn_Back");
++    BeginClose();
++    return;
++  }
+   if (page_ != Page::kMenu && page_ != Page::kUpsell) {
+     // the message box's hidden cancel button (B)
+     lock.unlock();
+@@ -631,7 +682,8 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+             transition_frames};
+   float seconds = std::chrono::duration<float>(now - anim_start_).count();
+   view.frames = seconds * layout_.fps;
+-  bool message_box = page_ == Page::kExit || page_ == Page::kTurnOff;
++  bool message_box = page_ == Page::kExit || page_ == Page::kTurnOff ||
++                     page_ == Page::kTitleMessage;
+   float open_after = page_ == Page::kUpsell || message_box
+                          ? layout_.slide_frames
+                          : layout_.slide_frames + layout_.fade_frames;
+@@ -761,6 +813,23 @@ const GuideOverlay::Image* GuideOverlay::Texture(const std::string& name,
+   // smaller on the GPU skips texels (shimmering text at 720p), so they are
+   // shrunk on the CPU to the exact on-screen size, off the UI thread.
+   Image& image = images_[name];
++  if (name.rfind("msgbox_title_", 0) == 0) {
++    // Composed for the current message box (ShowTitleMessageBox).
++    std::lock_guard<std::mutex> lock(prepare_mutex_);
++    auto it = title_images_.find(name);
++    if (it != title_images_.end()) {
++      Pixels& pixels = it->second;
++      image.texture = imgui_drawer_->CreateImGuiTexture(
++          pixels.width, pixels.height, pixels.rgba.data());
++      image.pixels_per_unit = title_images_ppu_;
++      image.width = pixels.width;
++      image.height = pixels.height;
++      image.units_w = pixels.units_w;
++      image.units_h = pixels.units_h;
++      title_images_.erase(it);
++    }
++    return image.texture ? &image : nullptr;
++  }
+   if (image.texture && image.pixels_per_unit == pixels_per_unit) {
+     return &image;
+   }
+@@ -819,8 +888,9 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   bool content_visible = true;
+   // The message box (xam's ErrorHUD, the frame mirrored on the right) and
+   // whether the half Guide is on screen (it leaves while the box shows).
+-  const bool message_box =
+-      view.page == Page::kExit || view.page == Page::kTurnOff;
++  const bool message_box = view.page == Page::kExit ||
++                           view.page == Page::kTurnOff ||
++                           view.page == Page::kTitleMessage;
+   bool half_visible = !message_box;
+   float error_dx = 0;  // ErrorHUD position - error_x
+   switch (view.mode) {
+@@ -915,6 +985,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   // the console puts it (layout offset, measured on real footage). Whole
+   // pixels, so the resampled images stay one texel per pixel.
+   const float k = display_h / l.canvas_h;
++  display_h_ = display_h;
+   const float ox = std::round(l.offset_x * k), oy = std::round(l.offset_y * k);
+   ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+   bool test_backdrop =
+@@ -955,9 +1026,12 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   }
+   if (message_box && !half_visible) {
+     // The ErrorHUD with the message box in it (one image, it slides whole).
+-    std::string name = std::string(view.page == Page::kExit ? "error_exit"
+-                                                            : "error_off") +
+-                       (view.choice == 0 ? "_yes" : "_no");
++    std::string name =
++        view.page == Page::kTitleMessage
++            ? "msgbox_title_f" + std::to_string(view.choice)
++            : std::string(view.page == Page::kExit ? "error_exit"
++                                                   : "error_off") +
++                  (view.choice == 0 ? "_yes" : "_no");
+     layer(name, l.error_x + error_dx, 1.0f);
+     return;
+   }
+@@ -1057,5 +1131,287 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   }
+ }
+ 
++// ------------------------------------------------------ title message boxes
++
++void GuideOverlay::LoadMessageBoxLayout() {
++  std::ifstream in(asset_dir_ / "msgbox.txt");
++  std::string key, name, kind;
++  int buttons, focus;
++  while (in >> key >> buttons >> focus >> name >> kind) {
++    MessageBoxItem item;
++    item.is_text = kind == "text";
++    in >> item.x >> item.y >> item.w >> item.h;
++    if (item.is_text) {
++      std::string color;
++      in >> item.size >> item.ascent >> item.line_h >> item.style >> color;
++      item.color = uint32_t(std::stoul(color, nullptr, 16));
++    }
++    message_box_layout_[buttons * 10 + focus][name] = item;
++  }
++  std::ifstream font(asset_dir_ / "XenonCLatin.ttf", std::ios::binary);
++  font_data_.assign(std::istreambuf_iterator<char>(font),
++                    std::istreambuf_iterator<char>());
++  font_ = std::make_unique<stbtt_fontinfo>();
++  if (font_data_.empty() ||
++      !stbtt_InitFont(font_.get(), font_data_.data(),
++                      stbtt_GetFontOffsetForIndex(font_data_.data(), 0))) {
++    font_.reset();
++  }
++  if (message_box_layout_.empty() || !font_) {
++    XELOGW("Guide: message box assets missing (msgbox.txt, XenonCLatin.ttf)");
++  }
++}
++
++namespace {
++// Straight-alpha "over" of a color (0..1 channels) with coverage `a`.
++void BlendPixel(uint8_t* p, float r, float g, float b, float a) {
++  if (a <= 0.0f) {
++    return;
++  }
++  float da = p[3] / 255.0f;
++  float oa = a + da * (1.0f - a);
++  auto channel = [&](int c, float v) {
++    float out = (v * a + p[c] / 255.0f * da * (1.0f - a)) / oa;
++    p[c] = uint8_t(std::clamp(out * 255.0f + 0.5f, 0.0f, 255.0f));
++  };
++  channel(0, r);
++  channel(1, g);
++  channel(2, b);
++  p[3] = uint8_t(std::clamp(oa * 255.0f + 0.5f, 0.0f, 255.0f));
++}
++}  // namespace
++
++// As xui_render.draw_text (checked against real frames): font pixel size
++// PointSize * 4/3, lines of ascent + descent (+ LineSpacingAdjust), words
++// wrapped at the box width, TextStyle 0x400 centered / 0x200 right / 0x1000
++// vertically centered.
++void GuideOverlay::RenderText(Pixels& out, const MessageBoxItem& item,
++                            const std::u16string& text) {
++  if (!font_ || text.empty()) {
++    return;
++  }
++  const float s = layout_.scale;
++  const float scale = stbtt_ScaleForMappingEmToPixels(font_.get(), item.size * s);
++  auto advance = [&](char16_t c) {
++    int adv, lsb;
++    stbtt_GetCodepointHMetrics(font_.get(), c, &adv, &lsb);
++    return adv * scale;
++  };
++  auto measure = [&](const std::u16string& t) {
++    float w = 0;
++    for (char16_t c : t) {
++      w += advance(c);
++    }
++    return w;
++  };
++  const float box_w = item.w * s, box_h = item.h * s;
++  std::vector<std::u16string> lines;
++  std::u16string raw;
++  auto flush = [&]() {
++    if (box_w > 0 && measure(raw) > box_w) {
++      std::u16string cur;
++      size_t start = 0;
++      while (true) {
++        size_t end = raw.find(u' ', start);
++        std::u16string word = raw.substr(
++            start, end == std::u16string::npos ? std::u16string::npos
++                                               : end - start);
++        std::u16string trial = cur.empty() ? word : cur + u" " + word;
++        if (measure(trial) > box_w && !cur.empty()) {
++          lines.push_back(cur);
++          cur = word;
++        } else {
++          cur = trial;
++        }
++        if (end == std::u16string::npos) {
++          break;
++        }
++        start = end + 1;
++      }
++      lines.push_back(cur);
++    } else {
++      lines.push_back(raw);
++    }
++    raw.clear();
++  };
++  for (char16_t c : text) {
++    if (c == u'\r') {
++      continue;
++    }
++    if (c == u'\n') {
++      flush();
++    } else {
++      raw.push_back(c);
++    }
++  }
++  flush();
++
++  const float line_h = item.line_h * s, ascent = item.ascent * s;
++  const float total = line_h * lines.size();
++  const float top = (item.style & 0x1000) ? (box_h - total) / 2 : 0.0f;
++  const float r = ((item.color >> 16) & 0xFF) / 255.0f;
++  const float g = ((item.color >> 8) & 0xFF) / 255.0f;
++  const float b = (item.color & 0xFF) / 255.0f;
++  const float alpha = (item.color >> 24) / 255.0f;
++  std::vector<uint8_t> glyph;
++  for (size_t i = 0; i < lines.size(); ++i) {
++    if (top + i * line_h >= box_h) {
++      break;  // past the bottom of the box
++    }
++    const float tw = measure(lines[i]);
++    float x = item.x * s + ((item.style & 0x400)   ? (box_w - tw) / 2
++                            : (item.style & 0x200) ? box_w - tw
++                                                   : 0.0f);
++    const float baseline = item.y * s + top + i * line_h + ascent;
++    const int base_y = int(std::floor(baseline));
++    const float shift_y = baseline - base_y;
++    for (char16_t c : lines[i]) {
++      const int pen_x = int(std::floor(x));
++      const float shift_x = x - pen_x;
++      int x0, y0, x1, y1;
++      stbtt_GetCodepointBitmapBoxSubpixel(font_.get(), c, scale, scale,
++                                          shift_x, shift_y, &x0, &y0, &x1, &y1);
++      const int gw = x1 - x0, gh = y1 - y0;
++      if (gw > 0 && gh > 0) {
++        glyph.assign(size_t(gw) * gh, 0);
++        stbtt_MakeCodepointBitmapSubpixel(font_.get(), glyph.data(), gw, gh,
++                                          gw, scale, scale, shift_x, shift_y,
++                                          c);
++        for (int gy = 0; gy < gh; ++gy) {
++          int oy = base_y + y0 + gy;
++          if (oy < 0 || oy >= out.height) continue;
++          for (int gx = 0; gx < gw; ++gx) {
++            int ox = pen_x + x0 + gx;
++            if (ox < 0 || ox >= out.width) continue;
++            float cover = glyph[size_t(gy) * gw + gx] / 255.0f * alpha;
++            BlendPixel(&out.rgba[(size_t(oy) * out.width + ox) * 4], r, g, b,
++                       cover);
++          }
++        }
++      }
++      x += advance(c);
++    }
++  }
++}
++
++bool GuideOverlay::ComposeMessageBox(const kernel::xam::TitleMessageBox& box,
++                                     int focus, Pixels& out) {
++  const int buttons = int(box.buttons.size());
++  auto layout = message_box_layout_.find(buttons * 10 + focus);
++  if (layout == message_box_layout_.end() ||
++      !Decode("msgbox" + std::to_string(buttons) + "_f" + std::to_string(focus),
++              out)) {
++    return false;
++  }
++  const auto& items = layout->second;
++  static const char* const kIcons[] = {nullptr, "msgbox_icon_error",
++                                       "msgbox_icon_warning",
++                                       "msgbox_icon_alert"};
++  auto icon_item = items.find("icon");
++  if (box.icon >= 1 && box.icon <= 3 && icon_item != items.end()) {
++    Pixels icon;
++    if (Decode(kIcons[box.icon], icon)) {
++      // Bilinear, like the renderer's linear sampling.
++      const float s = layout_.scale;
++      const MessageBoxItem& it = icon_item->second;
++      int dx0 = int(std::lround(it.x * s)), dy0 = int(std::lround(it.y * s));
++      int dw = int(std::lround(it.w * s)), dh = int(std::lround(it.h * s));
++      for (int y = 0; y < dh; ++y) {
++        for (int x = 0; x < dw; ++x) {
++          float u = (x + 0.5f) * icon.width / dw - 0.5f;
++          float v = (y + 0.5f) * icon.height / dh - 0.5f;
++          int u0 = std::clamp(int(std::floor(u)), 0, icon.width - 1);
++          int v0 = std::clamp(int(std::floor(v)), 0, icon.height - 1);
++          int u1 = std::min(u0 + 1, icon.width - 1);
++          int v1 = std::min(v0 + 1, icon.height - 1);
++          float fu = std::clamp(u - u0, 0.0f, 1.0f);
++          float fv = std::clamp(v - v0, 0.0f, 1.0f);
++          float c[4] = {};
++          for (int k = 0; k < 4; ++k) {
++            int su = (k & 1) ? u1 : u0, sv = (k & 2) ? v1 : v0;
++            float wgt = ((k & 1) ? fu : 1 - fu) * ((k & 2) ? fv : 1 - fv);
++            const uint8_t* p = &icon.rgba[(size_t(sv) * icon.width + su) * 4];
++            float a = p[3] / 255.0f;
++            for (int ch = 0; ch < 3; ++ch) c[ch] += p[ch] / 255.0f * a * wgt;
++            c[3] += a * wgt;
++          }
++          int ox = dx0 + x, oy = dy0 + y;
++          if (c[3] > 0 && ox >= 0 && ox < out.width && oy >= 0 &&
++              oy < out.height) {
++            BlendPixel(&out.rgba[(size_t(oy) * out.width + ox) * 4],
++                       c[0] / c[3], c[1] / c[3], c[2] / c[3], c[3]);
++          }
++        }
++      }
++    }
++  }
++  auto text = [&](const std::string& name, const std::u16string& value) {
++    auto it = items.find(name);
++    if (it != items.end()) {
++      RenderText(out, it->second, value);
++    }
++  };
++  text("title", box.title);
++  text("text", box.text);
++  for (int i = 0; i < buttons; ++i) {
++    text("button" + std::to_string(i), box.buttons[i]);
++  }
++  return true;
++}
++
++bool GuideOverlay::ShowTitleMessageBox(const kernel::xam::TitleMessageBox& box,
++                                       std::function<void(int)> done) {
++  const int buttons = int(box.buttons.size());
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (mode_ != Mode::kClosed || title_done_ || buttons < 1 || buttons > 3 ||
++        !font_) {
++      return false;
++    }
++  }
++  // Composed at the Guide's image scale, then shrunk to the screen like the
++  // other images (the last size the Guide was drawn at, if any).
++  float ppu = display_h_ > 0 ? display_h_ / layout_.canvas_h : layout_.scale;
++  std::map<std::string, Pixels> images;
++  for (int focus = 0; focus < buttons; ++focus) {
++    Pixels pixels;
++    if (!ComposeMessageBox(box, focus, pixels)) {
++      return false;
++    }
++    float f = ppu / layout_.scale;
++    if (f < 1.0f) {
++      pixels = Resample(pixels, std::max(1, int(std::lround(pixels.width * f))),
++                        std::max(1, int(std::lround(pixels.height * f))));
++    }
++    images["msgbox_title_f" + std::to_string(focus)] = std::move(pixels);
++  }
++  {
++    std::lock_guard<std::mutex> lock(prepare_mutex_);
++    title_images_ = std::move(images);
++    title_images_ppu_ = ppu;
++  }
++  XELOGI("Guide: message box \"{}\" ({} buttons)", xe::to_utf8(box.title),
++         buttons);
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    page_ = Page::kTitleMessage;
++    title_buttons_ = buttons;
++    title_result_ = -1;
++    title_done_ = std::move(done);
++    choice_ = std::clamp(int(box.focus), 0, buttons - 1);
++    mode_ = Mode::kOpening;  // ClosedToError
++    transition_ = Transition::kNone;
++    anim_start_ = Clock::now();
++  }
++  PlaySfx("HUD_open");
++  app_context_.CallInUIThread([this]() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!dialog_) {
++      dialog_ = new Dialog(imgui_drawer_, this);
++    }
++  });
++  return true;
++}
++
+ }  // namespace app
+ }  // namespace xe
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 672105610..fe78868a5 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -13,6 +13,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <filesystem>
++#include <functional>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -20,8 +21,15 @@
+ #include <thread>
+ #include <vector>
+ 
++struct stbtt_fontinfo;
++
+ namespace xe {
+ class Emulator;
++namespace kernel {
++namespace xam {
++struct TitleMessageBox;
++}  // namespace xam
++}  // namespace kernel
+ namespace ui {
+ class ImGuiDrawer;
+ class ImmediateTexture;
+@@ -46,6 +54,12 @@ class GuideOverlay {
+ 
+   static bool IsEnabled();
+ 
++  // XamShowMessageBoxUI from a game or the dashboard: xam's message box in the
++  // ErrorHUD, with the texts drawn in the console font. False if it cannot be
++  // shown now (the Guide is open, more buttons than xam's visuals have).
++  bool ShowTitleMessageBox(const kernel::xam::TitleMessageBox& box,
++                           std::function<void(int)> done);
++
+  private:
+   class Dialog;
+   friend class Dialog;
+@@ -54,7 +68,8 @@ class GuideOverlay {
+   enum class Mode { kClosed, kOpening, kOpen, kClosing };
+   // kUpsell: the Xbox Live upsell (XamShowLiveUpsellUI), a full-width Guide.
+   // kExit / kTurnOff: message boxes in the ErrorHUD.
+-  enum class Page { kMenu, kExit, kTurnOff, kUpsell };
++  // kTitleMessage: a title's XamShowMessageBoxUI (ShowTitleMessageBox).
++  enum class Page { kMenu, kExit, kTurnOff, kUpsell, kTitleMessage };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+   enum class Transition { kNone, kToError, kFromError };
+@@ -169,6 +184,32 @@ class GuideOverlay {
+   bool clock_24h_ = false;
+   bool clock_pad_hour_ = false;
+ 
++  // XuiMessageBox<buttons + 1> in the ErrorHUD (msgbox.txt from
++  // make_msgbox_assets.py): where its texts and icon go, per button count and
++  // focused button, in the image's canvas units.
++  struct MessageBoxItem {
++    bool is_text = false;
++    float x = 0, y = 0, w = 0, h = 0;
++    float size = 0, ascent = 0, line_h = 0;  // text: font px, metrics
++    uint32_t style = 0, color = 0;           // XUI TextStyle, ARGB
++  };
++  std::map<int, std::map<std::string, MessageBoxItem>> message_box_layout_;
++  std::vector<uint8_t> font_data_;  // the console font (XenonCLatin)
++  std::unique_ptr<stbtt_fontinfo> font_;
++  void LoadMessageBoxLayout();
++  // The message box image (layout scale) with `focus` highlighted.
++  bool ComposeMessageBox(const kernel::xam::TitleMessageBox& box, int focus,
++                         Pixels& out);
++  void RenderText(Pixels& out, const MessageBoxItem& item,
++                const std::u16string& text);
++  std::function<void(int)> title_done_;  // under mutex_
++  int title_buttons_ = 0;
++  int title_result_ = -1;
++  // Composed images ("msgbox_title_f<focus>") waiting for upload.
++  std::map<std::string, Pixels> title_images_;  // under prepare_mutex_
++  float title_images_ppu_ = 0;
++  std::atomic<float> display_h_{0};  // last drawn screen height
++
+   std::atomic<bool> running_{true};
+   std::thread input_thread_;
+ };
+diff --git a/src/xenia/kernel/xam/xam_ui.cc b/src/xenia/kernel/xam/xam_ui.cc
+index bb1cc7c42..422f15e94 100644
+--- a/src/xenia/kernel/xam/xam_ui.cc
++++ b/src/xenia/kernel/xam/xam_ui.cc
+@@ -359,6 +359,54 @@ static dword_result_t XamShowMessageBoxUi(
+     const Emulator* emulator = kernel_state()->emulator();
+     xe::ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
+ 
++    if (title_message_box_hook &&
++        !(flags & (XMBox_PASSCODEMODE | XMBox_VERIFYPASSCODEMODE))) {
++      // The console's own message box (Blades Guide overlay).
++      TitleMessageBox box;
++      box.title = title_ptr ? title_ptr.value() : u"";
++      box.text = text_ptr ? text_ptr.value() : u"";
++      for (uint32_t i = 0; i < button_count; ++i) {
++        box.buttons.push_back(xe::load_and_swap<std::u16string>(
++            kernel_state()->memory()->TranslateVirtual(button_ptrs[i])));
++      }
++      box.focus = active_button;
++      box.icon = flags & 0xF;
++      auto run = [box, result_ptr]() -> X_RESULT {
++        xe::threading::Fence fence;
++        int chosen = -1;
++        if (!title_message_box_hook(box, [&chosen, &fence](int button) {
++              chosen = button;
++              fence.Signal();
++            })) {
++          return X_ERROR_FUNCTION_FAILED;
++        }
++        kernel_state()->xam_state()->xam_dialogs_shown_++;
++        fence.Wait();
++        kernel_state()->xam_state()->xam_dialogs_shown_--;
++        if (chosen < 0) {
++          return X_ERROR_CANCELLED;  // B: xam's hidden cancel button
++        }
++        result_ptr->ButtonPressed = uint32_t(chosen);
++        return X_ERROR_SUCCESS;
++      };
++      auto pre = []() {
++        kernel_state()->BroadcastNotification(kXNotificationSystemUI, true);
++      };
++      auto post = []() {
++        xe::threading::Sleep(std::chrono::milliseconds(100));
++        kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
++      };
++      if (!overlapped) {
++        pre();
++        result = run();
++        post();
++      } else {
++        kernel_state()->CompleteOverlappedDeferred(run, overlapped, pre, post);
++        result = X_ERROR_IO_PENDING;
++      }
++      return result;
++    }
++
+     if (flags & XMBox_PASSCODEMODE || flags & XMBox_VERIFYPASSCODEMODE) {
+       auto close = [result_ptr,
+                     active_button](ui::ProfilePasscodeUI* dialog) -> X_RESULT {
+@@ -397,6 +445,8 @@ dword_result_t XamIsUIActive_entry() {
+ DECLARE_XAM_EXPORT2(XamIsUIActive, kUI, kImplemented, kHighFrequency);
+ 
+ std::function<bool()> live_upsell_ui_hook;
++std::function<bool(const TitleMessageBox&, std::function<void(int)>)>
++    title_message_box_hook;
+ 
+ // The Guide's Xbox Live upsell ("Join Xbox Live", InfoUpsellLive.xur). The
+ // blades dashboard calls it from Join Xbox Live and its Xbox Live banner and
+diff --git a/src/xenia/kernel/xam/xam_ui.h b/src/xenia/kernel/xam/xam_ui.h
+index 74ab3695a..7bc0da878 100644
+--- a/src/xenia/kernel/xam/xam_ui.h
++++ b/src/xenia/kernel/xam/xam_ui.h
+@@ -22,6 +22,19 @@ namespace xam {
+ // it (the Blades Guide overlay); returns whether it did.
+ extern std::function<bool()> live_upsell_ui_hook;
+ 
++// A message box (XamShowMessageBoxUI) for the host to show as the console
++// does (the Blades Guide overlay's ErrorHUD). The hook returns false if it
++// cannot show it now; otherwise it calls `done` once with the chosen button,
++// or -1 when cancelled (B).
++struct TitleMessageBox {
++  std::u16string title, text;
++  std::vector<std::u16string> buttons;
++  uint32_t focus = 0;
++  uint32_t icon = 0;  // XMBox_*: 0 none, 1 error, 2 warning, 3 alert
++};
++extern std::function<bool(const TitleMessageBox&, std::function<void(int)>)>
++    title_message_box_hook;
++
+ class XamDialog : public xe::ui::ImGuiDialog {
+  public:
+   void set_close_callback(std::function<void()> close_callback) {
+-- 
+2.55.0.windows.3
+

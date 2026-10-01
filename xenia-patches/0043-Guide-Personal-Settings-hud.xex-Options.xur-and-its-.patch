@@ -1,0 +1,912 @@
+From 02dbfb8f658fa299df2b1d3b26bbe883848743bb Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:38:32 +0530
+Subject: [PATCH 43/51] Guide: Personal Settings (hud.xex Options.xur and its
+ scenes)
+
+btnOptions' PressPath on both main menus opens Options.xur (OptionsScene 9144AC80): signed out (HUD state 6) Voice, Vibration, Themes and Active Downloads are disabled (message 0x7D3 = the control's Enabled flag, xam 81926524); a profile without an Xbox Live account (state 9) has Online Status disabled. Vibration (0x10040003), Notifications (XNotifyUISetOptions, kept in the config), Online Status (preset presence, then back), Voice (volume 0x1004000E, mute 0x1004000C, output 0x1004000D) and Shut Down (the Turn Off box, No returns to Options), with the scenes' trans_FadeOut / trans_FadeIn. Pages are a base image plus a layer per control state (make_options_assets.py). xam's default profile settings (table 0x818856E4): voice volume 100 and auto aim 1 added. Themes and Active Downloads are not built yet.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01TJbC5pRrQe1sZncuLBwzXN
+---
+ src/xenia/app/guide_options.cc       | 554 +++++++++++++++++++++++++++
+ src/xenia/app/guide_overlay.cc       |  97 ++++-
+ src/xenia/app/guide_overlay.h        |  59 ++-
+ src/xenia/kernel/xam/user_settings.h |   7 +-
+ 4 files changed, 711 insertions(+), 6 deletions(-)
+ create mode 100644 src/xenia/app/guide_options.cc
+
+diff --git a/src/xenia/app/guide_options.cc b/src/xenia/app/guide_options.cc
+new file mode 100644
+index 000000000..25a3a559f
+--- /dev/null
++++ b/src/xenia/app/guide_options.cc
+@@ -0,0 +1,554 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++// The Guide's Personal Settings: hud.xex's Options.xur (btnOptions' PressPath
++// on both main menus) and the scenes its buttons open.
++
++#include <algorithm>
++#include <cmath>
++#include <fstream>
++#include <optional>
++#include <sstream>
++#include <thread>
++
++#include "xenia/app/guide_overlay.h"
++#include "xenia/base/cvar.h"
++#include "xenia/base/logging.h"
++#include "xenia/config.h"
++#include "xenia/emulator.h"
++#include "xenia/kernel/kernel_state.h"
++#include "xenia/kernel/title_id_utils.h"
++#include "xenia/kernel/xam/user_tracker.h"
++#include "xenia/kernel/xam/xam_state.h"
++
++// XNotifyUIGetOptions / XNotifyUISetOptions (hud 9144A630 / 9144A4D0): kept
++// in the config (where xam keeps them was not traced; see the verification
++// list).
++DEFINE_bool(notify_show, true,
++            "Personal Settings > Notifications: Show Notifications "
++            "(XNotifyUISetOptions).",
++            "UI");
++DEFINE_bool(notify_sound, true,
++            "Personal Settings > Notifications: Play Sound "
++            "(XNotifyUISetOptions).",
++            "UI");
++
++namespace xe {
++namespace app {
++
++namespace {
++// hud's profile settings (XamUserRead/WriteProfileSettings, title FFFE07D1)
++constexpr uint32_t kVibration = 0x10040003;  // 9144B828 / 9144B6C0
++constexpr uint32_t kVoiceMuted = 0x1004000C;  // 9144B290 / 9144AEB0
++constexpr uint32_t kVoiceOutput = 0x1004000D;  // 9144B018: 0-2
++constexpr uint32_t kVoiceVolume = 0x1004000E;  // 9144B0C8: 0-100
++// OptionsOnline's radios -> XamSetUserPresetPresenceState (9144A748)
++constexpr uint32_t kPresence[4] = {1, 0x10001, 0x20001, 5};
++// trans_FadeOut: opacity 1 -> 0 over frames 0-15; trans_FadeIn: hidden
++// until 25, then 0 -> 1 by 40
++constexpr float kFadeOutEnd = 15.0f, kFadeInStart = 25.0f,
++                kFadeInEnd = 40.0f;
++
++void Blend(uint8_t* p, const uint8_t* c) {
++  const float a = c[3] / 255.0f;
++  if (a <= 0.0f) return;
++  const float da = p[3] / 255.0f;
++  const float oa = a + da * (1.0f - a);
++  for (int i = 0; i < 3; ++i) {
++    const float v =
++        (c[i] / 255.0f * a + p[i] / 255.0f * da * (1.0f - a)) / oa;
++    p[i] = uint8_t(std::clamp(v * 255.0f + 0.5f, 0.0f, 255.0f));
++  }
++  p[3] = uint8_t(std::clamp(oa * 255.0f + 0.5f, 0.0f, 255.0f));
++}
++}  // namespace
++
++const char* GuideOverlay::OptKey(Page page) {
++  switch (page) {
++    case Page::kOpt:
++      return "opt";
++    case Page::kOptVib:
++      return "optvib";
++    case Page::kOptNot:
++      return "optnot";
++    case Page::kOptOnl:
++      return "optonl";
++    case Page::kOptVoice:
++      return "optvoice";
++    default:
++      return nullptr;
++  }
++}
++
++void GuideOverlay::LoadOptionsLayout() {
++  std::ifstream in(asset_dir_ / "options.txt");
++  std::string line;
++  while (std::getline(in, line)) {
++    if (!line.empty() && line.back() == '\r') line.pop_back();
++    std::istringstream ls(line);
++    std::string kind, page;
++    ls >> kind >> page;
++    OptPage& p = opt_pages_[page];
++    if (kind == "page") {
++      std::string scene;
++      ls >> scene >> p.default_focus;
++    } else if (kind == "order") {
++      std::string id;
++      while (ls >> id) p.order.push_back(id);
++    } else if (kind == "ctrl") {
++      OptCtrl c;
++      ls >> c.id >> c.kind >> c.up >> c.down;
++      p.ctrls.push_back(c);
++    } else if (kind == "layer") {
++      std::string id, state;
++      int x, y;
++      ls >> id >> state >> x >> y;
++      p.layers[id + "_" + state] = {x, y};
++    }
++  }
++  opt_ready_ = opt_pages_.size() == 5;
++  for (const char* key : {"opt", "optvib", "optnot", "optonl", "optvoice"}) {
++    if (!opt_pages_.count(key) || opt_pages_[key].ctrls.empty()) {
++      opt_ready_ = false;
++    }
++  }
++}
++
++// Each layer is a crop of a full-canvas image (make_options_assets.py). It is
++// shrunk on the full image's own sampling grid (Resample's box filter over
++// the whole canvas), so it lands on the same pixels as the base image.
++void GuideOverlay::PrepareOptionsLayers(float ppu, float f) {
++  const int full_w = int(std::lround(layout_.canvas_w * layout_.scale));
++  const int full_h = int(std::lround(layout_.canvas_h * layout_.scale));
++  const int out_w = f < 1.0f ? std::max(1, int(std::lround(full_w * f))) : full_w;
++  const int out_h = f < 1.0f ? std::max(1, int(std::lround(full_h * f))) : full_h;
++  const double rx = double(full_w) / out_w, ry = double(full_h) / out_h;
++  std::map<std::string, OptLayer> layers;
++  for (const auto& [key, page] : opt_pages_) {
++    for (const auto& [name, origin] : page.layers) {
++      Pixels crop;
++      if (!Decode(key + "_" + name, crop)) continue;
++      OptLayer layer;
++      if (f >= 1.0f) {
++        layer.pixels = std::move(crop);
++        layer.x = origin[0];
++        layer.y = origin[1];
++        layers[key + "_" + name] = std::move(layer);
++        continue;
++      }
++      const int x0 = origin[0], y0 = origin[1];
++      const int ox0 = int(std::floor(x0 / rx));
++      const int oy0 = int(std::floor(y0 / ry));
++      const int ox1 = std::min(out_w, int(std::ceil((x0 + crop.width) / rx)));
++      const int oy1 = std::min(out_h, int(std::ceil((y0 + crop.height) / ry)));
++      Pixels& px = layer.pixels;
++      px.width = std::max(0, ox1 - ox0);
++      px.height = std::max(0, oy1 - oy0);
++      px.rgba.assign(size_t(px.width) * px.height * 4, 0);
++      for (int oy = oy0; oy < oy1; ++oy) {
++        const double sy0 = oy * ry, sy1 = std::min(double(full_h), sy0 + ry);
++        for (int ox = ox0; ox < ox1; ++ox) {
++          const double sx0 = ox * rx, sx1 = std::min(double(full_w), sx0 + rx);
++          double sum[4] = {};
++          for (int sy = int(sy0); sy < sy1; ++sy) {
++            const int cy = sy - y0;
++            if (cy < 0 || cy >= crop.height) continue;
++            const double wy = std::min(sy1, sy + 1.0) - std::max(sy0, double(sy));
++            for (int sx = int(sx0); sx < sx1; ++sx) {
++              const int cx = sx - x0;
++              if (cx < 0 || cx >= crop.width) continue;
++              const double w =
++                  wy * (std::min(sx1, sx + 1.0) - std::max(sx0, double(sx)));
++              const uint8_t* c = &crop.rgba[(size_t(cy) * crop.width + cx) * 4];
++              const double a = c[3] / 255.0 * w;
++              sum[0] += c[0] / 255.0 * a;
++              sum[1] += c[1] / 255.0 * a;
++              sum[2] += c[2] / 255.0 * a;
++              sum[3] += a;
++            }
++          }
++          const double area = (sx1 - sx0) * (sy1 - sy0);
++          uint8_t* o = &px.rgba[(size_t(oy - oy0) * px.width + (ox - ox0)) * 4];
++          const double a = sum[3] / area;
++          for (int i = 0; i < 3; ++i) {
++            const double v = sum[3] > 0 ? sum[i] / sum[3] : 0.0;
++            o[i] = uint8_t(std::clamp(v * 255.0 + 0.5, 0.0, 255.0));
++          }
++          o[3] = uint8_t(std::clamp(a * 255.0 + 0.5, 0.0, 255.0));
++        }
++      }
++      layer.x = ox0;
++      layer.y = oy0;
++      layers[key + "_" + name] = std::move(layer);
++    }
++  }
++  std::lock_guard<std::mutex> lock(prepare_mutex_);
++  opt_layers_ = std::move(layers);
++}
++
++// OptionsScene's init (9144AC80): message 0x7D3 (the control's Enabled flag,
++// xam 81926524) with 0 for Voice, Vibration, Themes and Active Downloads when
++// nobody is signed in (HUD state 6); Online Status disabled for a profile
++// without an Xbox Live account (state 9).
++bool GuideOverlay::OptEnabled(const std::string& id) const {
++  if (opt_hud_state_ == 6) {
++    return id != "btnVoice" && id != "btnController" &&
++           id != "btnPersonalization" && id != "btnDownloads";
++  }
++  if (opt_hud_state_ == 9) {
++    return id != "btnOnlineStatus";
++  }
++  return true;
++}
++
++// XUI's initial focus: the scene's DefaultFocus, or when that cannot take
++// focus its first enabled child in the scene's order.
++std::string GuideOverlay::OptFirstFocus(Page page) const {
++  const OptPage& p = opt_pages_.at(OptKey(page));
++  if (page != Page::kOpt || OptEnabled(p.default_focus)) return p.default_focus;
++  for (const auto& id : p.order) {
++    if (OptEnabled(id)) return id;
++  }
++  return p.default_focus;
++}
++
++bool GuideOverlay::ComposeOptionsPage(Page page, float ppu, Pixels& out) {
++  const char* key = OptKey(page);
++  std::unique_lock<std::mutex> lock(mutex_);
++  const std::string focus = opt_focus_;
++  const bool vib = opt_vib_, mute = opt_mute_;
++  const int presence = opt_presence_, output = opt_output_,
++            volume = opt_volume_;
++  std::map<std::string, bool> enabled;
++  for (const auto& c : opt_pages_[key].ctrls) enabled[c.id] = OptEnabled(c.id);
++  lock.unlock();
++  const bool show = cvars::notify_show, sound = cvars::notify_sound;
++  auto checked = [&](const std::string& id) {
++    if (id == "chkVibration") return vib;
++    if (id == "chkShow") return show;
++    if (id == "chkSound") return sound;
++    if (id == "chkMute") return mute;
++    static const char* const kOnline[] = {"radbtnOnline", "radbtnAway",
++                                          "radbtnBusy", "radbtnAppearOffline"};
++    static const char* const kOutput[] = {"radbtnPlayHeadset", "radbtnPlayTV",
++                                          "radbtnPlayBoth"};
++    for (int i = 0; i < 4; ++i) {
++      if (id == kOnline[i]) return i == presence;
++    }
++    for (int i = 0; i < 3; ++i) {
++      if (id == kOutput[i]) return i == output;
++    }
++    return false;
++  };
++  std::lock_guard<std::mutex> images_lock(prepare_mutex_);
++  if (!scaled_ready_ || scaled_ppu_ != ppu) return false;
++  auto base = scaled_.find(std::string(key) + "_base");
++  if (base == scaled_.end()) return false;
++  out = base->second;
++  for (const auto& c : opt_pages_[key].ctrls) {
++    const bool f = c.id == focus;
++    std::string state;
++    if (c.kind == "button") {
++      state = f ? "f" : enabled[c.id] ? "n" : "nd";
++    } else if (c.kind == "slider") {
++      state = std::string(f ? "f" : "n") + std::to_string(volume);
++    } else {
++      state = std::string(f ? "f" : "n") + (checked(c.id) ? "c" : "");
++    }
++    auto it = opt_layers_.find(std::string(key) + "_" + c.id + "_" + state);
++    if (it == opt_layers_.end()) continue;
++    const OptLayer& layer = it->second;
++    for (int y = 0; y < layer.pixels.height; ++y) {
++      const int oy = layer.y + y;
++      if (oy < 0 || oy >= out.height) continue;
++      for (int x = 0; x < layer.pixels.width; ++x) {
++        const int ox = layer.x + x;
++        if (ox < 0 || ox >= out.width) continue;
++        Blend(&out.rgba[(size_t(oy) * out.width + ox) * 4],
++              &layer.pixels.rgba[(size_t(y) * layer.pixels.width + x) * 4]);
++      }
++    }
++  }
++  return true;
++}
++
++// btnOptions' PressPath (XuiNavButton): XuiSceneNavigateForward to
++// Options.xur within the half-width Guide.
++void GuideOverlay::OptOpen() {
++  auto* state = emulator_->kernel_state()->xam_state();
++  opt_user_ = hud_user_;
++  if (!menu_signed_in_) {
++    opt_hud_state_ = 6;
++  } else {
++    auto* user = state->GetUserProfile(uint32_t(hud_user_));
++    opt_hud_state_ = user && user->IsLiveEnabled() ? 8 : 9;
++  }
++  opt_back_.clear();
++  OptGoTo(Page::kOpt);
++}
++
++void GuideOverlay::OptGoTo(Page page) {
++  // the outgoing scene's image fades out (trans_FadeOut) while this one
++  // waits, then fades in (trans_FadeIn)
++  if (page_ == Page::kMenu) {
++    const auto& menu = menu_signed_in_ ? layout_.menu_si : layout_.menu;
++    opt_fade_from_ = focus_ >= 0 && focus_ < int(menu.size())
++                         ? (menu_signed_in_ ? "menusi_" : "menu_") +
++                               menu[focus_].id
++                         : std::string();
++    opt_fade_capture_ = false;
++  } else {
++    opt_fade_from_ = "opt_prev";
++    opt_fade_capture_ = true;
++  }
++  if (OptKey(page_)) {
++    opt_back_.push_back({page_, opt_focus_});
++  }
++  page_ = page;
++  opt_focus_ = OptFirstFocus(page);
++  opt_fading_ = true;
++  opt_fade_start_ = std::chrono::steady_clock::now();
++  ++page_version_;
++  const Page init = page;
++  std::thread([this, init]() { OptLoadValues(init); }).detach();
++}
++
++void GuideOverlay::OptNavigateBack() {
++  opt_fade_from_ = "opt_prev";
++  opt_fade_capture_ = true;
++  opt_fading_ = true;
++  opt_fade_start_ = std::chrono::steady_clock::now();
++  if (opt_back_.empty()) {
++    // back to the main menu, on btnOptions (XUI keeps the focus)
++    page_ = Page::kMenu;
++    const auto& menu = menu_signed_in_ ? layout_.menu_si : layout_.menu;
++    for (size_t i = 0; i < menu.size(); ++i) {
++      if (menu[i].id == "btnOptions") focus_ = int(i);
++    }
++  } else {
++    page_ = opt_back_.back().first;
++    opt_focus_ = opt_back_.back().second;
++    opt_back_.pop_back();
++  }
++  ++page_version_;
++}
++
++void GuideOverlay::OptMove(Direction direction) {
++  const char* key = OptKey(page_);
++  if (!key || opt_fading_) return;
++  const OptPage& p = opt_pages_[key];
++  auto find = [&](const std::string& id) -> const OptCtrl* {
++    for (const auto& c : p.ctrls) {
++      if (c.id == id) return &c;
++    }
++    return nullptr;
++  };
++  const OptCtrl* cur = find(opt_focus_);
++  if (!cur) return;
++  if (direction == kLeft || direction == kRight) {
++    if (cur->kind != "slider") return;
++    // XuiSlider (8192DC08): a step (1) toward the end, within 0-10
++    const int next =
++        std::clamp(opt_volume_ + (direction == kRight ? 1 : -1), 0, 10);
++    if (next == opt_volume_) return;
++    opt_volume_ = next;
++    ++page_version_;
++    // 9144B0C8: (value - min) / (max - min) * 100
++    const int32_t volume = int32_t(float(next) / 10.0f * 100.0f);
++    std::thread([this, volume]() {
++      OptWriteSetting(kVoiceVolume, volume);
++    }).detach();
++    return;
++  }
++  // XUI's navigation passes over controls that cannot take focus
++  std::string target = direction == kUp ? cur->up : cur->down;
++  while (target != "-" && !target.empty()) {
++    const OptCtrl* t = find(target);
++    if (!t) return;
++    if (page_ != Page::kOpt || OptEnabled(target)) break;
++    target = direction == kUp ? t->up : t->down;
++  }
++  if (target == "-" || target.empty()) return;
++  opt_focus_ = target;
++  ++page_version_;
++  PlaySfx("btn_Focus");
++}
++
++void GuideOverlay::OptActivate() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  if (opt_fading_) return;
++  const Page page = page_;
++  const std::string focus = opt_focus_;
++  if (page == Page::kOpt) {
++    static const std::pair<const char*, Page> kPress[] = {
++        {"btnOnlineStatus", Page::kOptOnl},
++        {"btnVoice", Page::kOptVoice},
++        {"btnController", Page::kOptVib},
++        {"btnNotifications", Page::kOptNot}};
++    for (const auto& [id, next] : kPress) {
++      if (focus == id) {
++        OptGoTo(next);
++        lock.unlock();
++        PlaySfx("btn_Select");  // the button's Press state
++        return;
++      }
++    }
++    if (focus == "btnTurnOff") {
++      // 9144AA8C: Strings 44 "Are you sure you want to turn off the
++      // console?"; Yes (9144AA30) -> HalReturnToFirmware(5)
++      box_return_ = Page::kOpt;
++      lock.unlock();
++      PlaySfx("btn_Select");
++      ShowMessageBox(Page::kTurnOff);
++      return;
++    }
++    // Themes (SkinSelect.xur) and Active Downloads (XamShowMarketplaceUI):
++    // not built
++    lock.unlock();
++    PlaySfx("btn_Select");
++    XELOGW("Guide: Personal Settings {} is not available", focus);
++    return;
++  }
++  if (page == Page::kOptVib && focus == "chkVibration") {
++    // 9144B6C0: the setting follows the box (3 on, 0 off)
++    opt_vib_ = !opt_vib_;
++    const int32_t value = opt_vib_ ? 3 : 0;
++    ++page_version_;
++    lock.unlock();
++    PlaySfx("btn_Focus");  // its FocusCheck / Focus state's sound
++    OptWriteSetting(kVibration, value);
++    return;
++  }
++  if (page == Page::kOptNot) {
++    // 9144A4D0: XNotifyUISetOptions(show, sound)
++    if (focus == "chkShow") {
++      OVERRIDE_bool(notify_show, !cvars::notify_show);
++    } else if (focus == "chkSound") {
++      OVERRIDE_bool(notify_sound, !cvars::notify_sound);
++    } else {
++      return;
++    }
++    ++page_version_;
++    lock.unlock();
++    PlaySfx("btn_Focus");
++    config::SaveConfig();
++    return;
++  }
++  if (page == Page::kOptOnl) {
++    static const char* const kOnline[] = {"radbtnOnline", "radbtnAway",
++                                          "radbtnBusy", "radbtnAppearOffline"};
++    for (int i = 0; i < 4; ++i) {
++      if (focus != kOnline[i]) continue;
++      // 9144A748: XamSetUserPresetPresenceState, then back to Options
++      opt_presence_ = i;
++      opt_presence_by_user_[opt_user_] = i;
++      XELOGI("Guide: preset presence state {:X}", kPresence[i]);
++      ++page_version_;
++      OptNavigateBack();
++      lock.unlock();
++      PlaySfx("btn_Focus");
++      return;
++    }
++    return;
++  }
++  if (page == Page::kOptVoice) {
++    static const char* const kOutput[] = {"radbtnPlayHeadset", "radbtnPlayTV",
++                                          "radbtnPlayBoth"};
++    if (focus == "chkMute") {
++      opt_mute_ = !opt_mute_;
++      const int32_t value = opt_mute_ ? 1 : 0;
++      ++page_version_;
++      lock.unlock();
++      PlaySfx("btn_Focus");
++      OptWriteSetting(kVoiceMuted, value);
++      return;
++    }
++    for (int i = 0; i < 3; ++i) {
++      if (focus != kOutput[i] || i == opt_output_) continue;
++      opt_output_ = i;
++      ++page_version_;
++      lock.unlock();
++      PlaySfx("btn_Focus");
++      OptWriteSetting(kVoiceOutput, i);
++      return;
++    }
++  }
++}
++
++void GuideOverlay::OptBack() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (opt_fading_) return;
++    OptNavigateBack();
++  }
++  PlaySfx("btn_Back");  // the scene's XuiBackButton (legend_B) Press
++}
++
++// The scenes' inits read their settings for the Guide's user.
++void GuideOverlay::OptLoadValues(Page page) {
++  auto* state = emulator_->kernel_state()->xam_state();
++  uint32_t user_index;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    user_index = opt_user_;
++  }
++  auto* user = state->GetUserProfile(user_index);
++  auto read = [&](uint32_t id) -> std::optional<int32_t> {
++    if (!user) return std::nullopt;
++    auto setting = state->user_tracker()->GetSetting(user, kernel::kDashboardID,
++                                                     id);
++    if (!setting) return std::nullopt;
++    auto data = setting->get_host_data();
++    if (auto* v = std::get_if<int32_t>(&data)) return *v;
++    if (auto* u = std::get_if<uint32_t>(&data)) return int32_t(*u);
++    return std::nullopt;
++  };
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (page == Page::kOptVib) {
++    // 9144B828: checked first, then the setting (non-zero = on)
++    opt_vib_ = true;
++    if (auto v = read(kVibration)) opt_vib_ = *v != 0;
++  } else if (page == Page::kOptVoice) {
++    // 9144B290: unmuted, Play Through Speakers, the slider at its maximum;
++    // then the settings
++    opt_mute_ = false;
++    opt_output_ = 1;
++    opt_volume_ = 10;
++    if (auto v = read(kVoiceMuted)) opt_mute_ = *v != 0;
++    if (auto v = read(kVoiceOutput)) opt_output_ = std::clamp(*v, 0, 2);
++    if (auto v = read(kVoiceVolume)) {
++      const float volume = float(std::min(*v, 100));
++      // 9144B434: (value * 0.01f) * (max - min), single precision, truncated
++      opt_volume_ = int((volume * 0.01f) * 10.0f);
++    }
++  } else if (page == Page::kOptOnl) {
++    // 9144A8B0: XamGetUserPresetPresenceState's state as the radio
++    auto it = opt_presence_by_user_.find(user_index);
++    opt_presence_ = it != opt_presence_by_user_.end() ? it->second : 0;
++  }
++  ++page_version_;
++}
++
++void GuideOverlay::OptWriteSetting(uint32_t id, int32_t value) {
++  auto* state = emulator_->kernel_state()->xam_state();
++  uint32_t user_index;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    user_index = opt_user_;
++  }
++  auto* user = state->GetUserProfile(user_index);
++  if (!user) return;
++  const kernel::xam::UserSetting setting(
++      static_cast<kernel::xam::UserSettingId>(id), value);
++  state->user_tracker()->UpsertSetting(user->xuid(), kernel::kDashboardID,
++                                       &setting);
++  XELOGI("Guide: profile setting {:08X} = {}", id, value);
++}
++
++}  // namespace app
++}  // namespace xe
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 88546f26b..6c3208cc5 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -148,6 +148,7 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadViewGamesLayout();
+   LoadSignedInLayout();
+   LoadSignInLayout();
++  LoadOptionsLayout();
+   LoadHudKeys();
+   {
+     std::ifstream in(asset_dir_ / "gamertag.txt");
+@@ -619,6 +620,8 @@ void GuideOverlay::Open(Page page) {
+     choice_ = 1;
+     upsell_from_menu_ = false;
+     sign_out_pending_ = false;
++    opt_fading_ = false;
++    opt_back_.clear();
+     transition_ = Transition::kNone;
+     anim_start_ = Clock::now();
+     if (!blocking_title_input_) {
+@@ -697,6 +700,10 @@ void GuideOverlay::FinishClose() {
+ 
+ void GuideOverlay::Move(Direction direction) {
+   std::lock_guard<std::mutex> lock(mutex_);
++  if (OptKey(page_) && transition_ == Transition::kNone) {
++    OptMove(direction);
++    return;
++  }
+   if (page_ == Page::kSignIn && transition_ == Transition::kNone) {
+     SignInMove(direction);
+     return;
+@@ -787,6 +794,11 @@ void GuideOverlay::Activate() {
+     GpActivate();
+     return;
+   }
++  if (OptKey(page) && transition_ == Transition::kNone) {
++    lock.unlock();
++    OptActivate();
++    return;
++  }
+   if (transition_ != Transition::kNone || page == Page::kAddXboxLive ||
+       page == Page::kGamerTag) {
+     return;  // AddXboxLive, GamerTag: no A (its legend is dimmed)
+@@ -858,6 +870,11 @@ void GuideOverlay::Back() {
+     GpBack();
+     return;
+   }
++  if (OptKey(page_)) {
++    lock.unlock();
++    OptBack();
++    return;
++  }
+   if (page_ == Page::kAddXboxLive) {
+     lock.unlock();
+     AddXboxLiveBack();
+@@ -950,6 +967,11 @@ void GuideOverlay::Back() {
+ 
+ void GuideOverlay::ShowMessageBox(Page page) {
+   std::lock_guard<std::mutex> lock(mutex_);
++  if (page == Page::kExit || page == Page::kTurnOff) {
++    // back to the scene the box came from (Personal Settings' Shut Down, or
++    // held Guide on it), else the menu
++    box_return_ = OptKey(page_) ? page_ : Page::kMenu;
++  }
+   page_ = page;
+   choice_ = 1;  // hud.xex passes focus 1: No
+   if (mode_ == Mode::kOpen) {
+@@ -1114,7 +1136,7 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+         ShowProfileBox(next->box, next->return_to, std::move(next->done));
+       }
+     } else if (page_ == Page::kExit || page_ == Page::kTurnOff) {
+-      page_ = Page::kMenu;  // the Guide's own boxes: back to its menu
++      page_ = box_return_;  // the Guide's own boxes: back to its scene
+     } else if (page_ == Page::kSignOut) {
+       if (sign_out_pending_) {
+         // 914441B8: Status.xur; its init (9144F028) signs the profile out
+@@ -1159,7 +1181,7 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+   View view{mode_, page_, focus_, choice_, 0.0f, transition_,
+             transition_frames,
+             page_ == Page::kProfileError ? profile_box_return_
+-            : (page_ == Page::kExit || page_ == Page::kTurnOff) ? Page::kMenu
++            : (page_ == Page::kExit || page_ == Page::kTurnOff) ? box_return_
+                                                                 : page_};
+   view.signed_in = menu_signed_in_;
+   if (page_ == Page::kSignOut) view.base = Page::kMenu;
+@@ -1296,6 +1318,11 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+       names.insert(names.begin() + std::min<size_t>(7, names.size()), name);
+     }
+   }
++  if (opt_ready_) {  // Options.xur's legends (all its scenes: Select, Back)
++    for (const char* name : {"opt_legends_a", "opt_legends_b", "opt_legends_xy"}) {
++      names.push_back(name);
++    }
++  }
+   if (sn_ready_) {  // signin1.xur's legends
+     for (const char* name : {"si_legends_a", "si_legends_b", "si_legends_xy"}) {
+       names.push_back(name);
+@@ -1346,7 +1373,7 @@ const GuideOverlay::Image* GuideOverlay::Texture(const std::string& name,
+   // smaller on the GPU skips texels (shimmering text at 720p), so they are
+   // shrunk on the CPU to the exact on-screen size, off the UI thread.
+   Image& image = images_[name];
+-  if (name == "cp_page") {
++  if (name == "cp_page" || name == "opt_prev") {
+     return image.texture ? &image : nullptr;
+   }
+   if (name.rfind("msgbox_title_", 0) == 0) {
+@@ -1428,6 +1455,12 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+         return "status";
+       case Page::kSignIn:
+         return "si";
++      case Page::kOpt:
++      case Page::kOptVib:
++      case Page::kOptNot:
++      case Page::kOptOnl:
++      case Page::kOptVoice:
++        return "opt";
+       case Page::kAddXboxLive:
+         return "axl";
+       case Page::kGamerTag:
+@@ -1702,6 +1735,35 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     layer(name, l.error_x + error_dx, 1.0f);
+     return;
+   }
++  // Personal Settings' scene fades (trans_FadeOut 0-15 on the outgoing
++  // scene, trans_FadeIn 25-40 on the new one)
++  bool fading = false;
++  float fade_out = 0.0f, fade_in = 1.0f;
++  std::string fade_from;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (opt_fade_capture_) {
++      // the composed page on screen becomes the outgoing scene's image
++      opt_fade_capture_ = false;
++      images_["opt_prev"] = std::move(images_["cp_page"]);
++      images_["cp_page"] = Image();
++      composed_ppu_ = 0;
++    }
++    if (opt_fading_) {
++      const float t = std::chrono::duration<float>(Clock::now() -
++                                                   opt_fade_start_)
++                          .count() *
++                      l.fps;
++      if (t >= 40.0f) {
++        opt_fading_ = false;
++      } else {
++        fading = true;
++        fade_out = std::max(0.0f, 1.0f - t / 15.0f);
++        fade_in = t < 25.0f ? 0.0f : (t - 25.0f) / 15.0f;
++        fade_from = opt_fade_from_;
++      }
++    }
++  }
+   std::string content;
+   if (content_visible) {
+     switch (view.page) {
+@@ -1721,6 +1783,11 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kAddXboxLive:
+         content = "axl_page";
+         break;
++      case Page::kOpt:
++      case Page::kOptVib:
++      case Page::kOptNot:
++      case Page::kOptOnl:
++      case Page::kOptVoice:
+       case Page::kSignIn:
+       case Page::kKeyboard:
+       case Page::kSaveProfile:
+@@ -1778,7 +1845,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   // console: some lines blend additively onto it), so the page fades in as a
+   // crossfade over the chrome and, fully shown, replaces it.
+   bool page_ready = !content.empty() && Texture(content, k);
+-  if (!(page_ready && content_alpha >= 1.0f)) {
++  if (!(page_ready && content_alpha >= 1.0f) || fading) {
+     // The frame's base and blade, each where its keyframes put it (the
+     // images show them at rest in the full Guide: base 12, blade 991).
+     HudState base = HudAt("graphic-base", hud_f);
+@@ -1787,6 +1854,14 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     if (blade.show) layer("hud_blade", blade.x - 991.0f, 1.0f);
+   }
+   if (content_visible) {
++    if (fading && fade_out > 0.0f && !fade_from.empty()) {
++      layer(fade_from, 0.0f, content_alpha * fade_out);
++      if (fade_from.rfind("menu", 0) == 0) {
++        DrawMenuDynamic(k, ox, oy, up, content_alpha * fade_out,
++                        view.signed_in);
++      }
++    }
++    if (fading) content_alpha *= fade_in;
+     if (page_ready) {
+       layer(content, 0.0f, content_alpha);
+     }
+@@ -2377,6 +2452,9 @@ void GuideOverlay::PrepareCreateProfileImages(float ppu) {
+       names.push_back(name);
+     }
+   }
++  if (opt_ready_) {
++    for (const auto& [key, page] : opt_pages_) names.push_back(key + "_base");
++  }
+   for (const auto& [key, page] : gp_pages_) {
+     if (page.buttons.empty()) names.push_back(key);
+     for (const auto& b : page.buttons) names.push_back(key + "_" + b.id);
+@@ -2424,6 +2502,7 @@ void GuideOverlay::PrepareCreateProfileImages(float ppu) {
+     }
+     out[name] = std::move(pixels);
+   }
++  if (opt_ready_) PrepareOptionsLayers(ppu, f);
+   {
+     std::lock_guard<std::mutex> lock(prepare_mutex_);
+     scaled_ = std::move(out);
+@@ -4636,6 +4715,13 @@ void GuideOverlay::MenuPress(bool x_button) {
+   const std::string item = menu[focus_].id;
+   const bool signed_in = menu_signed_in_;
+   const uint32_t user = hud_user_;
++  if (!x_button && item == "btnOptions" && opt_ready_) {
++    // btnOptions' PressPath: Options.xur (both menus)
++    OptOpen();
++    lock.unlock();
++    PlaySfx("btn_Select");
++    return;
++  }
+   lock.unlock();
+   PlaySfx("btn_Select");
+   if (!signed_in) {
+@@ -5010,6 +5096,9 @@ bool GuideOverlay::ComposeCreateProfilePage(float ppu, Pixels& out) {
+   if (GpKey(page)) {
+     return ComposeGamerProfilePage(page, ppu, out);
+   }
++  if (OptKey(page)) {
++    return ComposeOptionsPage(page, ppu, out);
++  }
+   if (page == Page::kSignIn) {
+     return ComposeSignInPage(ppu, out);
+   }
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 49348cdb7..a1d7b4467 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -123,7 +123,14 @@ class GuideOverlay {
+     kSigningOut,
+     // signin.xex (XamShowSigninUIp, 1 pane): signin1.xur's UserList, then
+     // its status pane
+-    kSignIn
++    kSignIn,
++    // hud.xex's Personal Settings: Options.xur and the scenes its buttons
++    // open (Vibration, Notifications, Online Status, Voice); half width
++    kOpt,
++    kOptVib,
++    kOptNot,
++    kOptOnl,
++    kOptVoice
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+@@ -447,6 +454,56 @@ class GuideOverlay {
+   std::vector<SiProfile> sn_profiles_;
+   int sn_focus_ = 0, sn_top_ = 0;
+   uint32_t sn_user_ = 0;
++
++  // Personal Settings (guide_options.cc). Each page is its base image and a
++  // layer per control state (make_options_assets.py, options.txt).
++  struct OptCtrl {
++    std::string id, kind, up, down;
++  };
++  struct OptPage {
++    std::string default_focus;
++    std::vector<std::string> order;  // the scene's child order
++    std::vector<OptCtrl> ctrls;
++    std::map<std::string, std::array<int, 2>> layers;  // "<id>_<state>"
++  };
++  struct OptLayer {
++    Pixels pixels;
++    int x = 0, y = 0;  // on the page, pixels
++  };
++  std::map<std::string, OptPage> opt_pages_;
++  bool opt_ready_ = false;
++  // Under prepare_mutex_ ("<page>_<id>_<state>"), for scaled_ppu_
++  std::map<std::string, OptLayer> opt_layers_;
++  static const char* OptKey(Page page);
++  void LoadOptionsLayout();
++  void PrepareOptionsLayers(float ppu, float f);  // the scale thread
++  bool ComposeOptionsPage(Page page, float ppu, Pixels& out);
++  bool OptEnabled(const std::string& id) const;  // mutex_ held
++  std::string OptFirstFocus(Page page) const;    // mutex_ held
++  void OptOpen();                  // the menu's btnOptions; mutex_ held
++  void OptGoTo(Page page);         // XuiSceneNavigateForward; mutex_ held
++  void OptNavigateBack();          // mutex_ held
++  void OptMove(Direction direction);  // mutex_ held
++  void OptActivate();
++  void OptBack();
++  void OptLoadValues(Page page);   // the scene's init; no mutex_
++  void OptWriteSetting(uint32_t id, int32_t value);
++  // Under mutex_:
++  std::string opt_focus_;
++  std::vector<std::pair<Page, std::string>> opt_back_;
++  int opt_hud_state_ = 6;  // hud 91444010: 6 signed out, 8 / 9 signed in
++  uint32_t opt_user_ = 0;
++  bool opt_vib_ = true, opt_mute_ = false;
++  int opt_presence_ = 0, opt_output_ = 1, opt_volume_ = 10;
++  std::map<uint32_t, int> opt_presence_by_user_;
++  // The scenes' trans_FadeOut (frames 0-15) / trans_FadeIn (25-40): the
++  // outgoing scene's image (the menu's, or the composed page kept as
++  // "opt_prev") fades out while the new one waits, then fades in.
++  bool opt_fading_ = false, opt_fade_capture_ = false;
++  std::string opt_fade_from_;
++  std::chrono::steady_clock::time_point opt_fade_start_;
++  // where the Guide's own boxes (Exit, Turn Off) go back to
++  Page box_return_ = Page::kMenu;
+   std::map<std::string, MessageBoxItem> si_text_;
+   std::array<float, 4> si_tile_ = {};
+   std::map<int, std::u16string> si_str_;
+diff --git a/src/xenia/kernel/xam/user_settings.h b/src/xenia/kernel/xam/user_settings.h
+index 3c0471b84..40173aad1 100644
+--- a/src/xenia/kernel/xam/user_settings.h
++++ b/src/xenia/kernel/xam/user_settings.h
+@@ -561,8 +561,13 @@ class UserSetting : public UserData {
+   }
+ };
+ 
+-const static std::array<UserSetting, 3> default_setting_values = {
++// xam's own defaults for settings a profile has not written (its table at
++// 0x818856E4 in 2858: voice volume 100, vibration 3, auto aim 1) and
++// Xenia's.
++const static std::array<UserSetting, 5> default_setting_values = {
++    UserSetting(UserSettingId::XPROFILE_OPTION_VOICE_VOLUME, 100),
+     UserSetting(UserSettingId::XPROFILE_OPTION_CONTROLLER_VIBRATION, 3),
++    UserSetting(UserSettingId::XPROFILE_GAMER_ACTION_AUTO_AIM, 1),
+     UserSetting(
+         UserSettingId::XPROFILE_GAMER_TIER,
+         X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierGold),
+-- 
+2.55.0.windows.3
+

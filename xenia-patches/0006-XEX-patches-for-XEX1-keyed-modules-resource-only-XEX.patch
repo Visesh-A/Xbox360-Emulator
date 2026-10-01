@@ -1,0 +1,266 @@
+From 4fa83f9c4ce3bdc7a6b13f12b6ec41b1d01e41e9 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 10:36:03 +0530
+Subject: [PATCH 06/51] XEX patches for XEX1-keyed modules; resource-only XEX;
+ patched dumps
+
+ApplyPatch derived the patched module's keys with the XEX2 retail/devkit
+key only, so delta patches for modules encrypted with the XEX1 key (the
+system update's xam.xexp) failed with "patch image key doesn't match". Keep
+the key that decrypted the base and use it for the patch.
+
+Accept resource-only XEX images (no PE, e.g. huduiskin.xex) and skip code
+hashing for them.
+
+Research: --dump_patched_system_modules="<base dir>|<patch dir>|<out dir>"
+applies a system update's patches to the Guide modules (hud, huduiskin, xam,
+minimediaplayer, signin) and writes the images before and after.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/cpu/xex_module.cc     | 33 ++++++++++++-
+ src/xenia/cpu/xex_module.h      |  6 +++
+ src/xenia/emulator.cc           | 82 +++++++++++++++++++++++++++++++++
+ src/xenia/emulator.h            |  3 ++
+ src/xenia/kernel/user_module.cc |  6 +++
+ 5 files changed, 129 insertions(+), 1 deletion(-)
+
+diff --git a/src/xenia/cpu/xex_module.cc b/src/xenia/cpu/xex_module.cc
+index a4455173a..2cc5bd6b0 100644
+--- a/src/xenia/cpu/xex_module.cc
++++ b/src/xenia/cpu/xex_module.cc
+@@ -367,8 +367,10 @@ int XexModule::ApplyPatch(XexModule* module) {
+   memcpy(orig_session_key, module->session_key_, 0x10);
+ 
+   // Header patch updated the base XEX key, need to redecrypt it
++  // (with the key the base was decrypted with: system modules like xam.xex
++  // use the XEX1 key)
+   aes_decrypt_buffer(
+-      module->is_dev_kit_ ? xe_xex2_devkit_key : xe_xex2_retail_key,
++      module->master_key_,
+       reinterpret_cast<const uint8_t*>(module->xex_security_info()->aes_key),
+       16, module->session_key_, 16);
+ 
+@@ -514,6 +516,7 @@ int XexModule::ReadImage(const void* xex_addr, size_t xex_length,
+   }
+ 
+   is_dev_kit_ = key[0] == 0x00;
++  master_key_ = key;
+ 
+   if (is_patch()) {
+     // Make a copy of patch data for other XEX's to use with ApplyPatch()
+@@ -555,6 +558,28 @@ int XexModule::ReadImage(const void* xex_addr, size_t xex_length,
+     return 0;
+   }
+ 
++  // Resource-only images (no PE at all) are valid on the console. Accept one
++  // when its first resource starts with a printable tag, which a wrong key
++  // would not produce.
++  xex2_opt_resource_info* resources = nullptr;
++  if (GetOptHeader(XEX_HEADER_RESOURCE_INFO, &resources) && resources &&
++      resources->size >= sizeof(xex2_resource) + 4) {
++    const uint32_t res_address = resources->resources[0].address;
++    if (res_address >= base_address_) {
++      const uint8_t* tag = memory()->TranslateVirtual(res_address);
++      bool printable = true;
++      for (int i = 0; i < 4; ++i) {
++        printable &= tag[i] >= 0x20 && tag[i] < 0x7F;
++      }
++      if (printable) {
++        XELOGI("XEX {}: resource-only image (first resource tag {:c}{:c}{:c}{:c})",
++               name_, tag[0], tag[1], tag[2], tag[3]);
++        is_resource_only_ = true;
++        return 0;
++      }
++    }
++  }
++
+   // Not a patch and image doesn't have proper PE header, return 3
+   return 3;
+ }
+@@ -981,6 +1006,12 @@ bool XexModule::LoadContinue() {
+ 
+   finished_load_ = true;
+ 
++  if (is_resource_only_) {
++    // Nothing to link or execute; resources are read straight from memory.
++    low_address_ = high_address_ = base_address_;
++    return true;
++  }
++
+   if (ReadPEHeaders()) {
+     XELOGE("Failed to load XEX PE headers!");
+     return false;
+diff --git a/src/xenia/cpu/xex_module.h b/src/xenia/cpu/xex_module.h
+index a63dd2d32..cf154a4c5 100644
+--- a/src/xenia/cpu/xex_module.h
++++ b/src/xenia/cpu/xex_module.h
+@@ -271,6 +271,12 @@ class XexModule : public xe::cpu::Module {
+ 
+   uint8_t session_key_[0x10];
+   bool is_dev_kit_ = false;
++  // Key that decrypted the image (XEX2 retail/devkit or XEX1 retail); a
++  // delta patch's keys are derived from the same one.
++  const uint8_t* master_key_ = nullptr;
++
++  // Image is only XEX resources (no PE), e.g. the Guide skin huduiskin.xex.
++  bool is_resource_only_ = false;
+ 
+   bool loaded_ = false;         // Loaded into memory?
+   bool finished_load_ = false;  // PE/imports/symbols/etc all loaded?
+diff --git a/src/xenia/emulator.cc b/src/xenia/emulator.cc
+index 090a8308c..921bf9d55 100644
+--- a/src/xenia/emulator.cc
++++ b/src/xenia/emulator.cc
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <ranges>
++#include <sstream>
+ 
+ #include "xenia/emulator.h"
+ 
+@@ -24,6 +25,7 @@
+ #include "xenia/base/cvar.h"
+ #include "xenia/base/debugging.h"
+ #include "xenia/base/exception_handler.h"
++#include "xenia/base/filesystem.h"
+ #include "xenia/base/literals.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/mapped_memory.h"
+@@ -102,6 +104,11 @@ DEFINE_bool(
+     "without a dialog, so an external launcher can start the next title.",
+     "General");
+ 
++DEFINE_string(dump_patched_system_modules, "",
++              "Research: \"<base dir>|<patch dir>|<out dir>\": apply the system "
++              "update patches to the Guide's modules and write the images.",
++              "General");
++
+ DEFINE_bool(load_guide_module, false,
+             "Research: also load and link hud.xex (the Guide) when launching a "
+             "dashboard, without running it.",
+@@ -642,6 +649,13 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
+     result = kernel_state_->FinishLoadingUserModule(module, false);
+   }
+ 
++  // Research: the system update's delta patches (hud.xexp, ...) are only
++  // applied to the running title by Xenia; apply them to the Guide's modules
++  // too and write the images, unpatched and patched, for resource extraction.
++  if (!cvars::dump_patched_system_modules.empty()) {
++    DumpPatchedSystemModules(cvars::dump_patched_system_modules);
++  }
++
+   // Research: link the Guide (hud.xex) next to the dashboard to see what it
+   // needs from the system. Its DllMain is not run.
+   if (cvars::load_guide_module) {
+@@ -658,6 +672,74 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
+   return result;
+ }
+ 
++void Emulator::DumpPatchedSystemModules(const std::string& spec) {
++  // spec: "<dir with the base .xex files>|<dir with the .xexp patches>|<out>"
++  std::vector<std::string> parts;
++  std::stringstream stream(spec);
++  for (std::string part; std::getline(stream, part, '|');) {
++    parts.push_back(part);
++  }
++  if (parts.size() != 3) {
++    XELOGE("dump_patched_system_modules: expected base|patch|out");
++    return;
++  }
++  auto read = [](const std::filesystem::path& path) {
++    std::vector<uint8_t> data;
++    if (FILE* file = xe::filesystem::OpenFile(path, "rb")) {
++      fseek(file, 0, SEEK_END);
++      data.resize(ftell(file));
++      fseek(file, 0, SEEK_SET);
++      fread(data.data(), 1, data.size(), file);
++      fclose(file);
++    }
++    return data;
++  };
++  auto dump = [&](const std::string& name, xe::cpu::XexModule* xex) {
++    auto path = std::filesystem::path(parts[2]) / name;
++    if (FILE* file = xe::filesystem::OpenFile(path, "wb")) {
++      fwrite(memory_->TranslateVirtual(xex->base_address()), 1,
++             xex->image_size(), file);
++      fclose(file);
++      XELOGI("dump_patched_system_modules: {} ({:08X}+{:X})",
++             xe::path_to_utf8(path), xex->base_address(), xex->image_size());
++    }
++  };
++  for (const char* name :
++       {"hud", "huduiskin", "xam", "minimediaplayer", "signin"}) {
++    auto base_data = read(std::filesystem::path(parts[0]) /
++                          (std::string(name) + ".xex"));
++    auto patch_data = read(std::filesystem::path(parts[1]) /
++                           (std::string(name) + ".xexp"));
++    if (base_data.empty() || patch_data.empty()) {
++      XELOGE("dump_patched_system_modules: {} base or patch missing", name);
++      continue;
++    }
++    auto module = kernel::object_ref<kernel::UserModule>(
++        new kernel::UserModule(kernel_state_.get()));
++    if (XFAILED(module->LoadFromMemoryNamed(std::string(name) + "_research",
++                                            base_data.data(),
++                                            base_data.size()))) {
++      XELOGE("dump_patched_system_modules: {} failed to load", name);
++      continue;
++    }
++    dump(std::string(name) + "_1888.bin", module->xex_module());
++    auto patch = kernel::object_ref<kernel::UserModule>(
++        new kernel::UserModule(kernel_state_.get()));
++    if (XFAILED(patch->LoadFromMemoryNamed(std::string(name) + "_patch",
++                                           patch_data.data(),
++                                           patch_data.size()))) {
++      XELOGE("dump_patched_system_modules: {} patch failed to load", name);
++      continue;
++    }
++    int code = patch->xex_module()->ApplyPatch(module->xex_module());
++    if (code) {
++      XELOGE("dump_patched_system_modules: {} patch failed ({})", name, code);
++      continue;
++    }
++    dump(std::string(name) + "_2858.bin", module->xex_module());
++  }
++}
++
+ X_STATUS Emulator::LaunchDiscImage(const std::filesystem::path& path) {
+   std::string module_path = FindLaunchModule();
+   X_STATUS result = CompleteLaunch(path, module_path);
+diff --git a/src/xenia/emulator.h b/src/xenia/emulator.h
+index f6c94536e..4d88f84af 100644
+--- a/src/xenia/emulator.h
++++ b/src/xenia/emulator.h
+@@ -320,6 +320,9 @@ class Emulator {
+ 
+   std::string FindLaunchModule();
+ 
++  // Research: --dump_patched_system_modules.
++  void DumpPatchedSystemModules(const std::string& spec);
++
+   X_STATUS CompleteLaunch(const std::filesystem::path& path,
+                           const std::string_view module_path);
+ 
+diff --git a/src/xenia/kernel/user_module.cc b/src/xenia/kernel/user_module.cc
+index 24e8aedbe..c490ead66 100644
+--- a/src/xenia/kernel/user_module.cc
++++ b/src/xenia/kernel/user_module.cc
+@@ -1147,6 +1147,12 @@ void UserModule::CalculateHash() {
+     return UINT32_MAX;
+   };
+ 
++  if (find_code_section_page(true) == UINT32_MAX) {
++    // Resource-only module (e.g. huduiskin.xex): no code to hash.
++    hash_ = 0;
++    return;
++  }
++
+   const uint32_t start_address =
+       xex_module()->base_address() + (find_code_section_page(true) * page_size);
+   const uint32_t end_address =
+-- 
+2.55.0.windows.3
+

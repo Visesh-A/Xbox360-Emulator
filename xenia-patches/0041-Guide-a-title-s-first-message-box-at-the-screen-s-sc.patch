@@ -1,0 +1,43 @@
+From 1cb924dfefa6e523ab881b4547f9597df64daa03 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 22:40:08 +0530
+Subject: [PATCH 41/51] Guide: a title's first message box at the screen's
+ scale
+
+ShowTitleMessageBox took the size from the last Guide frame drawn. When a
+title's box (e.g. the dash's "Delete Item") is the first thing the Guide
+shows, there was none yet, so the box was composed at the 2x image scale
+and minified by the GPU: harder, aliased text unlike every other screen.
+It now uses the console frame height Draw uses (720 x resolution scale).
+Tested: that box is now pixel-identical to the same box shown after the
+Guide had been opened once.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/xenia/app/guide_overlay.cc | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 1fae4cfd4..2310ff550 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -2171,8 +2171,14 @@ bool GuideOverlay::ShowTitleMessageBox(const kernel::xam::TitleMessageBox& box,
+     }
+   }
+   // Composed at the Guide's image scale, then shrunk to the screen like the
+-  // other images (the last size the Guide was drawn at, if any).
+-  float ppu = display_h_ > 0 ? display_h_ / layout_.canvas_h : layout_.scale;
++  // other images: the last size the Guide was drawn at or, before it has
++  // been on screen, the console frame's (720 lines times the resolution
++  // scale, what Draw uses), so the box is one texel per pixel like the rest.
++  float frame_h =
++      display_h_ > 0
++          ? float(display_h_)
++          : 720.0f * float(std::max(1, cvars::draw_resolution_scale_y));
++  float ppu = frame_h / layout_.canvas_h;
+   std::map<std::string, Pixels> images;
+   for (int focus = 0; focus < buttons; ++focus) {
+     Pixels pixels;
+-- 
+2.55.0.windows.3
+

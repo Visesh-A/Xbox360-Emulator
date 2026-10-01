@@ -1,0 +1,189 @@
+From aa870e1ebac407dc4b32ca748d11fc1aa315ee15 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 20:36:41 +0530
+Subject: [PATCH 01/51] Dashboard disc tray + launch handoff; guide research
+ hooks
+
+---
+ src/xenia/emulator.cc            | 48 ++++++++++++++++++++++++++++++++
+ src/xenia/kernel/kernel_state.cc |  9 ++++++
+ src/xenia/kernel/xam/xam_info.cc | 40 ++++++++++++++++++++++++++
+ 3 files changed, 97 insertions(+)
+
+diff --git a/src/xenia/emulator.cc b/src/xenia/emulator.cc
+index 523b3fadd..090a8308c 100644
+--- a/src/xenia/emulator.cc
++++ b/src/xenia/emulator.cc
+@@ -88,6 +88,25 @@ DECLARE_int32(user_language);
+ 
+ DECLARE_bool(allow_plugins);
+ 
++DEFINE_path(
++    dashboard_disc, "",
++    "Disc image to leave in the DVD drive (\\Device\\Cdrom0, tray closed) when "
++    "launching an .xex such as a dashboard, so it can show and launch the "
++    "disc. Leave blank for an empty tray.",
++    "General");
++
++DEFINE_bool(
++    dashboard_handoff, false,
++    "When a title asks to launch another title or to return to the dashboard, "
++    "write the request to dashboard_launch.txt next to the executable and exit "
++    "without a dialog, so an external launcher can start the next title.",
++    "General");
++
++DEFINE_bool(load_guide_module, false,
++            "Research: also load and link hud.xex (the Guide) when launching a "
++            "dashboard, without running it.",
++            "General");
++
+ DEFINE_int32(priority_class, 0,
+              "Forces Xenia to use different process priority than default one. "
+              "It might affect performance and cause unexpected bugs. Possible "
+@@ -576,6 +595,21 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
+   // Get just the filename (foo.xex).
+   auto file_name = path.filename();
+ 
++  // Put a disc in the drive for dashboards. Registered directly instead of
++  // through MountPath, which would repoint game: away from the .xex folder.
++  if (!cvars::dashboard_disc.empty()) {
++    auto disc = CreateVfsDevice(cvars::dashboard_disc, "\\Device\\Cdrom0");
++    if (disc && disc->Initialize() &&
++        file_system_->RegisterDevice(std::move(disc))) {
++      kernel_state_->smc()->SetTrayState(X_DVD_TRAY_STATE::CLOSED);
++      XELOGI("Dashboard disc in drive: {}",
++             xe::path_to_utf8(cvars::dashboard_disc));
++    } else {
++      XELOGE("Unable to put dashboard disc in drive: {}",
++             xe::path_to_utf8(cvars::dashboard_disc));
++    }
++  }
++
+   // Launch the game.
+   auto fs_path = fmt::format("{}\\", kDefaultGameSymbolicLink) +
+                  xe::path_to_utf8(file_name);
+@@ -608,6 +642,19 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
+     result = kernel_state_->FinishLoadingUserModule(module, false);
+   }
+ 
++  // Research: link the Guide (hud.xex) next to the dashboard to see what it
++  // needs from the system. Its DllMain is not run.
++  if (cvars::load_guide_module) {
++    auto hud = kernel_state_->LoadUserModule("hud.xex");
++    if (hud) {
++      kernel_state_->FinishLoadingUserModule(hud, false);
++      XELOGI("Guide module linked at {:08X}, entry {:08X}", hud->hmodule_ptr(),
++             hud->entry_point());
++    } else {
++      XELOGE("Guide module (hud.xex) failed to load");
++    }
++  }
++
+   return result;
+ }
+ 
+@@ -1483,6 +1530,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
+   }
+ 
+   if (!module->is_executable()) {
++    module->Dump();  // headers/imports/exports of the library, for inspection
+     kernel_state_->UnloadUserModule(module, false);
+     XELOGE("Failed to load user module {}", path);
+     return X_STATUS_NOT_SUPPORTED;
+diff --git a/src/xenia/kernel/kernel_state.cc b/src/xenia/kernel/kernel_state.cc
+index 3bbad27be..defdb06b2 100644
+--- a/src/xenia/kernel/kernel_state.cc
++++ b/src/xenia/kernel/kernel_state.cc
+@@ -923,6 +923,15 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
+                                   xam_state()->IsUIActive());
+     listener->EnqueueNotification(kXNotificationSystemSignInChanged, 1);
+   }
++  // A disc that is already in the drive (tray closed at boot) is announced the
++  // same way as one that was just inserted; dashboards only probe the drive
++  // after this notification.
++  if (listener->mask() & kXNotifySystem &&
++      smc()->GetTrayState() == X_DVD_TRAY_STATE::CLOSED) {
++    listener->EnqueueNotification(
++        kXNotificationSystemTrayStateChanged,
++        static_cast<uint8_t>(X_DVD_TRAY_STATE::CLOSED));
++  }
+   if (!has_notified_live_startup_ && listener->mask() & kXNotifyLive) {
+     has_notified_live_startup_ = true;
+     // X_ONLINE_S_LOGON_DISCONNECTED
+diff --git a/src/xenia/kernel/xam/xam_info.cc b/src/xenia/kernel/xam/xam_info.cc
+index 0fd67f63a..42c22a502 100644
+--- a/src/xenia/kernel/xam/xam_info.cc
++++ b/src/xenia/kernel/xam/xam_info.cc
+@@ -7,7 +7,10 @@
+  ******************************************************************************
+  */
+ 
++#include <cstdlib>
++
+ #include "xenia/base/cvar.h"
++#include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/string_util.h"
+ #include "xenia/kernel/kernel_state.h"
+@@ -50,6 +53,7 @@ DECLARE_uint32(audio_flag);
+ DEFINE_bool(staging_mode, 0,
+             "Enables preview mode in dashboards to render debug information.",
+             "Kernel");
++DECLARE_bool(dashboard_handoff);
+ 
+ namespace xe {
+ namespace kernel {
+@@ -376,7 +380,24 @@ dword_result_t XamLoaderGetLaunchData_entry(lpvoid_t buffer_ptr,
+ }
+ DECLARE_XAM_EXPORT1(XamLoaderGetLaunchData, kNone, kSketchy);
+ 
++// Hands the launch request to an external launcher: the guest path of the next
++// title (empty = back to the dashboard) goes into dashboard_launch.txt, then
++// Xenia exits. Does not return.
++[[noreturn]] static void HandOffLaunch(const std::string& launch_path) {
++  XELOGI("Launch handoff: \"{}\"", launch_path);
++  if (FILE* file = xe::filesystem::OpenFile("dashboard_launch.txt", "wb")) {
++    fwrite(launch_path.data(), 1, launch_path.size(), file);
++    fclose(file);
++  }
++  xe::ShutdownLogging();  // flushes the log before the hard exit
++  std::quick_exit(0);
++}
++
+ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
++  if (cvars::dashboard_handoff) {
++    HandOffLaunch(raw_name_ptr ? xe::path_to_utf8(raw_name_ptr.value()) : "");
++  }
++
+   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+ 
+   auto& loader_data = xam->loader_data();
+@@ -408,6 +429,25 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
+ }
+ DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
+ 
++// Used by the dashboard to start a disc, e.g.
++// ("\Device\Cdrom0\default.xex", "\Device\Cdrom0", cmdline, flags).
++void XamLoaderLaunchTitleEx_entry(lpstring_t launch_path, lpstring_t mount_path,
++                                  lpstring_t cmd_line, dword_t flags) {
++  const std::string path =
++      launch_path ? xe::path_to_utf8(launch_path.value()) : "";
++  XELOGI("XamLoaderLaunchTitleEx(\"{}\", \"{}\", \"{}\", {:08X})", path,
++         mount_path ? xe::path_to_utf8(mount_path.value()) : "",
++         cmd_line ? xe::path_to_utf8(cmd_line.value()) : "",
++         static_cast<uint32_t>(flags));
++
++  if (cvars::dashboard_handoff) {
++    // The dashboard's disc tile passes no path: boot whatever is in the drive.
++    HandOffLaunch(path.empty() ? "\\Device\\Cdrom0\\default.xex" : path);
++  }
++  XamLoaderLaunchTitle_entry(launch_path, flags);
++}
++DECLARE_XAM_EXPORT1(XamLoaderLaunchTitleEx, kNone, kSketchy);
++
+ void XamLoaderTerminateTitle_entry() {
+   // This function does not return.
+   kernel_state()->TerminateTitle();
+-- 
+2.55.0.windows.3
+

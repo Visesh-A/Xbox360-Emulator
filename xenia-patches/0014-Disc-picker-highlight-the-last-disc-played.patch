@@ -1,0 +1,57 @@
+From a29d29de482f80d4d0ceb96fab8d9e41d1455f50 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 13:54:07 +0530
+Subject: [PATCH 14/51] Disc picker: highlight the last disc played
+
+Closing the tray with a disc records it in last_disc.txt (replacing
+dvd_drive.txt); the picker highlights it when the tray is empty.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/disc_picker.cc | 9 +++++++++
+ src/xenia/emulator.cc        | 7 +++++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/xenia/app/disc_picker.cc b/src/xenia/app/disc_picker.cc
+index c0368ca02..0e00a6545 100644
+--- a/src/xenia/app/disc_picker.cc
++++ b/src/xenia/app/disc_picker.cc
+@@ -99,7 +99,16 @@ void DiscPicker::Run() {
+     }
+   }
+   std::sort(st.discs.begin() + 1, st.discs.end());
++  // Highlight the disc in the tray, else the last one played.
+   auto in_tray = emulator_->tray_disc();
++  if (in_tray.empty()) {
++    if (FILE* file = xe::filesystem::OpenFile("last_disc.txt", "rb")) {
++      char buf[1024];
++      size_t n = fread(buf, 1, sizeof(buf), file);
++      fclose(file);
++      in_tray = xe::to_path(std::string_view(buf, n));
++    }
++  }
+   int selected = 0;
+   for (size_t i = 1; i < st.discs.size(); ++i) {
+     if (st.discs[i] == in_tray) selected = int(i);
+diff --git a/src/xenia/emulator.cc b/src/xenia/emulator.cc
+index 149b3c097..6b9006e37 100644
+--- a/src/xenia/emulator.cc
++++ b/src/xenia/emulator.cc
+@@ -426,8 +426,11 @@ void Emulator::CloseTray() {
+     XELOGI("DVD tray closed with {}",
+            disc_path_.empty() ? std::string("no disc")
+                               : xe::path_to_utf8(disc_path_));
+-    // Remembered like a disc left in a switched-off console.
+-    if (FILE* file = xe::filesystem::OpenFile("dvd_drive.txt", "wb")) {
++    // The last disc played, highlighted next time the disc picker opens.
++    FILE* file = disc_path_.empty()
++                     ? nullptr
++                     : xe::filesystem::OpenFile("last_disc.txt", "wb");
++    if (file) {
+       std::string p = xe::path_to_utf8(disc_path_);
+       fwrite(p.data(), 1, p.size(), file);
+       fclose(file);
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,402 @@
+From 3a896035ff907402a0f58f45ec645cc18343d49b Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 10:32:40 +0530
+Subject: [PATCH 23/51] Guide: xam's keyframe easing; AddXboxLive's Back and
+ box hand-offs
+
+- Easing: xam turns a key's EaseIn/EaseOut/EaseScale into a cubic Bezier
+  (8191E1A0: control points (scale, 0) turned by (1 - in) pi/4 and
+  (1, 1) - (scale, 0) turned by (1 - out) pi/4) and uses its y at the
+  linear progress (8190EA40). This replaces the quadratic stand-ins for
+  every Guide slide (EaseIn 100 / EaseOut 100 / both at scale 50).
+- AddXboxLive: each step's work is done when its status ends (its task
+  completing). B (90103980 -> 90102CE8) does nothing while the profile is
+  created, after that cancels and goes back to Save Gamer Profile
+  (hudbkgnd HalfToFull, 75-119, with that page's legends moving in); a
+  cancelled sign-in is done again on the next pass.
+- Box hand-offs from createprofile's box callback (90102040, run from the
+  HUD's box close 818D5A18): Test Connection -> Exit Session replaces the
+  box in place (the HUD stays in Error); Cancel/No -> ErrorToFull.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 167 +++++++++++++++++++++++----------
+ src/xenia/app/guide_overlay.h  |  19 +++-
+ 2 files changed, 135 insertions(+), 51 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 38733101a..b6c4e242b 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -9,6 +9,7 @@
+ #include "xenia/app/guide_overlay.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstdlib>
+ #include <ctime>
+ #include <fstream>
+@@ -74,13 +75,25 @@ constexpr auto kRepeatRate = std::chrono::milliseconds(150);
+ constexpr float kLegendSlide = 730.0f;
+ 
+ float Clamp01(float v) { return std::min(1.0f, std::max(0.0f, v)); }
+-// XUI keyframe easing (Interpolation 2) at full strength, approximated as
+-// quadratic: EaseIn = slow start, EaseOut = slow end.
+-float EaseIn(float u) { return u * u; }
+-float EaseOut(float u) { return 1.0f - (1.0f - u) * (1.0f - u); }
+-// Keys with EaseIn and EaseOut both 100: slow start and slow end. XUI's exact
+-// curve is not in the files; smoothstep, as the asset renderer uses.
+-float EaseInOut(float u) { return u * u * (3.0f - 2.0f * u); }
++// XUI keyframe easing (Interpolation 2), as xam computes it: the key's
++// EaseIn / EaseOut / EaseScale (signed bytes) give a cubic Bezier from 0 to 1
++// whose control points are (EaseScale/100, 0) turned by (1 - EaseIn/100) pi/4
++// and (1, 1) - (EaseScale/100, 0) turned by (1 - EaseOut/100) pi/4
++// (8191E1A0); the timeline then uses only its y at the linear progress u
++// (8190EA40): 3 P1 (1-u)^2 u + 3 P2 (1-u) u^2 + u^3.
++float XuiEase(float u, float ease_in, float ease_out, float ease_scale) {
++  constexpr float kQuarterPi = 0.78539816f;
++  const float s = ease_scale * 0.01f;
++  const float p1 = s * std::sin((1.0f - ease_in * 0.01f) * kQuarterPi);
++  const float p2 = 1.0f - s * std::sin((1.0f - ease_out * 0.01f) * kQuarterPi);
++  const float v = 1.0f - u;
++  return 3.0f * p1 * v * v * u + 3.0f * p2 * v * u * u + u * u * u;
++}
++// hudbkgnd's keys: EaseIn 100 (slow start), EaseOut 100 (slow end), or both,
++// always with EaseScale 50.
++float EaseIn(float u) { return XuiEase(u, 100.0f, 0.0f, 50.0f); }
++float EaseOut(float u) { return XuiEase(u, 0.0f, 100.0f, 50.0f); }
++float EaseInOut(float u) { return XuiEase(u, 100.0f, 100.0f, 50.0f); }
+ }  // namespace
+ 
+ // Lives while the Guide is on screen; the ImGui drawer calls OnDraw each frame.
+@@ -716,9 +729,8 @@ void GuideOverlay::Back() {
+     return;
+   }
+   if (page_ == Page::kAddXboxLive) {
+-    // AddXboxLive's backButton (90102530 cancels a pending request); its
+-    // steps here finish at once, so there is nothing to cancel.
+-    XELOGI("Guide: B on AddXboxLive");
++    lock.unlock();
++    AddXboxLiveBack();
+     return;
+   }
+   if (page_ == Page::kKeyboard) {
+@@ -836,6 +848,10 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+   if (transition_ == Transition::kFullToHalf && transition_frames >= 43.0f) {
+     transition_ = Transition::kNone;
+   }
++  // HalfToFull is hudbkgnd frames 75-119 (the page is shown fully at 119)
++  if (transition_ == Transition::kHalfToFull && transition_frames >= 44.0f) {
++    transition_ = Transition::kNone;
++  }
+   if (transition_ != Transition::kNone &&
+       transition_frames >= 2 * layout_.slide_frames) {
+     transition_ = Transition::kNone;
+@@ -955,7 +971,8 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+   }
+   if (!axl_spin_.empty()) {
+     for (const char* name :
+-         {"axl_page", "axl_legends_a", "axl_legends_b", "axl_legends_xy"}) {
++         {"axl_page", "axl_legends_a", "axl_legends_b", "axl_legends_xy",
++          "save_legends_a", "save_legends_b", "save_legends_xy"}) {
+       names.push_back(name);
+     }
+     for (size_t t = 0; t < axl_spin_.size(); ++t) {
+@@ -1066,6 +1083,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   const float clock_distance = clock_x + 270.0f;
+   float chrome_x = 0, legend_x = 0, clock_dx = 0;  // canvas units
+   float full_to_half = -1;  // FullToHalf progress (eased), -1 if none
++  float half_to_full = -1;  // HalfToFull progress (eased), -1 if none
+   float content_alpha = 1, legend_alpha = 1, clock_alpha = 1;
+   float dim_amount = 1;  // of layout_.dim
+   bool content_visible = true;
+@@ -1105,7 +1123,15 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     case Mode::kOpen: {
+       const float f = l.slide_frames;
+       const float t = view.transition_frames;
+-      if (view.transition == Transition::kFullToHalf) {
++      if (view.transition == Transition::kHalfToFull) {
++        // hudbkgnd HalfToFull: the half page hides at once (75), the frame,
++        // clock and A/B legends move to their full positions (75-102,
++        // EaseIn/EaseOut 100), then the full page fades in (102-119).
++        float slide = EaseInOut(Clamp01(t / 27.0f));
++        half_to_full = slide;
++        content_alpha = Clamp01((t - 27.0f) / 17.0f);
++        clock_dx = -415.0f * (1.0f - slide);  // 402 -> 817
++      } else if (view.transition == Transition::kFullToHalf) {
+         // hudbkgnd FullToHalf: the page hides at once (120), the frame,
+         // clock and A/B legends move to their half positions (120-145,
+         // EaseIn/EaseOut 100), then the new page fades in (146-163).
+@@ -1295,6 +1321,8 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   if (full_to_half >= 0.0f && full_to_half < 1.0f) {
+     // base 12 -> -397, blade 991 -> 583.5 (the half frame from then on)
+     layer("chrome_full", -409.0f * full_to_half, 1.0f);
++  } else if (half_to_full >= 0.0f && content_alpha < 1.0f) {
++    layer("chrome_full", -409.0f * (1.0f - half_to_full), 1.0f);
+   } else if (!(page_ready && content_alpha >= 1.0f)) {
+     layer(full ? "chrome_full" : "chrome", chrome_x, 1.0f);
+   }
+@@ -1327,6 +1355,12 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     layer("axl_legends_a", legend_x + 435.0f * move, legend_alpha);  // 589->154
+     layer("axl_legends_b", legend_x + 432.0f * move, legend_alpha);  // 572->140
+     layer("axl_legends_xy", legend_x, legend_alpha);
++  } else if (half_to_full >= 0.0f && content_alpha < 1.0f) {
++    // Save Gamer Profile's own, moving in (its page image has them once in)
++    float move = 1.0f - half_to_full;
++    layer("save_legends_a", legend_x - 435.0f * move, legend_alpha);
++    layer("save_legends_b", legend_x - 432.0f * move, legend_alpha);
++    layer("save_legends_xy", legend_x, legend_alpha);
+   } else if (!profile_page) {  // the profile pages' images carry their legends
+     layer(full ? "legends_upsell" : "legends_menu", legend_x, legend_alpha);
+   }
+@@ -1888,6 +1922,8 @@ bool GuideOverlay::ShowCreateProfile(uint32_t user_index) {
+     create_profile_active_ = true;
+     create_user_index_ = user_index;
+     created_xuid_ = 0;
++    axl_signed_in_ = false;
++    axl_status_key_.clear();
+     profile_box_done_ = nullptr;
+     profile_box_next_.reset();
+     save_focus_ = save_default_;
+@@ -2091,7 +2127,7 @@ void GuideOverlay::AnswerProfileBox(int choice) {
+ 
+ void GuideOverlay::ShowProfileBox(const kernel::xam::TitleMessageBox& box,
+                                   Page return_to,
+-                                  std::function<void(int)> done) {
++                                  std::function<void(int)> done, bool slide) {
+   profile_box_done_ = std::move(done);
+   float ppu = scaled_ppu_ > 0 ? scaled_ppu_ : layout_.scale;
+   std::map<std::string, Pixels> images;
+@@ -2116,8 +2152,10 @@ void GuideOverlay::ShowProfileBox(const kernel::xam::TitleMessageBox& box,
+   profile_box_return_ = return_to;
+   page_ = Page::kProfileError;
+   choice_ = std::clamp(int(box.focus), 0, title_buttons_ - 1);
+-  transition_ = Transition::kToError;  // FullToError
+-  transition_start_ = Clock::now();
++  if (slide) {
++    transition_ = Transition::kToError;  // FullToError / HalfToError
++    transition_start_ = Clock::now();
++  }
+ }
+ 
+ // Congratulations (90104124): each button sets what follows (app +0x94:
+@@ -2147,6 +2185,7 @@ constexpr auto kFromErrorTime = std::chrono::milliseconds(967);
+ 
+ void GuideOverlay::SetAddXboxLiveStatus(const char* key) {
+   axl_status_ = profile_strings_[key];
++  axl_status_key_ = key;
+   ++axl_text_version_;
+ }
+ 
+@@ -2158,59 +2197,64 @@ bool GuideOverlay::AddXboxLiveRunning(uint64_t run) {
+ 
+ void GuideOverlay::StartAddXboxLive(const std::string& button) {
+   uint64_t run;
+-  bool created;
++  int first;
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+     axl_button_ = button;
+     run = ++axl_run_;
+-    created = created_xuid_ != 0;
+     page_ = Page::kAddXboxLive;
+     transition_ = Transition::kFullToHalf;
+     transition_start_ = Clock::now();
+     axl_start_ = transition_start_;
+-    // 90103768: a profile saved on an earlier pass (back from a box) goes
+-    // straight to 90103530 -> 90103450, only the picture update left.
+-    SetAddXboxLiveStatus(created ? "st_updating" : "st_creating");
++    // 90103768: a profile saved on an earlier pass goes straight to 90103530,
++    // which signs it in unless it already is, then 90103450 (the picture).
++    if (!created_xuid_) {
++      first = 1;
++      SetAddXboxLiveStatus("st_creating");
++    } else if (!axl_signed_in_) {
++      first = 2;
++      SetAddXboxLiveStatus("st_signing");
++    } else {
++      first = 3;
++      SetAddXboxLiveStatus("st_updating");
++    }
+   }
+   PlaySfx("HUD_close");  // hudbkgnd FullToHalf, frame 120
+-  const auto shown = Clock::now() + kToHalfTime;
+-  if (created) {
+-    Schedule(shown + kStepTime, [this, run]() { AddXboxLiveStep(run, 3); });
+-    return;
+-  }
+-  // The work runs as its status appears (here it takes no time).
+-  if (!CreateProfileStep()) {
+-    EndCreateProfile();
+-    return;
+-  }
+-  Schedule(shown + kStepTime, [this, run]() { AddXboxLiveStep(run, 1); });
++  Schedule(Clock::now() + kToHalfTime + kStepTime,
++           [this, run, first]() { AddXboxLiveStep(run, first); });
+ }
+ 
++// Each step's work is done when its status ends, as the console's task
++// completes (90103688 dispatches the completions), then the next status.
+ void GuideOverlay::AddXboxLiveStep(uint64_t run, int step) {
+   if (!AddXboxLiveRunning(run)) {
+     return;
+   }
+   switch (step) {
+-    case 1: {  // 90103530 -> 90102820: XamUserLogon, "Signing in"
++    case 1: {  // "Creating profile" done (90103530)
++      if (!CreateProfileStep()) {
++        EndCreateProfile();
++        return;
++      }
+       {
+         std::lock_guard<std::mutex> lock(mutex_);
+-        SetAddXboxLiveStatus("st_signing");
++        SetAddXboxLiveStatus("st_signing");  // 90102820: XamUserLogon
+       }
+-      SignInStep();
+       Schedule(Clock::now() + kStepTime,
+                [this, run]() { AddXboxLiveStep(run, 2); });
+       break;
+     }
+-    case 2: {  // 90103450 -> 90103380: the gamer picture, "Updating profile"
++    case 2: {  // "Signing in" done (90103450)
++      SignInStep();
+       {
+         std::lock_guard<std::mutex> lock(mutex_);
+-        SetAddXboxLiveStatus("st_updating");
++        SetAddXboxLiveStatus("st_updating");  // 90103380: the gamer picture
+       }
+       Schedule(Clock::now() + kStepTime,
+                [this, run]() { AddXboxLiveStep(run, 3); });
+       break;
+     }
+-    case 3: {  // 901029F0 and the scene's end (90103880)
++    case 3: {  // "Updating profile" done: 901029F0 and the scene's end
+       std::string button;
+       {
+         std::lock_guard<std::mutex> lock(mutex_);
+@@ -2230,6 +2274,25 @@ void GuideOverlay::AddXboxLiveStep(uint64_t run, int step) {
+   }
+ }
+ 
++void GuideOverlay::AddXboxLiveBack() {
++  // 90103980 -> 90102CE8: nothing while the profile is being created; after
++  // that the pending request is cancelled and the scene goes back to Save
++  // Gamer Profile (hudbkgnd HalfToFull).
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (axl_status_key_ == "st_creating") {
++      return;
++    }
++    ++axl_run_;
++    page_ = Page::kSaveProfile;
++    ++page_version_;
++    transition_ = Transition::kHalfToFull;
++    transition_start_ = Clock::now();
++  }
++  PlaySfx("btn_Back");
++  PlaySfx("HUD_open");  // hudbkgnd HalfToFull, frame 75
++}
++
+ bool GuideOverlay::CreateProfileStep() {
+   std::string name;
+   {
+@@ -2273,6 +2336,8 @@ void GuideOverlay::SignInStep() {
+   }
+   profiles->Login(xuid, slot);
+   XELOGI("Guide: profile {:016X} signed in on controller {}", xuid, user_index);
++  std::lock_guard<std::mutex> lock(mutex_);
++  axl_signed_in_ = true;
+ }
+ 
+ void GuideOverlay::JoinXboxLive(uint64_t run) {
+@@ -2315,17 +2380,23 @@ void GuideOverlay::JoinXboxLive(uint64_t run) {
+           exit.buttons = {profile_strings_["yes"], profile_strings_["no"]};
+           exit.focus = 1;
+           exit.icon = 3;  // flags 3
+-          QueueProfileBox(exit, Page::kAddXboxLive, [this, back](int e) {
+-            if (e != 0) {
+-              back(e);
+-              return;
+-            }
+-            // 90102AD8: the dashboard again with launch data 2 (its network
+-            // test), which is not available here.
+-            XELOGW("Guide: the dashboard's connection test is not available");
+-            EndCreateProfile();
+-          });
+-          DismissMessageBox();
++          // AddXboxLive keeps a box pending (+0x20 = 4), so its box callback
++          // (90102040) keeps the HUD in Error: the new box replaces the old.
++          std::lock_guard<std::mutex> lock(mutex_);
++          ShowProfileBox(
++              exit, Page::kAddXboxLive,
++              [this, back](int e) {
++                if (e != 0) {
++                  back(e);
++                  return;
++                }
++                // 90102AD8: the dashboard again with launch data 2 (its
++                // network test), which is not available here.
++                XELOGW(
++                    "Guide: the dashboard's connection test is not available");
++                EndCreateProfile();
++              },
++              false);
+         });
+       });
+     });
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index d85479921..837078da3 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -92,8 +92,15 @@ class GuideOverlay {
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+-  // kFullToHalf: hudbkgnd FullToHalf (120-163), a full page to a half one.
+-  enum class Transition { kNone, kToError, kFromError, kFullToHalf };
++  // kFullToHalf / kHalfToFull: hudbkgnd FullToHalf (120-163) and HalfToFull
++  // (75-119), between a full page and a half one.
++  enum class Transition {
++    kNone,
++    kToError,
++    kFromError,
++    kFullToHalf,
++    kHalfToFull
++  };
+ 
+   struct Layout {
+     float canvas_w = 1120, canvas_h = 770, scale = 2;
+@@ -282,14 +289,18 @@ class GuideOverlay {
+   void OpenKeyboard(const std::u16string& text);  // mutex_ held
+   // A console message box over the profile pages (FullToError), back to
+   // `return_to` when answered (ErrorToFull). mutex_ held.
++  // `slide` false: in place of the box on screen (the HUD stays in its Error
++  // state, e.g. createprofile's Exit Session after Can't Connect).
+   void ShowProfileBox(const kernel::xam::TitleMessageBox& box, Page return_to,
+-                      std::function<void(int)> done = nullptr);
++                      std::function<void(int)> done = nullptr,
++                      bool slide = true);
+   void AnswerProfileBox(int choice);           // A / B on a profile box
+   void SaveProfilePress();                     // A on Save Gamer Profile
+   // AddXboxLive (createprofile 90103768 on): the half page's steps, each
+   // shown with its status while it runs.
+   void StartAddXboxLive(const std::string& button);
+   void AddXboxLiveStep(uint64_t run, int step);
++  void AddXboxLiveBack();  // B: 90102CE8, back to Save Gamer Profile
+   bool CreateProfileStep();   // "Creating profile"
+   void SignInStep();          // "Signing in"
+   void SetAddXboxLiveStatus(const char* key);  // mutex_ held
+@@ -298,6 +309,8 @@ class GuideOverlay {
+   std::string axl_button_;     // what Save Gamer Profile's A was on
+   uint64_t axl_run_ = 0;       // bumped per AddXboxLive (a stale step stops)
+   std::u16string axl_status_;  // under mutex_
++  std::string axl_status_key_;  // which status (st_creating: B does nothing)
++  bool axl_signed_in_ = false;  // the new profile's sign-in went through
+   std::chrono::steady_clock::time_point axl_start_;  // its wait cursor's t=0
+   MessageBoxItem axl_status_item_;
+   struct SpinFrame {
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,556 @@
+From 384dad079e23d81c092fe105d8e8f2f6bf57d99e Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 21:20:37 +0530
+Subject: [PATCH 38/51] Guide: signed-in menu, Sign Out, profile count, menu
+ actions
+
+The Guide shows hud.xex's MainMenuSignedIn when its controller has a
+profile signed in (hud 91444010). For a profile without an Xbox Live
+account (state 9, 914479E0) that is the gamer card (Mini, with gamerscore,
+achievements and picture drawn at run time), the community bar (heading
+follows the focus, 91450C18; no counts), Private Chat, Personal Settings,
+music and the banner. hud's one-second timer switches menus when the
+sign-in state changes.
+
+Menu actions per hud:
+- Signed out (91449038 / 91449490): Create New Profile closes the Guide,
+  then createprofile. Sign In and X close it, then XamShowSigninUIp (the
+  panes are not built yet).
+- Signed in (914481F8 / 91448570): the gamer card closes the Guide, then
+  gamerprofile. Community and Private Chat go to InfoUpsellLive in the
+  Guide (9144851C), and B comes back. X shows the Sign Out box (Strings 39,
+  41 / 40, focus No). Yes shows Status.xur ("Signing out", XamUserLogon, at
+  least 2 s), then the signed-out menu.
+
+The signed-out menu's labelProfiles ("%d Profiles Found" / "%d Profile
+Found", 91449310) now counts the console's profiles.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/xenia/app/guide_overlay.cc | 321 +++++++++++++++++++++++++++++++--
+ src/xenia/app/guide_overlay.h  |  27 ++-
+ 2 files changed, 335 insertions(+), 13 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 5882d0327..800f34cf7 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -147,6 +147,7 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadGamerProfileLayout();
+   LoadPrefsLayout();
+   LoadViewGamesLayout();
++  LoadSignedInLayout();
+   LoadHudKeys();
+   {
+     std::ifstream in(asset_dir_ / "gamertag.txt");
+@@ -554,6 +555,13 @@ void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float lx,
+     Activate();
+   } else if (pressed & hid::X_INPUT_GAMEPAD_B) {
+     Back();
++  } else if (pressed & hid::X_INPUT_GAMEPAD_X) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    if (page_ == Page::kMenu && transition_ == Transition::kNone &&
++        mode_ == Mode::kOpen) {
++      lock.unlock();
++      MenuPress(true);
++    }
+   } else if (pressed & hid::X_INPUT_GAMEPAD_Y) {
+     std::unique_lock<std::mutex> lock(mutex_);
+     if (GpKey(page_) && transition_ == Transition::kNone) {
+@@ -584,6 +592,8 @@ void GuideOverlay::Open(Page page) {
+     page_ = page;
+     focus_ = 0;
+     choice_ = 1;
++    upsell_from_menu_ = false;
++    sign_out_pending_ = false;
+     transition_ = Transition::kNone;
+     anim_start_ = Clock::now();
+     if (!blocking_title_input_) {
+@@ -671,10 +681,10 @@ void GuideOverlay::Move(Direction direction) {
+     return;  // a single button / nothing to move to / sliding
+   }
+   if (page_ == Page::kMenu) {
+-    if (focus_ < 0 || focus_ >= int(layout_.menu.size())) {
++    if (focus_ < 0 || focus_ >= int(Menu().size())) {
+       return;
+     }
+-    int next = layout_.menu[focus_].nav[direction];
++    int next = Menu()[focus_].nav[direction];
+     if (next < 0) {
+       return;
+     }
+@@ -747,10 +757,14 @@ void GuideOverlay::Activate() {
+       page == Page::kGamerTag) {
+     return;  // AddXboxLive, GamerTag: no A (its legend is dimmed)
+   }
+-  if (page == Page::kMenu || page == Page::kUpsell) {
++  if (page == Page::kMenu) {
+     lock.unlock();
+-    // Profile screens and joining Xbox Live (no service) are not available.
+-    PlaySfx("btn_Select");
++    MenuPress(false);
++    return;
++  }
++  if (page == Page::kUpsell || page == Page::kSigningOut) {
++    lock.unlock();
++    if (page == Page::kUpsell) PlaySfx("btn_Select");
+     return;
+   }
+   if (page == Page::kKeyboard) {
+@@ -783,6 +797,14 @@ void GuideOverlay::Activate() {
+     DismissMessageBox();
+     return;
+   }
++  if (page == Page::kSignOut) {
++    // Yes, sign out
++    sign_out_pending_ = true;
++    lock.unlock();
++    PlaySfx("btn_Select");
++    DismissMessageBox();
++    return;
++  }
+   lock.unlock();
+   PlaySfx("btn_Select");
+   if (page == Page::kExit) {
+@@ -856,6 +878,21 @@ void GuideOverlay::Back() {
+     BeginClose();
+     return;
+   }
++  if (page_ == Page::kSigningOut) {
++    return;  // Status.xur: no legends
++  }
++  if (page_ == Page::kUpsell && upsell_from_menu_) {
++    // XuiSceneNavigateBack: the menu again (the frame goes FullToHalf)
++    upsell_from_menu_ = false;
++    page_ = Page::kMenu;
++    ++page_version_;
++    transition_ = Transition::kFullToHalf;
++    transition_start_ = Clock::now();
++    lock.unlock();
++    PlaySfx("btn_Back");
++    PlaySfx("HUD_close");  // hudbkgnd FullToHalf, frame 120
++    return;
++  }
+   if (page_ != Page::kMenu && page_ != Page::kUpsell) {
+     // the message box's hidden cancel button (B)
+     lock.unlock();
+@@ -1007,7 +1044,17 @@ bool GuideOverlay::DashboardIsRunning() const {
+ }
+ 
+ GuideOverlay::View GuideOverlay::Snapshot() {
++  const bool signed_in =
++      !layout_.menu_si.empty() &&
++      emulator_->kernel_state()->xam_state()->GetUserProfile(
++          uint32_t(hud_user_)) != nullptr;
+   std::lock_guard<std::mutex> lock(mutex_);
++  if (signed_in != menu_signed_in_) {
++    // hud's timer (91447C90) puts the other menu up when the state changes
++    menu_signed_in_ = signed_in;
++    focus_ = 0;
++    ++page_version_;
++  }
+   auto now = Clock::now();
+   float transition_frames =
+       std::chrono::duration<float>(now - transition_start_).count() *
+@@ -1024,6 +1071,29 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+       }
+     } else if (page_ == Page::kExit || page_ == Page::kTurnOff) {
+       page_ = Page::kMenu;  // the Guide's own boxes: back to its menu
++    } else if (page_ == Page::kSignOut) {
++      if (sign_out_pending_) {
++        // 914441B8: Status.xur; its init (9144F028) signs the profile out
++        // (XamUserLogon) and shows "Signing out" at least 2 s (9144F2E8),
++        // then the signed-out menu takes its place (9144F118).
++        sign_out_pending_ = false;
++        page_ = Page::kSigningOut;
++        const uint32_t user = hud_user_;
++        auto* profiles =
++            emulator_->kernel_state()->xam_state()->profile_manager();
++        if (user < 4) profiles->Logout(uint8_t(user));
++        XELOGI("Guide: signed out controller {}", user);
++        Schedule(Clock::now() + std::chrono::milliseconds(2000), [this]() {
++          std::lock_guard<std::mutex> lock(mutex_);
++          if (page_ == Page::kSigningOut) {
++            page_ = Page::kMenu;
++            focus_ = 0;
++            ++page_version_;
++          }
++        });
++      } else {
++        page_ = Page::kMenu;
++      }
+     }
+   }
+   // FullToHalf is hudbkgnd frames 120-163 (the page is shown fully at 163)
+@@ -1047,9 +1117,12 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+             page_ == Page::kProfileError ? profile_box_return_
+             : (page_ == Page::kExit || page_ == Page::kTurnOff) ? Page::kMenu
+                                                                 : page_};
++  view.signed_in = menu_signed_in_;
++  if (page_ == Page::kSignOut) view.base = Page::kMenu;
+   float seconds = std::chrono::duration<float>(now - anim_start_).count();
+   view.frames = seconds * layout_.fps;
+   bool message_box = page_ == Page::kExit || page_ == Page::kTurnOff ||
++                     page_ == Page::kSignOut ||
+                      page_ == Page::kTitleMessage ||
+                      page_ == Page::kProfileError;
+   float open_after = page_ == Page::kUpsell || page_ == Page::kKeyboard ||
+@@ -1166,6 +1239,19 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+     names.insert(names.begin() + std::min<size_t>(7 + i, names.size()),
+                  "menu_" + layout_.menu[i].id);
+   }
++  // the signed-in menu, its legends, Sign Out's box and Status.xur
++  for (size_t i = 0; i < layout_.menu_si.size(); ++i) {
++    names.insert(names.begin() + std::min<size_t>(7 + i, names.size()),
++                 "menusi_" + layout_.menu_si[i].id);
++  }
++  if (!layout_.menu_si.empty()) {
++    for (const char* name :
++         {"menusi_legends_a", "menusi_legends_b", "menusi_legends_xy",
++          "error_signout_yes", "error_signout_no", "status_signout",
++          "status_legends_a", "status_legends_b", "status_legends_xy"}) {
++      names.insert(names.begin() + std::min<size_t>(7, names.size()), name);
++    }
++  }
+   if (prefs_ready_) {
+     for (const char* name :
+          {"gp_spin_left", "gp_spin_left_shade", "gp_spin_right",
+@@ -1286,8 +1372,11 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+                     GpKey(view.base) != nullptr;
+   const bool axl_page = view.base == Page::kAddXboxLive;
+   // Legend layers per page: <prefix>_legends_a / _b / _xy.
+-  auto legend_prefix = [](Page page) -> const char* {
++  const bool signed_in_menu = view.signed_in;
++  auto legend_prefix = [signed_in_menu](Page page) -> const char* {
+     switch (page) {
++      case Page::kSigningOut:
++        return "status";
+       case Page::kAddXboxLive:
+         return "axl";
+       case Page::kGamerTag:
+@@ -1297,7 +1386,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kKeyboard:
+         return "kbd";
+       case Page::kMenu:
+-        return "menu";
++        return signed_in_menu ? "menusi" : "menu";
+       case Page::kUpsell:
+         return "upsell";
+       case Page::kGpCard:
+@@ -1334,6 +1423,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   // whether the half Guide is on screen (it leaves while the box shows).
+   const bool message_box = view.page == Page::kExit ||
+                            view.page == Page::kTurnOff ||
++                           view.page == Page::kSignOut ||
+                            view.page == Page::kTitleMessage ||
+                            view.page == Page::kProfileError;
+   bool half_visible = !message_box;
+@@ -1554,8 +1644,9 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     std::string name =
+         view.page == Page::kTitleMessage || view.page == Page::kProfileError
+             ? "msgbox_title_f" + std::to_string(view.choice)
+-            : std::string(view.page == Page::kExit ? "error_exit"
+-                                                   : "error_off") +
++            : std::string(view.page == Page::kExit      ? "error_exit"
++                          : view.page == Page::kSignOut ? "error_signout"
++                                                        : "error_off") +
+                   (view.choice == 0 ? "_yes" : "_no");
+     layer(name, l.error_x + error_dx, 1.0f);
+     return;
+@@ -1563,11 +1654,16 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   std::string content;
+   if (content_visible) {
+     switch (view.page) {
+-      case Page::kMenu:
+-        if (view.focus >= 0 && view.focus < int(layout_.menu.size())) {
+-          content = "menu_" + layout_.menu[view.focus].id;
++      case Page::kMenu: {
++        const auto& menu = view.signed_in ? layout_.menu_si : layout_.menu;
++        if (view.focus >= 0 && view.focus < int(menu.size())) {
++          content = (view.signed_in ? "menusi_" : "menu_") + menu[view.focus].id;
+         }
+         break;
++      }
++      case Page::kSigningOut:
++        content = "status_signout";
++        break;
+       case Page::kUpsell:
+         content = "upsell_live";
+         break;
+@@ -1650,6 +1746,9 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+         (view.page == Page::kGpGames || view.page == Page::kGpAchs)) {
+       DrawViewGames(k, ox, oy, up, content_alpha);
+     }
++    if (page_ready && content_alpha > 0.0f && view.page == Page::kMenu) {
++      DrawMenuDynamic(k, ox, oy, up, content_alpha, view.signed_in);
++    }
+     if (content == "axl_page" && page_ready && content_alpha > 0.0f) {
+       DrawAddXboxLive(k, ox, oy, up, content_alpha);
+     }
+@@ -4393,6 +4492,204 @@ void GuideOverlay::DrawViewGames(float k, float ox, float oy, float up,
+   }
+ }
+ 
++// -------------------------------------------------------- hud.xex's menus
++
++void GuideOverlay::LoadSignedInLayout() {
++  std::ifstream in(asset_dir_ / "signedin.txt", std::ios::binary);
++  std::string line;
++  std::vector<std::array<std::string, 4>> nav_names;
++  while (std::getline(in, line)) {
++    if (!line.empty() && line.back() == '\r') line.pop_back();
++    std::istringstream ls(line);
++    std::string kind, name;
++    ls >> kind;
++    if (kind == "menusi") {
++      std::array<std::string, 4> nav;
++      ls >> name >> nav[0] >> nav[1] >> nav[2] >> nav[3];
++      layout_.menu_si.push_back({name});
++      nav_names.push_back(nav);
++    } else if (kind == "text") {
++      std::string color;
++      MessageBoxItem item;
++      item.is_text = true;
++      ls >> name >> item.x >> item.y >> item.w >> item.h >> item.size >>
++          item.ascent >> item.line_h >> item.style >> color;
++      item.color = uint32_t(std::stoul(color, nullptr, 16));
++      si_text_[name] = item;
++    } else if (kind == "image") {
++      ls >> name >> si_tile_[0] >> si_tile_[1] >> si_tile_[2] >> si_tile_[3];
++    }
++  }
++  // "up down left right" by name -> by index
++  for (size_t i = 0; i < layout_.menu_si.size(); ++i) {
++    for (int d = 0; d < 4; ++d) {
++      for (size_t j = 0; j < layout_.menu_si.size(); ++j) {
++        if (layout_.menu_si[j].id == nav_names[i][d]) {
++          layout_.menu_si[i].nav[d] = int(j);
++        }
++      }
++    }
++  }
++  std::ifstream strings(asset_dir_ / "signedin_strings.txt", std::ios::binary);
++  while (std::getline(strings, line)) {
++    if (!line.empty() && line.back() == '\r') line.pop_back();
++    std::istringstream ls(line);
++    std::string kind, text;
++    int id;
++    ls >> kind >> id;
++    std::getline(ls >> std::ws, text);
++    if (kind == "str") si_str_[id] = xe::to_utf16(text);
++  }
++  if (layout_.menu_si.empty() || !si_text_.count("profiles")) {
++    XELOGW("Guide: signed-in menu assets missing (signedin.txt)");
++    layout_.menu_si.clear();
++  }
++}
++
++void GuideOverlay::RunAfterClose(std::function<void()> action) {
++  BeginClose();
++  std::thread([this, action = std::move(action)]() {
++    for (int i = 0; i < 100; ++i) {
++      std::this_thread::sleep_for(std::chrono::milliseconds(50));
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (mode_ == Mode::kClosed) break;
++    }
++    action();
++  }).detach();
++}
++
++// A on the menu (and X, its legend): what hud.xex's menus do. Signed out
++// (91449038, then 91449490 once the Guide has closed): Sign In and X ->
++// XamShowSigninUIp(user, 1, 0x10000); Create New Profile -> createprofile.
++// Signed in (914481F8, then 91448570): the gamer card -> gamerprofile; in
++// state 9 (a profile without an Xbox Live account) the community bar and
++// Private Chat -> InfoUpsellLive.xur (9144851C, XuiSceneNavigateForward);
++// X -> the Sign Out box.
++void GuideOverlay::MenuPress(bool x_button) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  const auto& menu = Menu();
++  if (focus_ < 0 || focus_ >= int(menu.size())) return;
++  const std::string item = menu[focus_].id;
++  const bool signed_in = menu_signed_in_;
++  const uint32_t user = hud_user_;
++  lock.unlock();
++  PlaySfx("btn_Select");
++  if (!signed_in) {
++    if (x_button || item == "btnSignIn") {
++      RunAfterClose([this, user]() { ShowSignIn(user); });
++    } else if (item == "btnNewProfile") {
++      RunAfterClose([this, user]() { ShowCreateProfile(user); });
++    }
++    return;
++  }
++  if (x_button) {
++    ShowMessageBox(Page::kSignOut);
++    return;
++  }
++  if (item == "ctlGamerCard") {
++    RunAfterClose([this, user]() { ShowGamerCard(user); });
++  } else if (item == "btnMessages" || item == "btnFriends" ||
++             item == "btnRecentPlayers" || item == "btnQuickChat") {
++    lock.lock();
++    upsell_from_menu_ = true;
++    page_ = Page::kUpsell;
++    ++page_version_;
++    transition_ = Transition::kHalfToFull;  // a full-width scene
++    transition_start_ = Clock::now();
++    lock.unlock();
++    PlaySfx("HUD_open");  // hudbkgnd HalfToFull, frame 75
++  }
++}
++
++// What the menus fill in at run time: signed out, labelProfiles ("%d
++// Profiles Found" / "%d Profile Found", 91449310); signed in, the gamer
++// card's gamerscore, achievements and picture (xam's card control).
++void GuideOverlay::DrawMenuDynamic(float k, float ox, float oy, float up,
++                                   float alpha, bool signed_in) {
++  auto* state = emulator_->kernel_state()->xam_state();
++  std::u16string cred, achievements, profiles;
++  std::vector<uint8_t> tile;
++  uint64_t xuid = 0;
++  if (signed_in) {
++    auto* user = state->GetUserProfile(uint32_t(hud_user_));
++    if (!user) return;
++    xuid = user->xuid();
++    auto* tracker = state->user_tracker();
++    auto value = [&](kernel::xam::UserSettingId id) {
++      auto setting = tracker->GetSetting(user, kernel::kDashboardID, uint32_t(id));
++      if (!setting) return int32_t(0);
++      auto data = setting->get_host_data();
++      if (auto* v = std::get_if<int32_t>(&data)) return *v;
++      if (auto* u = std::get_if<uint32_t>(&data)) return int32_t(*u);
++      return int32_t(0);
++    };
++    cred = xe::to_utf16(std::to_string(
++        value(kernel::xam::UserSettingId::XPROFILE_GAMERCARD_CRED)));
++    achievements = xe::to_utf16(std::to_string(value(
++        kernel::xam::UserSettingId::XPROFILE_GAMERCARD_ACHIEVEMENTS_EARNED)));
++    auto icon = tracker->GetIcon(xuid, 0, kernel::xam::XTileType::kGamerTile, 0);
++    tile.assign(icon.begin(), icon.end());
++  } else {
++    const size_t count = state->profile_manager()->GetAccounts()->size();
++    std::u16string text = si_str_[count == 1 ? 38 : 37];
++    size_t at = text.find(u"%d");
++    if (at != std::u16string::npos) {
++      text.replace(at, 2, xe::to_utf16(std::to_string(count)));
++    }
++    profiles = text;
++  }
++  const std::string key = fmt::format(
++      "{}|{}|{}|{}|{}|{}|{}", signed_in, xe::to_utf8(cred),
++      xe::to_utf8(achievements), xe::to_utf8(profiles), xuid, tile.size(), k);
++  Image& image = images_["menu_dyn"];
++  if (key != menu_dyn_key_ || !image.texture) {
++    Pixels pixels;
++    pixels.width = int(std::ceil(layout_.canvas_w * k));
++    pixels.height = int(std::ceil(layout_.canvas_h * k));
++    pixels.rgba.assign(size_t(pixels.width) * pixels.height * 4, 0);
++    auto text = [&](const char* name, const std::u16string& value) {
++      auto it = si_text_.find(name);
++      if (it != si_text_.end()) RenderText(pixels, it->second, value, k);
++    };
++    if (signed_in) {
++      text("card_cred", cred);
++      text("card_ach", achievements);
++      if (!tile.empty()) {
++        Pixels picture;
++        int channels;
++        if (uint8_t* rgba = stbi_load_from_memory(
++                tile.data(), int(tile.size()), &picture.width,
++                &picture.height, &channels, STBI_rgb_alpha)) {
++          picture.rgba.assign(rgba,
++                              rgba + size_t(picture.width) * picture.height * 4);
++          stbi_image_free(rgba);
++          DrawPictureInto(pixels, picture, si_tile_[0], si_tile_[1],
++                          si_tile_[2], si_tile_[3], k);
++        }
++      }
++    } else {
++      text("profiles", profiles);
++    }
++    image.texture = imgui_drawer_->CreateImGuiTexture(
++        pixels.width, pixels.height, pixels.rgba.data());
++    image.width = pixels.width;
++    image.height = pixels.height;
++    menu_dyn_key_ = key;
++  }
++  auto V = [up](float x, float y) { return ImVec2(x * up, y * up); };
++  ImGui::GetForegroundDrawList()->AddImage(
++      reinterpret_cast<ImTextureID>(image.texture.get()), V(ox, oy),
++      V(ox + image.width, oy + image.height), ImVec2(0, 0), ImVec2(1, 1),
++      IM_COL32(255, 255, 255, int(alpha * 255.0f + 0.5f)));
++}
++
++// signin.xex's panes: not built yet.
++bool GuideOverlay::ShowSignIn(uint32_t user_index) {
++  XELOGW("Guide: sign in (signin.xex) is not built yet (controller {})",
++         user_index);
++  return false;
++}
++
+ // Congratulations' gamerTileImage: the picture (xam's 64x64 PNG, read by
+ // the scene with XamReadTile) drawn into its box.
+ void GuideOverlay::DrawGamerPicture(Pixels& out, int picture, float ppu) {
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 8d60a02ee..644218911 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -117,7 +117,10 @@ class GuideOverlay {
+     kGpGames,
+     kGpAchs,
+     kGpAchDetail,
+-    kGpGsInfo
++    kGpGsInfo,
++    // hud.xex: X "Sign Out"'s message box, then Status.xur ("Signing out")
++    kSignOut,
++    kSigningOut
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+@@ -152,6 +155,7 @@ class GuideOverlay {
+       std::array<int, 4> nav = {-1, -1, -1, -1};
+     };
+     std::vector<MenuItem> menu;
++    std::vector<MenuItem> menu_si;  // MainMenuSignedIn.xur (signedin.txt)
+     // Battery icon (hosted scene's imgBatteryIcon), canvas units.
+     float battery_menu_x = 0, battery_menu_y = 0, battery_size = 32;
+   };
+@@ -166,6 +170,7 @@ class GuideOverlay {
+     Transition transition;
+     float transition_frames;  // since the transition began
+     Page base;  // the page itself, or under a message box, the one below
++    bool signed_in = false;  // the menu is MainMenuSignedIn
+   };
+ 
+   void InputThread();
+@@ -408,6 +413,26 @@ class GuideOverlay {
+   void GpActivate();
+   void GpBack();
+   void EndGamerProfile();
++  // hud.xex's menus: MainMenuSignedOut, or MainMenuSignedIn when the Guide's
++  // controller has a profile signed in (hud 91444010: state 6 / 8 / 9).
++  const std::vector<Layout::MenuItem>& Menu() const {
++    return menu_signed_in_ ? layout_.menu_si : layout_.menu;
++  }
++  void LoadSignedInLayout();
++  void MenuPress(bool x_button);  // A (or X) on the menu
++  void RunAfterClose(std::function<void()> action);
++  void DrawMenuDynamic(float k, float ox, float oy, float up, float alpha,
++                       bool signed_in);
++  // XamShowSigninUIp: signin.xex's panes in the Guide.
++  bool ShowSignIn(uint32_t user_index);
++  std::map<std::string, MessageBoxItem> si_text_;
++  std::array<float, 4> si_tile_ = {};
++  std::map<int, std::u16string> si_str_;
++  std::string menu_dyn_key_;  // what "menu_dyn" holds (UI thread)
++  // Under mutex_:
++  bool menu_signed_in_ = false;
++  bool upsell_from_menu_ = false;  // InfoUpsellLive navigated to from the menu
++  bool sign_out_pending_ = false;  // Sign Out's Yes: Status.xur next
+   // Game Defaults (prefs.txt from make_prefs_assets.py): gamerprofile's
+   // categories (0x901018C8) and their settings and values.
+   struct PrefSetting {
+-- 
+2.55.0.windows.3
+

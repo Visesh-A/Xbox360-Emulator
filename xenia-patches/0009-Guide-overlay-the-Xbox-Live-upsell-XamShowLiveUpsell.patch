@@ -1,0 +1,335 @@
+From 496e79b58fe96f491c337f3ac9bd824ee55ce229 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 15:14:41 +0530
+Subject: [PATCH 09/51] Guide overlay: the Xbox Live upsell
+ (XamShowLiveUpsellUI)
+
+The dashboard's Join Xbox Live and its Xbox Live banner call
+XamShowLiveUpsellUI (undefined in Xenia, so nothing happened). It is a Guide
+page: InfoUpsellLive.xur in the full-width Guide (hudbkgnd.xur ClosedToFull
+/ FullToClosed: chrome and clock slide 1079, the page and legends appear at
+the end, B closes). XamShowLiveSignupUI (Recover Gamertag) now fails cleanly
+(no Xbox Live) instead of being an undefined import.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 91 ++++++++++++++++++++++++----------
+ src/xenia/app/guide_overlay.h  |  7 ++-
+ src/xenia/kernel/xam/xam_ui.cc | 23 +++++++++
+ src/xenia/kernel/xam/xam_ui.h  |  4 ++
+ 4 files changed, 97 insertions(+), 28 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 6982b1793..62858cce0 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -28,6 +28,7 @@
+ #include "xenia/hid/input_system.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/xam/xam_state.h"
++#include "xenia/kernel/xam/xam_ui.h"
+ #include "xenia/ui/imgui_dialog.h"
+ #include "xenia/ui/imgui_drawer.h"
+ #include "xenia/ui/windowed_app_context.h"
+@@ -94,11 +95,17 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+       asset_dir_(xe::filesystem::GetExecutableFolder() / "guide") {
+   LoadLayout();
+   input_thread_ = std::thread([this]() { InputThread(); });
++  // XamShowLiveUpsellUI (the dashboard's Join Xbox Live) is a Guide page.
++  kernel::xam::live_upsell_ui_hook = [this]() {
++    Open(Page::kUpsell);
++    return true;
++  };
+   XELOGI("Blades Guide overlay enabled (assets: {})",
+          xe::path_to_utf8(asset_dir_));
+ }
+ 
+ GuideOverlay::~GuideOverlay() {
++  kernel::xam::live_upsell_ui_hook = nullptr;
+   running_ = false;
+   if (input_thread_.joinable()) {
+     input_thread_.join();
+@@ -130,6 +137,12 @@ void GuideOverlay::LoadLayout() {
+       in >> l.offset_x >> l.offset_y;
+     } else if (key == "dim") {
+       in >> l.dim;
++    } else if (key == "full_slide") {
++      in >> l.full_slide;
++    } else if (key == "full_legend_slide") {
++      in >> l.full_legend_slide;
++    } else if (key == "full_clock_x") {
++      in >> l.full_clock_x;
+     } else if (key == "space") {
+       in >> l.clock_advance[' '];
+     } else if (key == "menu") {
+@@ -392,12 +405,12 @@ void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float lx,
+   }
+ }
+ 
+-void GuideOverlay::Open() {
+-  XELOGI("Guide: open");
++void GuideOverlay::Open(Page page) {
++  XELOGI("Guide: open (page {})", int(page));
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+     mode_ = Mode::kOpening;
+-    page_ = Page::kMenu;
++    page_ = page;
+     focus_ = 0;
+     anim_start_ = Clock::now();
+     if (!blocking_title_input_) {
+@@ -449,6 +462,9 @@ void GuideOverlay::FinishClose() {
+ 
+ void GuideOverlay::Move(Direction direction) {
+   std::lock_guard<std::mutex> lock(mutex_);
++  if (page_ == Page::kUpsell) {
++    return;  // a single button
++  }
+   if (page_ == Page::kMenu) {
+     if (focus_ < 0 || focus_ >= int(layout_.menu.size())) {
+       return;
+@@ -476,9 +492,9 @@ void GuideOverlay::Activate() {
+   std::unique_lock<std::mutex> lock(mutex_);
+   Page page = page_;
+   int choice = choice_;
+-  if (page == Page::kMenu) {
++  if (page == Page::kMenu || page == Page::kUpsell) {
+     lock.unlock();
+-    // Profile screens are not part of this Guide.
++    // Profile screens and joining Xbox Live (no service) are not available.
+     PlaySfx("btn_Select");
+     return;
+   }
+@@ -499,7 +515,7 @@ void GuideOverlay::Activate() {
+ 
+ void GuideOverlay::Back() {
+   std::unique_lock<std::mutex> lock(mutex_);
+-  if (page_ != Page::kMenu) {
++  if (page_ != Page::kMenu && page_ != Page::kUpsell) {
+     page_ = Page::kMenu;
+     lock.unlock();
+     PlaySfx("btn_Back");
+@@ -542,8 +558,10 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+   float seconds =
+       std::chrono::duration<float>(Clock::now() - anim_start_).count();
+   view.frames = seconds * layout_.fps;
+-  if (mode_ == Mode::kOpening &&
+-      view.frames >= layout_.slide_frames + layout_.fade_frames) {
++  float open_after = page_ == Page::kUpsell
++                         ? layout_.slide_frames
++                         : layout_.slide_frames + layout_.fade_frames;
++  if (mode_ == Mode::kOpening && view.frames >= open_after) {
+     mode_ = view.mode = Mode::kOpen;
+   }
+   return view;
+@@ -583,7 +601,8 @@ void ResampleAxis(const std::vector<float>& in, std::vector<float>& out,
+ // Every image the Guide draws, most urgent (first frames of the slide) first.
+ // Besides one menu_<item> image per focusable menu control (layout.txt).
+ const char* const kImages[] = {
+-    "chrome",         "legends_menu",    "clock_atlas",   "battery_1",
++    "chrome",         "legends_menu",    "clock_atlas",   "chrome_full",
++    "upsell_live",    "legends_upsell",  "battery_1",
+     "battery_2",      "battery_3",       "battery_4",     "dialog_exit_no",
+     "dialog_exit_yes", "dialog_off_no",  "dialog_off_yes", "legends_dialog"};
+ 
+@@ -714,8 +733,14 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     XELOGI("Guide: mode {} ({}x{})", int(view.mode), display_w, display_h);
+   }
+ 
+-  float chrome_x = 0, legend_x = 0;  // canvas units
+-  float content_alpha = 1, legend_alpha = 1;
++  const bool full = view.page == Page::kUpsell;
++  const float slide_distance = full ? l.full_slide : l.slide;
++  const float legend_distance = full ? l.full_legend_slide : kLegendSlide;
++  // the clock ends at x 402 (half) / 817 (full) and leaves for -270
++  const float clock_x = full ? l.full_clock_x : l.clock_x;
++  const float clock_distance = clock_x + 270.0f;
++  float chrome_x = 0, legend_x = 0, clock_dx = 0;  // canvas units
++  float content_alpha = 1, legend_alpha = 1, clock_alpha = 1;
+   float dim_amount = 1;  // of layout_.dim
+   bool content_visible = true;
+   switch (view.mode) {
+@@ -723,22 +748,32 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       // hudbkgnd.xur ClosedToHalf: chrome slides in (frames 1-30, eased:
+       // EaseOut 100, fast start and settling into place) while the content
+       // and legends are invisible, then they fade in (30-44).
+-      float slide = EaseOut(Clamp01(view.frames / l.slide_frames));
+-      chrome_x = -l.slide * (1.0f - slide);
++      // ClosedToFull: the chrome and the clock slide in together (164-193);
++      // the page and the legends appear at the end.
++      float progress = Clamp01(view.frames / l.slide_frames);
++      float slide = EaseOut(progress);
++      chrome_x = -slide_distance * (1.0f - slide);
+       dim_amount = slide;
+-      content_alpha = legend_alpha =
+-          Clamp01((view.frames - l.slide_frames) / l.fade_frames);
++      if (full) {
++        content_alpha = legend_alpha = progress >= 1.0f ? 1.0f : 0.0f;
++        clock_dx = -clock_distance * (1.0f - slide);
++      } else {
++        content_alpha = legend_alpha = clock_alpha =
++            Clamp01((view.frames - l.slide_frames) / l.fade_frames);
++      }
+       break;
+     }
+     case Mode::kOpen:
+       break;
+     case Mode::kClosing: {
+-      // HalfToClosed: the hosted scene hides at once, chrome and legends
+-      // slide back out (EaseIn 100: slow start, accelerating away).
++      // HalfToClosed / FullToClosed: the hosted scene hides at once, chrome,
++      // legends and clock slide back out (EaseIn 100: slow start,
++      // accelerating away).
+       float progress = Clamp01(view.frames / l.slide_frames);
+       float slide = EaseIn(progress);
+-      chrome_x = -l.slide * slide;
+-      legend_x = -kLegendSlide * slide;
++      chrome_x = -slide_distance * slide;
++      legend_x = -legend_distance * slide;
++      clock_dx = -clock_distance * slide;
+       dim_amount = 1.0f - slide;
+       content_visible = false;
+       if (progress >= 1.0f) {
+@@ -808,6 +843,9 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kTurnOff:
+         content = std::string("dialog_off") + choice;
+         break;
++      case Page::kUpsell:
++        content = "upsell_live";
++        break;
+     }
+   }
+   // The page images include the chrome (rendered in one pass, like the
+@@ -815,7 +853,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+   // crossfade over the chrome and, fully shown, replaces it.
+   bool page_ready = !content.empty() && Texture(content, k);
+   if (!(page_ready && content_alpha >= 1.0f)) {
+-    layer("chrome", chrome_x, 1.0f);
++    layer(full ? "chrome_full" : "chrome", chrome_x, 1.0f);
+   }
+   if (content_visible) {
+     if (page_ready) {
+@@ -825,7 +863,7 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     // A wireless controller's battery (part of the hosted scene, so it fades
+     // with it); none for a wired one, like the console.
+     int level = battery_level_;
+-    if (level >= 0 && content_alpha > 0.0f) {
++    if (level >= 0 && content_alpha > 0.0f && !full) {
+       std::string name = "battery_" + std::to_string(std::clamp(level, 0, 3) + 1);
+       if (const Image* icon = Texture(name, k)) {
+         bool menu = view.page == Page::kMenu;
+@@ -840,13 +878,14 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       }
+     }
+   }
+-  layer(view.page == Page::kMenu ? "legends_menu" : "legends_dialog", legend_x,
+-        legend_alpha);
++  layer(full ? "legends_upsell"
++             : view.page == Page::kMenu ? "legends_menu" : "legends_dialog",
++        legend_x, legend_alpha);
+ 
+   // Clock (hudbkgnd DateTimeTextId): glyphs rendered with the same font and
+   // metrics as the Guide images, right aligned and vertically centered.
+   const Image* clock_atlas =
+-      legend_alpha > 0.0f ? Texture("clock_atlas", k) : nullptr;
++      clock_alpha > 0.0f ? Texture("clock_atlas", k) : nullptr;
+   if (clock_atlas) {
+     const Image& atlas = *clock_atlas;
+     std::time_t now = std::time(nullptr);
+@@ -867,10 +906,10 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     for (const char* c = text; *c; ++c) {
+       width += l.clock_advance.count(*c) ? l.clock_advance.at(*c) : 0.0f;
+     }
+-    float pen = l.clock_x + l.clock_w - width + legend_x;
++    float pen = clock_x + l.clock_w - width + clock_dx;
+     float baseline = l.clock_y + (l.clock_h - l.clock_line_h) / 2 + l.clock_ascent;
+     float cell_h = l.clock_line_h + 2 * l.clock_pad;
+-    ImU32 tint = IM_COL32(255, 255, 255, int(legend_alpha * 255.0f + 0.5f));
++    ImU32 tint = IM_COL32(255, 255, 255, int(clock_alpha * 255.0f + 0.5f));
+     for (const char* c = text; *c; ++c) {
+       size_t index = l.clock_chars.find(*c);
+       if (index == std::string::npos) {
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 0c143fc92..3bbc4fb9e 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -50,13 +50,16 @@ class GuideOverlay {
+   struct Image;
+ 
+   enum class Mode { kClosed, kOpening, kOpen, kClosing };
+-  enum class Page { kMenu, kExit, kTurnOff };
++  // kUpsell: the Xbox Live upsell (XamShowLiveUpsellUI), a full-width Guide.
++  enum class Page { kMenu, kExit, kTurnOff, kUpsell };
+ 
+   struct Layout {
+     float canvas_w = 1120, canvas_h = 770, scale = 2;
+     float slide = 672, slide_frames = 29, fade_frames = 14, fps = 60;
+     // canvas position on screen (units) and darkening of the screen behind
+     float offset_x = 0, offset_y = 0, dim = 0;
++    // full-width Guide (ClosedToFull / FullToClosed)
++    float full_slide = 1079, full_legend_slide = 1165, full_clock_x = 817;
+     float clock_x = 402, clock_y = 64, clock_w = 170, clock_h = 40;
+     float clock_line_h = 26, clock_ascent = 21, clock_cell = 40, clock_pad = 6;
+     std::string clock_chars;
+@@ -86,7 +89,7 @@ class GuideOverlay {
+   void InputThread();
+   void OnButtons(uint16_t pressed, uint16_t held, float lx, float ly,
+                  std::chrono::steady_clock::time_point now);
+-  void Open();
++  void Open(Page page = Page::kMenu);
+   void BeginClose();
+   void Activate();  // A
+   void Back();      // B
+diff --git a/src/xenia/kernel/xam/xam_ui.cc b/src/xenia/kernel/xam/xam_ui.cc
+index 50d4cc698..e3eefa82f 100644
+--- a/src/xenia/kernel/xam/xam_ui.cc
++++ b/src/xenia/kernel/xam/xam_ui.cc
+@@ -394,6 +394,29 @@ dword_result_t XamIsUIActive_entry() {
+ }
+ DECLARE_XAM_EXPORT2(XamIsUIActive, kUI, kImplemented, kHighFrequency);
+ 
++std::function<bool()> live_upsell_ui_hook;
++
++// The Guide's Xbox Live upsell ("Join Xbox Live", InfoUpsellLive.xur). The
++// blades dashboard calls it from Join Xbox Live and its Xbox Live banner and
++// ignores the result.
++dword_result_t XamShowLiveUpsellUI_entry(dword_t user_index, dword_t flags) {
++  if (live_upsell_ui_hook && live_upsell_ui_hook()) {
++    return X_ERROR_SUCCESS;
++  }
++  return X_ERROR_FUNCTION_FAILED;
++}
++DECLARE_XAM_EXPORT1(XamShowLiveUpsellUI, kUI, kSketchy);
++
++// Xbox Live account sign-up / gamertag recovery: needs the Xbox Live service,
++// which is not emulated. (Defined so callers get a failure rather than an
++// undefined import; the dashboard's Recover Gamertag ignores the result.)
++dword_result_t XamShowLiveSignupUI_entry(dword_t user_index, dword_t flags) {
++  XELOGI("XamShowLiveSignupUI({}, {:X}): Xbox Live is not available",
++         uint32_t(user_index), uint32_t(flags));
++  return X_ERROR_FUNCTION_FAILED;
++}
++DECLARE_XAM_EXPORT1(XamShowLiveSignupUI, kUI, kStub);
++
+ // https://www.se7ensins.com/forums/threads/working-xshowmessageboxui.844116/
+ dword_result_t XamShowMessageBoxUI_entry(
+     dword_t user_index, lpu16string_t title_ptr, lpu16string_t text_ptr,
+diff --git a/src/xenia/kernel/xam/xam_ui.h b/src/xenia/kernel/xam/xam_ui.h
+index 4716826e3..74ab3695a 100644
+--- a/src/xenia/kernel/xam/xam_ui.h
++++ b/src/xenia/kernel/xam/xam_ui.h
+@@ -18,6 +18,10 @@ namespace xe {
+ namespace kernel {
+ namespace xam {
+ 
++// Shows the Xbox Live upsell (XamShowLiveUpsellUI) when the host has a UI for
++// it (the Blades Guide overlay); returns whether it did.
++extern std::function<bool()> live_upsell_ui_hook;
++
+ class XamDialog : public xe::ui::ImGuiDialog {
+  public:
+   void set_close_callback(std::function<void()> close_callback) {
+-- 
+2.55.0.windows.3
+

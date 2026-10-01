@@ -1,0 +1,250 @@
+From 0d18efffe27208ae654ed414112151b1c2f15552 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 11:49:35 +0530
+Subject: [PATCH 25/51] Create profile: createprofile's first scene and the
+ keyboard's frame changes
+
+From the code: createprofile starts with CreateGamerProfile.xur (90105388,
+mode 0; GamerTagScene), a half-width scene that shows only its legends and,
+once on screen, checks the storage device and shows vk's keyboard (full
+width). The HUD adopts each HUD scene's width and legends as it transitions
+in (xam 818D4F88: 818D4C10 legends, 818D4C78 state). So:
+- the Guide opens half width with that scene (ClosedToHalf), then the frame
+  widens for the keyboard (HalfToFull, its A/B legends moving in);
+- Back on Save Gamer Profile returns to that scene (FullToHalf) and it shows
+  the keyboard again (HalfToFull) with the name;
+- keyboard -> Save Gamer Profile stays full width (unchanged).
+Also the name error box has the error icon (XamShowMessageBox flags 1).
+The Save Gamer Profile panel timelines are one frame long, so their
+instant change was already right.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 95 +++++++++++++++++++++++++++-------
+ src/xenia/app/guide_overlay.h  |  8 ++-
+ 2 files changed, 83 insertions(+), 20 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index be85d97ed..0999c6a12 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -605,7 +605,7 @@ void GuideOverlay::FinishClose() {
+ void GuideOverlay::Move(Direction direction) {
+   std::lock_guard<std::mutex> lock(mutex_);
+   if (page_ == Page::kUpsell || page_ == Page::kAddXboxLive ||
+-      transition_ != Transition::kNone) {
++      page_ == Page::kGamerTag || transition_ != Transition::kNone) {
+     return;  // a single button / nothing to move to / sliding
+   }
+   if (page_ == Page::kMenu) {
+@@ -676,8 +676,9 @@ void GuideOverlay::Activate() {
+   std::unique_lock<std::mutex> lock(mutex_);
+   Page page = page_;
+   int choice = choice_;
+-  if (transition_ != Transition::kNone || page == Page::kAddXboxLive) {
+-    return;  // AddXboxLive: no A (its legend is dimmed)
++  if (transition_ != Transition::kNone || page == Page::kAddXboxLive ||
++      page == Page::kGamerTag) {
++    return;  // AddXboxLive, GamerTag: no A (its legend is dimmed)
+   }
+   if (page == Page::kMenu || page == Page::kUpsell) {
+     lock.unlock();
+@@ -742,13 +743,21 @@ void GuideOverlay::Back() {
+     return;
+   }
+   if (page_ == Page::kSaveProfile) {
+-    // Back_Functionality: createprofile opens the keyboard again with the
+-    // name as its default text
+-    OpenKeyboard(kbd_text_);
++    // Back_Functionality: back to CreateGamerProfile.xur (half width: the
++    // frame goes FullToHalf), which opens the keyboard again with the name
++    // (GamerTagScene's transition, 90106A80 -> 901068A0).
++    page_ = Page::kGamerTag;
++    ++page_version_;
++    transition_ = Transition::kFullToHalf;
++    transition_start_ = Clock::now();
+     lock.unlock();
+     PlaySfx("btn_Back");
++    PlaySfx("HUD_close");  // hudbkgnd FullToHalf, frame 120
+     return;
+   }
++  if (page_ == Page::kGamerTag) {
++    return;  // on screen only until the keyboard opens
++  }
+   if (page_ == Page::kProfileError) {
+     lock.unlock();
+     PlaySfx("btn_Back");
+@@ -848,6 +857,10 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+   // FullToHalf is hudbkgnd frames 120-163 (the page is shown fully at 163)
+   if (transition_ == Transition::kFullToHalf && transition_frames >= 43.0f) {
+     transition_ = Transition::kNone;
++    if (page_ == Page::kGamerTag) {
++      ShowKeyboardFromGamerTag();
++      transition_frames = 0;
++    }
+   }
+   // HalfToFull is hudbkgnd frames 75-119 (the page is shown fully at 119)
+   if (transition_ == Transition::kHalfToFull && transition_frames >= 44.0f) {
+@@ -871,6 +884,12 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+                          : layout_.slide_frames + layout_.fade_frames;
+   if (mode_ == Mode::kOpening && view.frames >= open_after) {
+     mode_ = view.mode = Mode::kOpen;
++    if (page_ == Page::kGamerTag) {
++      ShowKeyboardFromGamerTag();
++      view.page = view.base = page_;
++      view.transition = transition_;
++      view.transition_frames = 0;
++    }
+   }
+   return view;
+ }
+@@ -974,7 +993,9 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+   if (!axl_spin_.empty()) {
+     for (const char* name :
+          {"axl_page", "axl_legends_a", "axl_legends_b", "axl_legends_xy",
+-          "save_legends_a", "save_legends_b", "save_legends_xy"}) {
++          "save_legends_a", "save_legends_b", "save_legends_xy",
++          "gts_legends_a", "gts_legends_b", "gts_legends_xy",
++          "kbd_legends_a", "kbd_legends_b", "kbd_legends_xy"}) {
+       names.push_back(name);
+     }
+     for (size_t t = 0; t < axl_spin_.size(); ++t) {
+@@ -1078,6 +1099,23 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+                     view.base == Page::kKeyboard ||
+                     view.base == Page::kSaveProfile;
+   const bool axl_page = view.base == Page::kAddXboxLive;
++  // Legend layers per page: <prefix>_legends_a / _b / _xy.
++  auto legend_prefix = [](Page page) -> const char* {
++    switch (page) {
++      case Page::kAddXboxLive:
++        return "axl";
++      case Page::kGamerTag:
++        return "gts";
++      case Page::kSaveProfile:
++        return "save";
++      case Page::kKeyboard:
++        return "kbd";
++      default:
++        return nullptr;
++    }
++  };
++  const char* legends = legend_prefix(view.base);
++  const bool half_page = axl_page || view.base == Page::kGamerTag;
+   const float slide_distance = full ? l.full_slide : l.slide;
+   const float legend_distance = full ? l.full_legend_slide : kLegendSlide;
+   // the clock ends at x 402 (half) / 817 (full) and leaves for -270
+@@ -1398,17 +1436,22 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       }
+     }
+   }
+-  if (axl_page) {
+-    float move = full_to_half >= 0.0f ? 1.0f - full_to_half : 0.0f;
+-    layer("axl_legends_a", legend_x + 435.0f * move, legend_alpha);  // 589->154
+-    layer("axl_legends_b", legend_x + 432.0f * move, legend_alpha);  // 572->140
+-    layer("axl_legends_xy", legend_x, legend_alpha);
+-  } else if (half_to_full >= 0.0f && content_alpha < 1.0f) {
+-    // Save Gamer Profile's own, moving in (its page image has them once in)
+-    float move = 1.0f - half_to_full;
+-    layer("save_legends_a", legend_x - 435.0f * move, legend_alpha);
+-    layer("save_legends_b", legend_x - 432.0f * move, legend_alpha);
+-    layer("save_legends_xy", legend_x, legend_alpha);
++  if (legends && (half_page || (half_to_full >= 0.0f && content_alpha < 1.0f))) {
++    // The half pages' legends, and a full page's while HalfToFull brings them
++    // in (its page image has them once it is shown). A and B move between
++    // their half and full places (A 154 / 589, B 140 / 572), X and Y stay.
++    float a = 0.0f, b = 0.0f;
++    if (full_to_half >= 0.0f) {
++      a = 435.0f * (1.0f - full_to_half);
++      b = 432.0f * (1.0f - full_to_half);
++    } else if (half_to_full >= 0.0f) {
++      a = -435.0f * (1.0f - half_to_full);
++      b = -432.0f * (1.0f - half_to_full);
++    }
++    std::string p = legends;
++    layer(p + "_legends_a", legend_x + a, legend_alpha);
++    layer(p + "_legends_b", legend_x + b, legend_alpha);
++    layer(p + "_legends_xy", legend_x, legend_alpha);
+   } else if (!profile_page) {  // the profile pages' images carry their legends
+     layer(full ? "legends_upsell" : "legends_menu", legend_x, legend_alpha);
+   }
+@@ -1985,6 +2028,9 @@ bool GuideOverlay::ShowCreateProfile(uint32_t user_index) {
+     profile_box_next_.reset();
+     save_focus_ = save_default_;
+     OpenKeyboard(default_name);
++    // createprofile starts with CreateGamerProfile.xur (90105388, mode 0),
++    // a half-width scene; the keyboard comes once it is on screen.
++    page_ = Page::kGamerTag;
+   }
+   // Prepared for the screen's size; if the Guide has not been drawn yet, the
+   // first frame does it (Draw).
+@@ -2001,7 +2047,7 @@ bool GuideOverlay::ShowCreateProfile(uint32_t user_index) {
+   emulator_->kernel_state()->BroadcastNotification(
+       xe::kXNotificationSystemUI, true);
+   XELOGI("Guide: create profile");
+-  Open(Page::kKeyboard);
++  Open(Page::kGamerTag);
+   return true;
+ }
+ 
+@@ -2019,6 +2065,16 @@ void GuideOverlay::EndCreateProfile() {
+   }).detach();
+ }
+ 
++void GuideOverlay::ShowKeyboardFromGamerTag() {
++  // GamerTagScene (90106A80, on its transition) checks the storage device
++  // (90106450; the hard drive: nothing to show) and shows vk's keyboard
++  // (901068A0), a full-width scene: the frame goes HalfToFull.
++  OpenKeyboard(kbd_text_);
++  transition_ = Transition::kHalfToFull;
++  transition_start_ = Clock::now();
++  PlaySfx("HUD_open");  // hudbkgnd HalfToFull, frame 75
++}
++
+ void GuideOverlay::OpenKeyboard(const std::u16string& text) {
+   // createprofile 901068A0 passes the name (or the default one) with VKBD
+   // flags 0x20000004; vk 917EF6E8 highlights it (XuiEditSetTextFormatInfo,
+@@ -2147,6 +2203,7 @@ void GuideOverlay::KeyboardSubmit() {
+     box.title = profile_strings_["title"];
+     box.text = error;
+     box.buttons = {profile_strings_["ok"]};
++    box.icon = 1;  // XamShowMessageBox flags 1 (90109254)
+     ShowProfileBox(box, Page::kKeyboard);
+     // behind the box: the keyboard opened again with what was typed
+     OpenKeyboard(kbd_text_);
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 76a46c77f..f0981840a 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -79,6 +79,10 @@ class GuideOverlay {
+   // kProfileError: a name the console rejects, in the ErrorHUD.
+   // kAddXboxLive: createprofile's AddXboxLive.xur, a half-width page with a
+   // wait cursor and a status line while the profile is saved.
++  // kGamerTag: createprofile's first scene (CreateGamerProfile.xur,
++  // GamerTagScene): half width, nothing shown but its legends; it opens the
++  // keyboard once it is on screen and again when Save Gamer Profile goes
++  // back to it.
+   enum class Page {
+     kMenu,
+     kExit,
+@@ -88,7 +92,8 @@ class GuideOverlay {
+     kKeyboard,
+     kSaveProfile,
+     kProfileError,
+-    kAddXboxLive
++    kAddXboxLive,
++    kGamerTag
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+@@ -287,6 +292,7 @@ class GuideOverlay {
+   void KeyboardSubmit();                       // Done (mutex_ held)
+   // The keyboard (again) with `text` as vk's highlighted default text.
+   void OpenKeyboard(const std::u16string& text);  // mutex_ held
++  void ShowKeyboardFromGamerTag();                // mutex_ held
+   // A console message box over the profile pages (FullToError), back to
+   // `return_to` when answered (ErrorToFull). mutex_ held.
+   // `slide` false: in place of the box on screen (the HUD stays in its Error
+-- 
+2.55.0.windows.3
+

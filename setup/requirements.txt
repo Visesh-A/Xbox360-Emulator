@@ -1,0 +1,8 @@
+# Python packages for the Guide asset scripts (exact versions: the images are
+# then byte-identical to the reference setup)
+skia-python==144.0.post2
+numpy==2.5.3
+opencv-python-headless==5.0.0.93
+pillow==12.3.0
+capstone==5.0.9
+fonttools==4.66.0

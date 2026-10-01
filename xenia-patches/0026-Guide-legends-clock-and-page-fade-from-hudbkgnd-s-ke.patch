@@ -1,0 +1,136 @@
+From ddf5efcad4ee806904a15d41e512cdceb6712805 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 12:06:13 +0530
+Subject: [PATCH 26/51] Guide: legends, clock and page fade from hudbkgnd's
+ keyframes
+
+The legends no longer vanish with Save Gamer Profile / the keyboard when
+the Guide closes or a message box comes: every page's legends are layers
+(A, B and X+Y apart) placed each frame by hudbkgnd's Legend_A/B/X
+keyframes, since they move differently (full Guide: A -1165, B -1156,
+X/Y -730; half: -730 / -724 / -730). The clock (DateTimeTextId) and the
+hosted page's fade (AppHostElementId, e.g. 31-44 in ClosedToHalf) come
+from their keyframes too. The Guide's own Exit / Turn Off boxes count the
+menu as the page below them. Menu and upsell legend layers are prepared
+first so they show on the first open.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 65 ++++++++++++++++++++++------------
+ 1 file changed, 43 insertions(+), 22 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 0999c6a12..b72d9248a 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -872,7 +872,9 @@ GuideOverlay::View GuideOverlay::Snapshot() {
+   }
+   View view{mode_, page_, focus_, choice_, 0.0f, transition_,
+             transition_frames,
+-            page_ == Page::kProfileError ? profile_box_return_ : page_};
++            page_ == Page::kProfileError ? profile_box_return_
++            : (page_ == Page::kExit || page_ == Page::kTurnOff) ? Page::kMenu
++                                                                : page_};
+   float seconds = std::chrono::duration<float>(now - anim_start_).count();
+   view.frames = seconds * layout_.fps;
+   bool message_box = page_ == Page::kExit || page_ == Page::kTurnOff ||
+@@ -929,8 +931,9 @@ void ResampleAxis(const std::vector<float>& in, std::vector<float>& out,
+ // Besides one menu_<item> image per focusable menu control (layout.txt).
+ const char* const kImages[] = {
+     "hud_base",       "hud_blade",       "clock_atlas",   "hud_rol",
+-    "legends_menu",
+-    "upsell_live",    "legends_upsell",  "battery_1",
++    "menu_legends_a", "menu_legends_b",  "menu_legends_xy",
++    "upsell_live",    "upsell_legends_a", "upsell_legends_b",
++    "upsell_legends_xy",                 "battery_1",
+     "battery_2",      "battery_3",       "battery_4",     "error_exit_no",
+     "error_exit_yes", "error_off_no",    "error_off_yes"};
+ 
+@@ -987,7 +990,7 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+   // in on the first frames (half or full Guide), then the menu images.
+   std::vector<std::string> names(std::begin(kImages), std::end(kImages));
+   for (size_t i = 0; i < layout_.menu.size(); ++i) {
+-    names.insert(names.begin() + std::min<size_t>(5 + i, names.size()),
++    names.insert(names.begin() + std::min<size_t>(7 + i, names.size()),
+                  "menu_" + layout_.menu[i].id);
+   }
+   if (!axl_spin_.empty()) {
+@@ -1110,6 +1113,10 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+         return "save";
+       case Page::kKeyboard:
+         return "kbd";
++      case Page::kMenu:
++        return "menu";
++      case Page::kUpsell:
++        return "upsell";
+       default:
+         return nullptr;
+     }
+@@ -1284,6 +1291,17 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     default:
+       break;
+   }
++  // The hosted page, the clock: shown and faded as hudbkgnd's
++  // AppHostElementId and DateTimeTextId keyframes say.
++  if (!message_box) {
++    HudState app = HudAt("AppHostElementId", hud_f);
++    content_alpha = app.show ? app.opacity : 0.0f;
++  }
++  {
++    HudState clock = HudAt("DateTimeTextId", hud_f);
++    clock_dx = clock.x - clock_x;
++    clock_alpha = half_visible && clock.show ? clock.opacity : 0.0f;
++  }
+ 
+   // The 1120x770 Guide canvas is drawn into the console's frame (720 lines
+   // for the 720p output, times Xenia's resolution scale) where the console
+@@ -1436,24 +1454,27 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       }
+     }
+   }
+-  if (legends && (half_page || (half_to_full >= 0.0f && content_alpha < 1.0f))) {
+-    // The half pages' legends, and a full page's while HalfToFull brings them
+-    // in (its page image has them once it is shown). A and B move between
+-    // their half and full places (A 154 / 589, B 140 / 572), X and Y stay.
+-    float a = 0.0f, b = 0.0f;
+-    if (full_to_half >= 0.0f) {
+-      a = 435.0f * (1.0f - full_to_half);
+-      b = 432.0f * (1.0f - full_to_half);
+-    } else if (half_to_full >= 0.0f) {
+-      a = -435.0f * (1.0f - half_to_full);
+-      b = -432.0f * (1.0f - half_to_full);
+-    }
+-    std::string p = legends;
+-    layer(p + "_legends_a", legend_x + a, legend_alpha);
+-    layer(p + "_legends_b", legend_x + b, legend_alpha);
+-    layer(p + "_legends_xy", legend_x, legend_alpha);
+-  } else if (!profile_page) {  // the profile pages' images carry their legends
+-    layer(full ? "legends_upsell" : "legends_menu", legend_x, legend_alpha);
++  if (legends && (!profile_page || !(page_ready && content_alpha >= 1.0f))) {
++    // The legends, each where hudbkgnd's keyframes put it (A: half 154 /
++    // full 589, B: 140 / 572, X and Y: 164 / 180 in both; they leave by
++    // different distances). A full profile page's image has its legends,
++    // so its layers are drawn only while that image is not on screen.
++    // The layers show them where they rest in their page's Guide.
++    struct Part {
++      const char* id;
++      const char* suffix;
++      float half_x, full_x;
++    };
++    static const Part kParts[] = {{"Legend_A", "_legends_a", 154.0f, 589.0f},
++                                  {"Legend_B", "_legends_b", 140.0f, 572.0f},
++                                  {"Legend_X", "_legends_xy", 164.0f, 164.0f}};
++    const std::string p = legends;
++    for (const Part& part : kParts) {
++      HudState st = HudAt(part.id, hud_f);
++      if (!st.show || st.opacity <= 0.0f) continue;
++      layer(p + part.suffix, st.x - (full ? part.full_x : part.half_x),
++            st.opacity);
++    }
+   }
+   // The keyboard's caret (skin visual XuiCaret: shown 30 of every 60 frames)
+   // after the name's text up to the cursor.
+-- 
+2.55.0.windows.3
+

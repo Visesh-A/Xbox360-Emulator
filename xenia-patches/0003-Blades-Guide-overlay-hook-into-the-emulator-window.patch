@@ -1,0 +1,91 @@
+From 08bb7d15c557b04feb857dc8bf1984521d6d8757 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 23:50:09 +0530
+Subject: [PATCH 03/51] Blades Guide overlay: hook into the emulator window
+
+--blades_guide creates the GuideOverlay once the emulator is initialized and
+keeps the Guide button from reaching titles (the overlay owns it, like xam on
+the console).
+---
+ src/xenia/app/emulator_window.cc  |  5 +++++
+ src/xenia/app/emulator_window.h   |  3 +++
+ src/xenia/kernel/xam/xam_input.cc | 12 ++++++++++++
+ 3 files changed, 20 insertions(+)
+
+diff --git a/src/xenia/app/emulator_window.cc b/src/xenia/app/emulator_window.cc
+index e49159e69..ad0a0f50b 100644
+--- a/src/xenia/app/emulator_window.cc
++++ b/src/xenia/app/emulator_window.cc
+@@ -275,6 +275,11 @@ void EmulatorWindow::OnEmulatorInitialized() {
+         "controller hotkeys!!!");
+   }
+ 
++  if (GuideOverlay::IsEnabled() && !guide_overlay_) {
++    guide_overlay_ = std::make_unique<GuideOverlay>(
++        emulator_, imgui_drawer_.get(), app_context_);
++  }
++
+   // Create a thread to listen for controller hotkeys.
+   if (cvars::controller_hotkeys) {
+     Gamepad_HotKeys_Listener =
+diff --git a/src/xenia/app/emulator_window.h b/src/xenia/app/emulator_window.h
+index bbc1a7c63..632a43d02 100644
+--- a/src/xenia/app/emulator_window.h
++++ b/src/xenia/app/emulator_window.h
+@@ -13,6 +13,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include "xenia/app/guide_overlay.h"
+ #include "xenia/app/profile_dialogs.h"
+ #include "xenia/emulator.h"
+ #include "xenia/gpu/command_processor.h"
+@@ -301,6 +302,8 @@ class EmulatorWindow {
+   EmulatorWindowListener window_listener_;
+   std::unique_ptr<ui::Window> window_;
+   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
++  // After imgui_drawer_ so it is destroyed first.
++  std::unique_ptr<GuideOverlay> guide_overlay_;
+   std::unique_ptr<DisplayConfigGameConfigLoadCallback>
+       display_config_game_config_load_callback_;
+   // Creation may fail, in this case immediate drawer UI must not be drawn.
+diff --git a/src/xenia/kernel/xam/xam_input.cc b/src/xenia/kernel/xam/xam_input.cc
+index 6179f7e5f..faa799a3d 100644
+--- a/src/xenia/kernel/xam/xam_input.cc
++++ b/src/xenia/kernel/xam/xam_input.cc
+@@ -7,6 +7,7 @@
+  ******************************************************************************
+  */
+ 
++#include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/emulator.h"
+ #include "xenia/hid/input.h"
+@@ -16,6 +17,12 @@
+ #include "xenia/kernel/xam/xam_private.h"
+ #include "xenia/xbox.h"
+ 
++DEFINE_bool(blades_guide, false,
++            "Show the 2006 Xbox Guide overlay on the Guide button (images in "
++            "the 'guide' folder next to the executable). The Guide button is "
++            "then not passed to titles.",
++            "HID");
++
+ namespace xe {
+ namespace kernel {
+ namespace xam {
+@@ -131,6 +138,11 @@ dword_result_t XamInputGetState_entry(dword_t user_index, dword_t flags,
+   }
+ 
+   if (input_state && result == X_ERROR_SUCCESS) {
++    if (cvars::blades_guide) {
++      // The Guide button belongs to the Guide overlay.
++      input_state->gamepad.buttons = static_cast<uint16_t>(
++          input_state->gamepad.buttons & ~hid::X_INPUT_GAMEPAD_GUIDE);
++    }
+     if (auto patch = kernel_state()->xmp_volume_patch()) {
+       patch->OnInputPoll(input_state->packet_number);
+     }
+-- 
+2.55.0.windows.3
+

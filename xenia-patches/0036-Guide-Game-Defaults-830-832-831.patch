@@ -1,0 +1,537 @@
+From 69abde6a8d8364be23f3e36bd30163711992a861 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 20:20:10 +0530
+Subject: [PATCH 36/51] Guide: Game Defaults (830/832/831)
+
+The gamer card's Game Defaults (9010C718) opens 830_GamerPreferences: the
+categories General, Action and Racing (gamerprofile's table at 0x901018C8),
+with the focused one's description in the metapanel. A opens
+832_PreferenceCategory ("%s Defaults"): a label and a spinner
+(PreferenceValueList, btn_spinner, Wrap) per setting. The focused spinner
+shows its arrows, fading in over Focus frames 2-8; left/right change the
+value, with that side's Scrolling glow. A there opens 831_PreferenceSetting
+(901100A8): the setting's values in a 10-row list that scrolls a row at a
+time, with scroll-end arrows and glow, header = the setting, metapanel = its
+description. Choosing a value returns to 832 (901101D8). Values are the
+profile's settings (XamUserReadProfileSettings, unset = 0), written with
+each change.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 359 ++++++++++++++++++++++++++++++++-
+ src/xenia/app/guide_overlay.h  |  37 +++-
+ 2 files changed, 392 insertions(+), 4 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 6ed9df34b..50cb9dc89 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -145,6 +145,7 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadCreateProfileLayout();
+   LoadAddXboxLiveLayout();
+   LoadGamerProfileLayout();
++  LoadPrefsLayout();
+   LoadHudKeys();
+   {
+     std::ifstream in(asset_dir_ / "gamertag.txt");
+@@ -1159,6 +1160,14 @@ void GuideOverlay::PrepareImages(float pixels_per_unit) {
+     names.insert(names.begin() + std::min<size_t>(7 + i, names.size()),
+                  "menu_" + layout_.menu[i].id);
+   }
++  if (prefs_ready_) {
++    for (const char* name :
++         {"gp_spin_left", "gp_spin_left_shade", "gp_spin_right",
++          "gp_spin_right_shade", "gp_scroll_up", "gp_scroll_up_shade",
++          "gp_scroll_down", "gp_scroll_down_shade"}) {
++      names.push_back(name);
++    }
++  }
+   if (!axl_spin_.empty()) {
+     for (const char* name :
+          {"axl_page", "axl_legends_a", "axl_legends_b", "axl_legends_xy",
+@@ -1290,6 +1299,9 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kGpEditPic:
+       case Page::kGpPics:
+       case Page::kGpPersonal:
++      case Page::kGpPrefs:
++      case Page::kGpPrefCat:
++      case Page::kGpPrefSet:
+         return "gp";
+       default:
+         return nullptr;
+@@ -1558,7 +1570,10 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kGpEdit:
+       case Page::kGpEditPic:
+       case Page::kGpPics:
+-      case Page::kGpPersonal: {
++      case Page::kGpPersonal:
++      case Page::kGpPrefs:
++      case Page::kGpPrefCat:
++      case Page::kGpPrefSet: {
+         // Composed from createprofile's page images with the name and the
+         // captions in the console font; again whenever it changes.
+         uint64_t version;
+@@ -1613,6 +1628,10 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+     if (page_ready) {
+       layer(content, 0.0f, content_alpha);
+     }
++    if (page_ready && content_alpha > 0.0f &&
++        (view.page == Page::kGpPrefCat || view.page == Page::kGpPrefSet)) {
++      DrawPrefs(k, ox, oy, up, content_alpha);
++    }
+     if (content == "axl_page" && page_ready && content_alpha > 0.0f) {
+       DrawAddXboxLive(k, ox, oy, up, content_alpha);
+     }
+@@ -2186,6 +2205,22 @@ void GuideOverlay::PrepareCreateProfileImages(float ppu) {
+     names.push_back("gp_cell_normal");
+     names.push_back("gp_cell_focus");
+   }
++  if (prefs_ready_) {
++    for (size_t c = 0; c < prefs_.size(); ++c) {
++      names.push_back("gpprefs_" + std::to_string(c));
++      for (size_t r = 0; r < prefs_[c].settings.size(); ++r) {
++        names.push_back(fmt::format("gpcat_{}_{}", c, r));
++      }
++    }
++    int index = 0;
++    for (const auto& category : prefs_) {
++      for (size_t r = 0; r < category.settings.size(); ++r) {
++        names.push_back("gpset_" + std::to_string(index++));
++      }
++    }
++    names.push_back("gp_prow_normal");
++    names.push_back("gp_prow_focus");
++  }
+   for (auto& b : save_buttons_) names.push_back(b.image);
+   for (auto& [id, key] : kbd_keys_) {
+     if (!key.image.empty()) names.push_back("kbd_focus_" + key.image);
+@@ -3183,6 +3218,12 @@ const char* GuideOverlay::GpKey(Page page) {
+       return "gppics";
+     case Page::kGpPersonal:
+       return "gppers";
++    case Page::kGpPrefs:
++      return "gpprefs";
++    case Page::kGpPrefCat:
++      return "gpcat";
++    case Page::kGpPrefSet:
++      return "gpset";
+     default:
+       return nullptr;
+   }
+@@ -3296,6 +3337,9 @@ void GuideOverlay::GpGoTo(Page page) {
+   if (page == Page::kGpPics || page == Page::kGpPersonal) {
+     gp_cell_ = 0;  // 90117CE0: the list selects its first item
+     gp_focus_.clear();
++  } else if (page == Page::kGpPrefs || page == Page::kGpPrefCat ||
++             page == Page::kGpPrefSet) {
++    gp_focus_.clear();  // their lists (pref_*)
+   } else {
+     gp_focus_ = gp_pages_[GpKey(page)].default_focus;
+   }
+@@ -3303,7 +3347,46 @@ void GuideOverlay::GpGoTo(Page page) {
+ }
+ 
+ void GuideOverlay::GpMove(Direction direction) {
+-  if (page_ == Page::kGpPics || page_ == Page::kGpPersonal) {
++  if (page_ == Page::kGpPrefs) {
++    // GamerPreferencesList: the categories, a list without Wrap
++    const int count = int(prefs_.size());
++    int next = pref_cat_ + (direction == kDown ? 1 : direction == kUp ? -1 : 0);
++    if (next < 0 || next >= count || next == pref_cat_) return;
++    pref_cat_ = next;
++  } else if (page_ == Page::kGpPrefCat) {
++    const int count = int(prefs_[pref_cat_].settings.size());
++    if (direction == kUp || direction == kDown) {
++      // setting<n>Value's NavUp / NavDown, only between the rows shown
++      int next = pref_row_ + (direction == kDown ? 1 : -1);
++      if (next < 0 || next >= count) return;
++      pref_row_ = next;
++      pref_focus_at_ = Clock::now();  // btn_spinner's Focus: arrows fade in
++    } else {
++      // the focused spinner (PreferenceValueList, Wrap): its previous / next
++      // value; the list scrolls that way (its ScrollEnd's Scrolling)
++      const PrefSetting* setting = PrefSettingAt(pref_cat_, pref_row_);
++      if (!setting || setting->values.size() < 2) return;
++      const int n = int(setting->values.size());
++      const int index = (PrefIndex(*setting) + (direction == kRight ? 1 : -1) + n) % n;
++      SetPref(*setting, index);
++      pref_scroll_dir_ = direction == kRight ? 1 : 0;
++      pref_scroll_at_ = Clock::now();
++    }
++  } else if (page_ == Page::kGpPrefSet) {
++    // valueList: no Wrap; it scrolls a row at a time to keep the focus shown
++    const PrefSetting* setting = PrefSettingAt(pref_cat_, pref_row_);
++    if (!setting || (direction != kUp && direction != kDown)) return;
++    const int count = int(setting->values.size());
++    const int visible = std::max(1, int(pref_list_[4]));
++    int next = pref_item_ + (direction == kDown ? 1 : -1);
++    if (next < 0 || next >= count) return;
++    pref_item_ = next;
++    if (pref_item_ < pref_top_ || pref_item_ >= pref_top_ + visible) {
++      pref_top_ = pref_item_ < pref_top_ ? pref_item_ : pref_item_ - visible + 1;
++      pref_scroll_dir_ = direction == kDown ? 1 : 0;
++      pref_scroll_at_ = Clock::now();
++    }
++  } else if (page_ == Page::kGpPics || page_ == Page::kGpPersonal) {
+     // the list's grid, 3 columns of 12 items
+     const int cols = int(gp_cells_[4]), count = int(gp_cells_[5]);
+     int next = gp_cell_;
+@@ -3333,6 +3416,40 @@ void GuideOverlay::GpActivate() {
+   const Page page = page_;
+   const std::string focus = gp_focus_;
+   PlaySfx("btn_Select");
++  if (page == Page::kGpPrefs) {
++    // 9010F8F0: 832_PreferenceCategory.xur for the category; its first row
++    pref_row_ = 0;
++    pref_focus_at_ = Clock::now();
++    GpGoTo(Page::kGpPrefCat);
++    return;
++  }
++  if (page == Page::kGpPrefCat) {
++    // 901100A8: 831_PreferenceSetting.xur with the setting's values, the
++    // current one selected (a text setting, flag 1, would be the keyboard;
++    // none of these is)
++    const PrefSetting* setting = PrefSettingAt(pref_cat_, pref_row_);
++    if (!setting) return;
++    const int visible = std::max(1, int(pref_list_[4]));
++    pref_item_ = PrefIndex(*setting);
++    pref_top_ = std::max(0, pref_item_ - visible + 1);
++    pref_scroll_dir_ = -1;
++    GpGoTo(Page::kGpPrefSet);
++    return;
++  }
++  if (page == Page::kGpPrefSet) {
++    // the chosen value goes back to 832's row (901101D8) and 831 closes
++    if (const PrefSetting* setting = PrefSettingAt(pref_cat_, pref_row_)) {
++      SetPref(*setting, pref_item_);
++    }
++    if (!gp_back_.empty()) {
++      page_ = gp_back_.back().first;
++      gp_focus_ = gp_back_.back().second;
++      gp_back_.pop_back();
++    }
++    pref_focus_at_ = Clock::now();
++    ++page_version_;
++    return;
++  }
+   if (page == Page::kGpCard) {
+     if (focus == "editProfileButton") {
+       GpGoTo(Page::kGpEdit);  // 808_EditProfile.xur
+@@ -3358,7 +3475,13 @@ void GuideOverlay::GpActivate() {
+         ShowLiveSignup(user_index);
+       }).detach();
+     } else {
+-      XELOGW("Guide: gamer card {} is not built yet", focus);
++      if (focus == "gamerPreferencesButton" && prefs_ready_) {
++        // 9010C718: 830_GamerPreferences.xur
++        pref_cat_ = 0;
++        GpGoTo(Page::kGpPrefs);
++      } else {
++        XELOGW("Guide: gamer card {} is not built yet", focus);
++      }
+     }
+     return;
+   }
+@@ -3481,6 +3604,10 @@ void GuideOverlay::DrawPictureInto(Pixels& out, const Pixels& picture, float x,
+ }
+ 
+ bool GuideOverlay::ComposeGamerProfilePage(Page page, float ppu, Pixels& out) {
++  if (page == Page::kGpPrefs || page == Page::kGpPrefCat ||
++      page == Page::kGpPrefSet) {
++    return ComposePrefsPage(page, ppu, out);
++  }
+   std::unique_lock<std::mutex> lock(mutex_);
+   const std::string focus = gp_focus_;
+   const int cell = gp_cell_;
+@@ -3594,6 +3721,232 @@ bool GuideOverlay::ComposeGamerProfilePage(Page page, float ppu, Pixels& out) {
+   return true;
+ }
+ 
++// ------------------------------------------------------------ Game Defaults
++
++void GuideOverlay::LoadPrefsLayout() {
++  std::ifstream in(asset_dir_ / "prefs.txt", std::ios::binary);
++  std::string line;
++  auto rest = [](std::istringstream& ls) {
++    std::string text;
++    std::getline(ls >> std::ws, text);
++    if (!text.empty() && text.back() == '\r') text.pop_back();
++    return Unescape(text);
++  };
++  auto item = [](std::istringstream& ls, MessageBoxItem& it) {
++    std::string color;
++    it.is_text = true;
++    ls >> it.x >> it.y >> it.w >> it.h >> it.size >> it.ascent >> it.line_h >>
++        it.style >> color;
++    it.color = uint32_t(std::stoul(color, nullptr, 16));
++  };
++  while (std::getline(in, line)) {
++    std::istringstream ls(line);
++    std::string kind, which;
++    ls >> kind;
++    if (kind == "rowtext" || kind == "spintext") {
++      ls >> which;
++      item(ls, (kind == "rowtext" ? pref_rowtext_
++                                  : pref_spintext_)[which == "focus"]);
++    } else if (kind == "spin") {
++      int i;
++      ls >> i;
++      if (i >= 0 && i < 8) ls >> pref_spin_[i][0] >> pref_spin_[i][1];
++    } else if (kind == "scroll" || kind == "spinarrow") {
++      ls >> which;
++      float* r = kind == "scroll" ? pref_scroll_[which == "down"]
++                                  : pref_arrow_[which == "right"];
++      ls >> r[0] >> r[1] >> r[2] >> r[3];
++    } else if (kind == "list") {
++      for (float& v : pref_list_) ls >> v;
++    } else if (kind == "cat") {
++      int c;
++      ls >> c;
++      prefs_.push_back({rest(ls), {}});
++    } else if (kind == "setting" && !prefs_.empty()) {
++      int c;
++      std::string id;
++      PrefSetting setting;
++      ls >> c >> id >> setting.flags;
++      setting.id = uint32_t(std::stoul(id, nullptr, 16));
++      setting.name = rest(ls);
++      prefs_.back().settings.push_back(std::move(setting));
++    } else if (kind == "value" && !prefs_.empty() &&
++               !prefs_.back().settings.empty()) {
++      int32_t v;
++      ls >> v;
++      prefs_.back().settings.back().values.push_back({v, rest(ls)});
++    }
++  }
++  prefs_ready_ = prefs_.size() == 3 && pref_list_[4] > 0;
++}
++
++const GuideOverlay::PrefSetting* GuideOverlay::PrefSettingAt(int category,
++                                                             int row) const {
++  if (category < 0 || category >= int(prefs_.size())) return nullptr;
++  const auto& settings = prefs_[category].settings;
++  return row >= 0 && row < int(settings.size()) ? &settings[row] : nullptr;
++}
++
++// The profile's value (XamUserReadProfileSettings; unset = 0, the default),
++// as its place in the setting's list.
++int GuideOverlay::PrefIndex(const PrefSetting& setting) const {
++  int32_t value = 0;
++  auto* state = emulator_->kernel_state()->xam_state();
++  if (auto* user = state->GetUserProfile(gp_xuid_)) {
++    auto current = state->user_tracker()->GetSetting(
++        user, kernel::kDashboardID, setting.id);
++    if (current) {
++      auto data = current->get_host_data();
++      if (auto* v = std::get_if<int32_t>(&data)) value = *v;
++    }
++  }
++  for (size_t i = 0; i < setting.values.size(); ++i) {
++    if (setting.values[i].first == value) return int(i);
++  }
++  return 0;
++}
++
++// XamUserWriteProfileSettings (90115F28) with the value.
++void GuideOverlay::SetPref(const PrefSetting& setting, int index) {
++  if (index < 0 || index >= int(setting.values.size())) return;
++  const kernel::xam::UserSetting value(
++      static_cast<kernel::xam::UserSettingId>(setting.id),
++      setting.values[index].first);
++  emulator_->kernel_state()->xam_state()->user_tracker()->UpsertSetting(
++      gp_xuid_, kernel::kDashboardID, &value);
++  XELOGI("Guide: game default {:08X} = {}", setting.id,
++         setting.values[index].first);
++}
++
++bool GuideOverlay::ComposePrefsPage(Page page, float ppu, Pixels& out) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  const int cat = pref_cat_, row = pref_row_, item = pref_item_,
++            top = pref_top_;
++  lock.unlock();
++  if (cat < 0 || cat >= int(prefs_.size())) return false;
++  std::string base;
++  if (page == Page::kGpPrefs) {
++    base = "gpprefs_" + std::to_string(cat);
++  } else if (page == Page::kGpPrefCat) {
++    base = fmt::format("gpcat_{}_{}", cat, row);
++  } else {
++    int index = row;
++    for (int c = 0; c < cat; ++c) index += int(prefs_[c].settings.size());
++    base = "gpset_" + std::to_string(index);
++  }
++  // the current values, before taking the images' lock
++  std::vector<std::u16string> spin_text;
++  for (const auto& setting : prefs_[cat].settings) {
++    spin_text.push_back(setting.values[PrefIndex(setting)].second);
++  }
++  std::lock_guard<std::mutex> images_lock(prepare_mutex_);
++  if (!scaled_ready_ || scaled_ppu_ != ppu) return false;
++  auto it = scaled_.find(base);
++  if (it == scaled_.end()) return false;
++  out = it->second;
++  const float lx = pref_list_[0], ly = pref_list_[1], rh = pref_list_[3];
++  const int visible = std::max(1, int(pref_list_[4]));
++  // a list row (XuiListItem, visual XuiButton) and its caption
++  auto list_row = [&](float y, bool focused, const std::u16string& text) {
++    auto img = scaled_.find(focused ? "gp_prow_focus" : "gp_prow_normal");
++    if (img != scaled_.end()) {
++      const Pixels& p = img->second;
++      const int ox0 = int(std::lround(lx * ppu));
++      const int oy0 = int(std::lround(y * ppu));
++      for (int yy = 0; yy < p.height; ++yy) {
++        int oy = oy0 + yy;
++        if (oy < 0 || oy >= out.height) continue;
++        for (int xx = 0; xx < p.width; ++xx) {
++          int ox = ox0 + xx;
++          if (ox < 0 || ox >= out.width) continue;
++          const uint8_t* c = &p.rgba[(size_t(yy) * p.width + xx) * 4];
++          BlendPixel(&out.rgba[(size_t(oy) * out.width + ox) * 4],
++                     c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f,
++                     c[3] / 255.0f);
++        }
++      }
++    }
++    MessageBoxItem t = pref_rowtext_[focused];
++    t.x += lx;
++    t.y += y;
++    RenderText(out, t, text, ppu);
++  };
++  if (page == Page::kGpPrefs) {
++    for (int c = 0; c < int(prefs_.size()); ++c) {
++      list_row(ly + c * rh, c == cat, prefs_[c].name);
++    }
++  } else if (page == Page::kGpPrefCat) {
++    // each spinner's value (PreferenceValueList's item text)
++    for (int r = 0; r < int(spin_text.size()) && r < 8; ++r) {
++      MessageBoxItem t = pref_spintext_[r == row];
++      t.x += pref_spin_[r][0];
++      t.y += pref_spin_[r][1];
++      RenderText(out, t, spin_text[r], ppu);
++    }
++  } else if (const PrefSetting* setting = PrefSettingAt(cat, row)) {
++    const int n = int(setting->values.size());
++    for (int i = top; i < n && i < top + visible; ++i) {
++      list_row(ly + (i - top) * rh, i == item, setting->values[i].second);
++    }
++  }
++  return true;
++}
++
++// The lists' XuiScrollEnds: 832's focused spinner shows both arrows (Wrap),
++// fading in over btn_spinner's Focus frames (2-8); 831's list shows an arrow
++// where it can scroll (ScrollMore). Scrolling one way plays that end's
++// Scrolling glow (xhade1: 0 at frame 4, 1 at 14, 0 at 25).
++void GuideOverlay::DrawPrefs(float k, float ox, float oy, float up,
++                             float alpha) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  const Page page = page_;
++  const int cat = pref_cat_, row = pref_row_, top = pref_top_;
++  const auto focus_at = pref_focus_at_, scroll_at = pref_scroll_at_;
++  const int dir = pref_scroll_dir_;
++  lock.unlock();
++  const PrefSetting* setting = PrefSettingAt(cat, row);
++  if (!setting) return;
++  auto V = [up](float x, float y) { return ImVec2(x * up, y * up); };
++  ImDrawList* draw_list = ImGui::GetForegroundDrawList();
++  auto frames = [this](Clock::time_point t) {
++    return std::chrono::duration<float>(Clock::now() - t).count() *
++           layout_.fps;
++  };
++  const float g = frames(scroll_at);
++  const float glow = g < 10.0f   ? g / 10.0f
++                     : g < 21.0f ? 1.0f - (g - 10.0f) / 11.0f
++                                 : 0.0f;
++  auto image = [&](const std::string& name, const float* r, float x, float y,
++                   float a) {
++    if (a <= 0.0f) return;
++    if (const Image* img = Texture(name, k)) {
++      const float x0 = ox + (x + r[0]) * k, y0 = oy + (y + r[1]) * k;
++      draw_list->AddImage(
++          reinterpret_cast<ImTextureID>(img->texture.get()), V(x0, y0),
++          V(x0 + r[2] * k, y0 + r[3] * k), ImVec2(0, 0), ImVec2(1, 1),
++          IM_COL32(255, 255, 255, int(a * alpha * 255.0f + 0.5f)));
++    }
++  };
++  if (page == Page::kGpPrefCat && setting->values.size() > 1 && row < 8) {
++    const float shown = std::clamp(frames(focus_at) / 6.0f, 0.0f, 1.0f);
++    const float sx = pref_spin_[row][0], sy = pref_spin_[row][1];
++    for (int side = 0; side < 2; ++side) {
++      const std::string name = side ? "gp_spin_right" : "gp_spin_left";
++      image(name, pref_arrow_[side], sx, sy, shown);
++      if (dir == side) image(name + "_shade", pref_arrow_[side], sx, sy, glow);
++    }
++  } else if (page == Page::kGpPrefSet) {
++    const int n = int(setting->values.size());
++    const int visible = std::max(1, int(pref_list_[4]));
++    const bool more[2] = {top > 0, top + visible < n};
++    for (int side = 0; side < 2; ++side) {
++      const std::string name = side ? "gp_scroll_down" : "gp_scroll_up";
++      if (more[side]) image(name, pref_scroll_[side], 0, 0, 1.0f);
++      if (dir == side) image(name + "_shade", pref_scroll_[side], 0, 0, glow);
++    }
++  }
++}
++
+ // Congratulations' gamerTileImage: the picture (xam's 64x64 PNG, read by
+ // the scene with XamReadTile) drawn into its box.
+ void GuideOverlay::DrawGamerPicture(Pixels& out, int picture, float ppu) {
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 80e5ed484..8224f135a 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -106,7 +106,12 @@ class GuideOverlay {
+     kGpEdit,
+     kGpEditPic,
+     kGpPics,
+-    kGpPersonal  // ChangePersonalTile.xur
++    kGpPersonal,  // ChangePersonalTile.xur
++    // Game Defaults: 830_GamerPreferences, 832_PreferenceCategory,
++    // 831_PreferenceSetting
++    kGpPrefs,
++    kGpPrefCat,
++    kGpPrefSet
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+@@ -397,6 +402,36 @@ class GuideOverlay {
+   void GpActivate();
+   void GpBack();
+   void EndGamerProfile();
++  // Game Defaults (prefs.txt from make_prefs_assets.py): gamerprofile's
++  // categories (0x901018C8) and their settings and values.
++  struct PrefSetting {
++    uint32_t id = 0;
++    int flags = 0;
++    std::u16string name;
++    std::vector<std::pair<int32_t, std::u16string>> values;
++  };
++  struct PrefCategory {
++    std::u16string name;
++    std::vector<PrefSetting> settings;
++  };
++  std::vector<PrefCategory> prefs_;
++  MessageBoxItem pref_rowtext_[2], pref_spintext_[2];  // normal, focus
++  float pref_spin_[8][2] = {};    // the 832 spinners' origins
++  float pref_scroll_[2][4] = {};  // 831 list scroll ends: up, down
++  float pref_arrow_[2][4] = {};   // spinner arrows from its origin: left, right
++  float pref_list_[5] = {};       // x, y, width, row height, visible rows
++  bool prefs_ready_ = false;
++  void LoadPrefsLayout();
++  const PrefSetting* PrefSettingAt(int category, int row) const;
++  int PrefIndex(const PrefSetting& setting) const;  // current value's index
++  void SetPref(const PrefSetting& setting, int index);
++  bool ComposePrefsPage(Page page, float ppu, Pixels& out);
++  void DrawPrefs(float k, float ox, float oy, float up, float alpha);
++  // Under mutex_:
++  int pref_cat_ = 0, pref_row_ = 0, pref_item_ = 0, pref_top_ = 0;
++  std::chrono::steady_clock::time_point pref_focus_at_;   // 832 row focused
++  std::chrono::steady_clock::time_point pref_scroll_at_;  // a list scrolled
++  int pref_scroll_dir_ = -1;  // 0 up / left, 1 down / right
+   bool ComposeGamerProfilePage(Page page, float ppu, Pixels& out);
+   void DrawPictureInto(Pixels& out, const Pixels& picture, float x, float y,
+                        float w, float h, float ppu);
+-- 
+2.55.0.windows.3
+

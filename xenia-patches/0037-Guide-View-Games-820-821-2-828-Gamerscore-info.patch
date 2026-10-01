@@ -1,0 +1,639 @@
+From fab70871070c74a48092568089e7c3d79e65aa4e Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 20:39:05 +0530
+Subject: [PATCH 37/51] Guide: View Games (820/821-2/828, Gamerscore info)
+
+The gamer card's View Games (9010C6E8) opens 820_GameShowcaseMe ("All
+Games"): the titles played (MeGameList) with icon, name, "%1 of %2
+Achievements" and gamerscore earned, or noGamesText. Y goes to
+GamerscoreMoreInfo.xur (the hidden yButton's PressPath). A opens
+821-2_GameAchievStatsMe for the title (AchievementsList). A row shows the
+name or "Secret", "Unlocked <date>" / "Unlocked" / "Locked", the
+gamerscore or "--", and the picture or unearnedAchievement.png. The header
+is the title, with sortOrderText and "%1 of %2 unlocked". Y re-sorts by date
+(9010EDA8) or by gamerscore (9010EE10), keeping the focus. A opens
+828_AchievDetails (90104B28). Both lists scroll a row at a time with their
+scroll ends.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AFb8CDFE1Ms5NnJH88eG8b
+---
+ src/xenia/app/guide_overlay.cc | 454 ++++++++++++++++++++++++++++++++-
+ src/xenia/app/guide_overlay.h  |  44 +++-
+ 2 files changed, 493 insertions(+), 5 deletions(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 50cb9dc89..5882d0327 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -146,6 +146,7 @@ GuideOverlay::GuideOverlay(Emulator* emulator, ui::ImGuiDrawer* imgui_drawer,
+   LoadAddXboxLiveLayout();
+   LoadGamerProfileLayout();
+   LoadPrefsLayout();
++  LoadViewGamesLayout();
+   LoadHudKeys();
+   {
+     std::ifstream in(asset_dir_ / "gamertag.txt");
+@@ -555,6 +556,11 @@ void GuideOverlay::OnButtons(uint16_t pressed, uint16_t held, float lx,
+     Back();
+   } else if (pressed & hid::X_INPUT_GAMEPAD_Y) {
+     std::unique_lock<std::mutex> lock(mutex_);
++    if (GpKey(page_) && transition_ == Transition::kNone) {
++      lock.unlock();
++      GpY();
++      return;
++    }
+     if (page_ == Page::kMenu) {
+       if (DashboardIsRunning()) {
+         lock.unlock();
+@@ -1302,6 +1308,10 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kGpPrefs:
+       case Page::kGpPrefCat:
+       case Page::kGpPrefSet:
++      case Page::kGpGames:
++      case Page::kGpAchs:
++      case Page::kGpAchDetail:
++      case Page::kGpGsInfo:
+         return "gp";
+       default:
+         return nullptr;
+@@ -1573,7 +1583,11 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+       case Page::kGpPersonal:
+       case Page::kGpPrefs:
+       case Page::kGpPrefCat:
+-      case Page::kGpPrefSet: {
++      case Page::kGpPrefSet:
++      case Page::kGpGames:
++      case Page::kGpAchs:
++      case Page::kGpAchDetail:
++      case Page::kGpGsInfo: {
+         // Composed from createprofile's page images with the name and the
+         // captions in the console font; again whenever it changes.
+         uint64_t version;
+@@ -1632,6 +1646,10 @@ void GuideOverlay::Draw(float display_w, float display_h) {
+         (view.page == Page::kGpPrefCat || view.page == Page::kGpPrefSet)) {
+       DrawPrefs(k, ox, oy, up, content_alpha);
+     }
++    if (page_ready && content_alpha > 0.0f &&
++        (view.page == Page::kGpGames || view.page == Page::kGpAchs)) {
++      DrawViewGames(k, ox, oy, up, content_alpha);
++    }
+     if (content == "axl_page" && page_ready && content_alpha > 0.0f) {
+       DrawAddXboxLive(k, ox, oy, up, content_alpha);
+     }
+@@ -2221,6 +2239,14 @@ void GuideOverlay::PrepareCreateProfileImages(float ppu) {
+     names.push_back("gp_prow_normal");
+     names.push_back("gp_prow_focus");
+   }
++  if (vg_ready_) {
++    for (const char* name :
++         {"gpgames", "gpgames_none", "gpachs", "gpachs_none", "gpachd",
++          "gpgsinfo", "gp_grow_0_normal", "gp_grow_0_focus", "gp_grow_1_normal",
++          "gp_grow_1_focus", "gp_unearned"}) {
++      names.push_back(name);
++    }
++  }
+   for (auto& b : save_buttons_) names.push_back(b.image);
+   for (auto& [id, key] : kbd_keys_) {
+     if (!key.image.empty()) names.push_back("kbd_focus_" + key.image);
+@@ -3224,6 +3250,14 @@ const char* GuideOverlay::GpKey(Page page) {
+       return "gpcat";
+     case Page::kGpPrefSet:
+       return "gpset";
++    case Page::kGpGames:
++      return "gpgames";
++    case Page::kGpAchs:
++      return "gpachs";
++    case Page::kGpAchDetail:
++      return "gpachd";
++    case Page::kGpGsInfo:
++      return "gpgsinfo";
+     default:
+       return nullptr;
+   }
+@@ -3338,7 +3372,9 @@ void GuideOverlay::GpGoTo(Page page) {
+     gp_cell_ = 0;  // 90117CE0: the list selects its first item
+     gp_focus_.clear();
+   } else if (page == Page::kGpPrefs || page == Page::kGpPrefCat ||
+-             page == Page::kGpPrefSet) {
++             page == Page::kGpPrefSet || page == Page::kGpGames ||
++             page == Page::kGpAchs || page == Page::kGpAchDetail ||
++             page == Page::kGpGsInfo) {
+     gp_focus_.clear();  // their lists (pref_*)
+   } else {
+     gp_focus_ = gp_pages_[GpKey(page)].default_focus;
+@@ -3347,7 +3383,25 @@ void GuideOverlay::GpGoTo(Page page) {
+ }
+ 
+ void GuideOverlay::GpMove(Direction direction) {
+-  if (page_ == Page::kGpPrefs) {
++  if (page_ == Page::kGpGames || page_ == Page::kGpAchs) {
++    // MeGameList / AchievementsList: no Wrap, a row at a time
++    const bool games = page_ == Page::kGpGames;
++    int& sel = games ? vg_game_ : vg_ach_;
++    int& top = games ? vg_game_top_ : vg_ach_top_;
++    const int count = games ? int(vg_titles_.size()) : int(vg_achs_.size());
++    const int visible = std::max(1, int(vg_list_[games ? 0 : 1][5]));
++    if (direction != kUp && direction != kDown) return;
++    const int next = sel + (direction == kDown ? 1 : -1);
++    if (next < 0 || next >= count) return;
++    sel = next;
++    if (sel < top || sel >= top + visible) {
++      top = sel < top ? sel : sel - visible + 1;
++      vg_scroll_dir_ = direction == kDown ? 1 : 0;
++      vg_scroll_at_ = Clock::now();
++    }
++  } else if (page_ == Page::kGpAchDetail || page_ == Page::kGpGsInfo) {
++    return;
++  } else if (page_ == Page::kGpPrefs) {
+     // GamerPreferencesList: the categories, a list without Wrap
+     const int count = int(prefs_.size());
+     int next = pref_cat_ + (direction == kDown ? 1 : direction == kUp ? -1 : 0);
+@@ -3415,7 +3469,22 @@ void GuideOverlay::GpActivate() {
+   std::unique_lock<std::mutex> lock(mutex_);
+   const Page page = page_;
+   const std::string focus = gp_focus_;
++  if (page == Page::kGpAchDetail || page == Page::kGpGsInfo ||
++      (page == Page::kGpGames && vg_titles_.empty()) ||
++      (page == Page::kGpAchs && vg_achs_.empty())) {
++    return;  // nothing to select (no A legend / an empty list)
++  }
+   PlaySfx("btn_Select");
++  if (page == Page::kGpGames) {
++    // 9010D8D8: 821-2_GameAchievStatsMe.xur for the title
++    LoadAchievements();
++    GpGoTo(Page::kGpAchs);
++    return;
++  }
++  if (page == Page::kGpAchs) {
++    GpGoTo(Page::kGpAchDetail);  // 828_AchievDetails.xur
++    return;
++  }
+   if (page == Page::kGpPrefs) {
+     // 9010F8F0: 832_PreferenceCategory.xur for the category; its first row
+     pref_row_ = 0;
+@@ -3475,7 +3544,11 @@ void GuideOverlay::GpActivate() {
+         ShowLiveSignup(user_index);
+       }).detach();
+     } else {
+-      if (focus == "gamerPreferencesButton" && prefs_ready_) {
++      if (focus == "viewGamesButton" && vg_ready_) {
++        // 9010C6E8: 820_GameShowcaseMe.xur
++        LoadViewGames();
++        GpGoTo(Page::kGpGames);
++      } else if (focus == "gamerPreferencesButton" && prefs_ready_) {
+         // 9010C718: 830_GamerPreferences.xur
+         pref_cat_ = 0;
+         GpGoTo(Page::kGpPrefs);
+@@ -3608,6 +3681,10 @@ bool GuideOverlay::ComposeGamerProfilePage(Page page, float ppu, Pixels& out) {
+       page == Page::kGpPrefSet) {
+     return ComposePrefsPage(page, ppu, out);
+   }
++  if (page == Page::kGpGames || page == Page::kGpAchs ||
++      page == Page::kGpAchDetail || page == Page::kGpGsInfo) {
++    return ComposeViewGamesPage(page, ppu, out);
++  }
+   std::unique_lock<std::mutex> lock(mutex_);
+   const std::string focus = gp_focus_;
+   const int cell = gp_cell_;
+@@ -3947,6 +4024,375 @@ void GuideOverlay::DrawPrefs(float k, float ox, float oy, float up,
+   }
+ }
+ 
++// --------------------------------------------------------------- View Games
++
++void GuideOverlay::LoadViewGamesLayout() {
++  std::ifstream in(asset_dir_ / "viewgames.txt", std::ios::binary);
++  std::string line;
++  while (std::getline(in, line)) {
++    if (!line.empty() && line.back() == '\r') line.pop_back();
++    std::istringstream ls(line);
++    std::string kind, name;
++    ls >> kind;
++    if (kind == "text") {
++      std::string color;
++      MessageBoxItem item;
++      item.is_text = true;
++      ls >> name >> item.x >> item.y >> item.w >> item.h >> item.size >>
++          item.ascent >> item.line_h >> item.style >> color;
++      item.color = uint32_t(std::stoul(color, nullptr, 16));
++      vg_text_[name] = item;
++    } else if (kind == "image") {
++      std::array<float, 4> r;
++      ls >> name >> r[0] >> r[1] >> r[2] >> r[3];
++      vg_image_[name] = r;
++    } else if (kind == "list") {
++      int v;
++      ls >> v;
++      if (v >= 0 && v < 2) {
++        for (float& f : vg_list_[v]) ls >> f;
++      }
++    } else if (kind == "scroll") {
++      int v;
++      ls >> v >> name;
++      if (v >= 0 && v < 2) {
++        float* r = vg_scroll_[v][name == "down"];
++        ls >> r[0] >> r[1] >> r[2] >> r[3];
++      }
++    } else if (kind == "str") {
++      std::string id, text;
++      ls >> id;
++      std::getline(ls >> std::ws, text);
++      vg_str_[int(std::stoul(id, nullptr, 16))] = Unescape(text);
++    }
++  }
++  vg_ready_ = vg_list_[0][5] > 0 && vg_list_[1][5] > 0 && prefs_ready_ &&
++              vg_text_.count("det_desc");
++}
++
++// XamUserCreateTitlesPlayedEnumerator, as this Xenia's xam gives it: most
++// recently played first, without the dashboard and titles without
++// achievements.
++void GuideOverlay::LoadViewGames() {
++  vg_titles_.clear();
++  vg_game_ = vg_game_top_ = 0;
++  vg_scroll_dir_ = -1;
++  auto* tracker = emulator_->kernel_state()->xam_state()->user_tracker();
++  for (const auto& title : tracker->GetPlayedTitles(gp_xuid_)) {
++    if (title.id == kernel::kDashboardID || !title.achievements_count ||
++        !title.gamerscore_amount) {
++      continue;
++    }
++    VgTitle t;
++    t.id = title.id;
++    t.name = title.title_name;
++    t.earned = title.unlocked_achievements_count;
++    t.total = title.achievements_count;
++    t.gamerscore = title.title_earned_gamerscore;
++    t.icon.assign(title.icon.begin(), title.icon.end());
++    vg_titles_.push_back(std::move(t));
++  }
++}
++
++// XamUserCreateAchievementEnumerator for the title, sorted by date (821's
++// init, 9010F3C0: +0x540 = 0).
++void GuideOverlay::LoadAchievements() {
++  vg_achs_.clear();
++  vg_ach_ = vg_ach_top_ = 0;
++  vg_sort_ = 0;
++  vg_scroll_dir_ = -1;
++  if (vg_game_ < 0 || vg_game_ >= int(vg_titles_.size())) return;
++  auto* tracker = emulator_->kernel_state()->xam_state()->user_tracker();
++  int order = 0;
++  for (const auto& a :
++       tracker->GetUserTitleAchievements(gp_xuid_, vg_titles_[vg_game_].id)) {
++    VgAchievement v;
++    v.id = a.achievement_id;
++    v.gamerscore = a.gamerscore;
++    v.flags = a.flags;
++    v.unlocked_at =
++        (uint64_t(uint32_t(a.unlock_time.high_part)) << 32) |
++        uint32_t(a.unlock_time.low_part);
++    v.name = a.achievement_name;
++    v.description = a.unlocked_description;
++    v.locked_description = a.locked_description;
++    v.order = order++;
++    vg_achs_.push_back(std::move(v));
++  }
++  SortAchievements();
++}
++
++// 821's comparators: by date (9010EDA8): unlocked first, in the enumerator's
++// order, then locked ones by id; by gamerscore (9010EE10): among unlocked
++// ones, and among locked ones shown (flag 8), the higher score first, the
++// rest as by date.
++void GuideOverlay::SortAchievements() {
++  auto unlocked = [](const VgAchievement& a) { return (a.flags & 0x20000) != 0; };
++  auto by_date = [&](const VgAchievement& a, const VgAchievement& b) {
++    if (unlocked(a) != unlocked(b)) return unlocked(a);
++    if (unlocked(a)) return a.order < b.order;
++    return a.id < b.id;
++  };
++  auto by_score = [&](const VgAchievement& a, const VgAchievement& b) {
++    if (a.gamerscore != b.gamerscore) {
++      if (unlocked(a) && unlocked(b)) return a.gamerscore > b.gamerscore;
++      if (!unlocked(a) && !unlocked(b) && (a.flags & 8) && (b.flags & 8)) {
++        return a.gamerscore > b.gamerscore;
++      }
++    }
++    return by_date(a, b);
++  };
++  if (vg_sort_) {
++    std::stable_sort(vg_achs_.begin(), vg_achs_.end(), by_score);
++  } else {
++    std::stable_sort(vg_achs_.begin(), vg_achs_.end(), by_date);
++  }
++}
++
++// Y: 820's hidden yButton (PressPath GamerscoreMoreInfo.xur); 821's
++// (9010F168) changes the sort order, the focus staying on its achievement.
++void GuideOverlay::GpY() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (page_ == Page::kGpGames) {
++    PlaySfx("btn_Select");
++    GpGoTo(Page::kGpGsInfo);
++  } else if (page_ == Page::kGpAchs) {
++    PlaySfx("btn_Select");
++    const uint32_t focused =
++        vg_ach_ < int(vg_achs_.size()) ? vg_achs_[vg_ach_].id : 0;
++    vg_sort_ = vg_sort_ ? 0 : 1;
++    SortAchievements();
++    const int visible = std::max(1, int(vg_list_[1][5]));
++    for (int i = 0; i < int(vg_achs_.size()); ++i) {
++      if (vg_achs_[i].id == focused) vg_ach_ = i;
++    }
++    if (vg_ach_ < vg_ach_top_) vg_ach_top_ = vg_ach_;
++    if (vg_ach_ >= vg_ach_top_ + visible) vg_ach_top_ = vg_ach_ - visible + 1;
++    ++page_version_;
++  }
++}
++
++const GuideOverlay::Pixels* GuideOverlay::VgPicture(
++    const std::string& key, const std::vector<uint8_t>& png) {
++  auto it = vg_pictures_.find(key);
++  if (it == vg_pictures_.end()) {
++    Pixels pixels;
++    int channels;
++    if (!png.empty()) {
++      if (uint8_t* rgba =
++              stbi_load_from_memory(png.data(), int(png.size()), &pixels.width,
++                                    &pixels.height, &channels, STBI_rgb_alpha)) {
++        pixels.rgba.assign(rgba,
++                           rgba + size_t(pixels.width) * pixels.height * 4);
++        stbi_image_free(rgba);
++      }
++    } else if (key == "unearned") {
++      Decode("gp_unearned", pixels);
++    }
++    it = vg_pictures_.emplace(key, std::move(pixels)).first;
++  }
++  return it->second.rgba.empty() ? nullptr : &it->second;
++}
++
++namespace {
++// "%1!u! of %2!u! ..." (XamFormatMessage) with two numbers.
++std::u16string FormatCount(std::u16string text, uint32_t a, uint32_t b) {
++  auto put = [&](const char16_t* key, uint32_t v) {
++    size_t at = text.find(key);
++    if (at != std::u16string::npos) {
++      text.replace(at, 5, xe::to_utf16(std::to_string(v)));
++    }
++  };
++  put(u"%1!u!", a);
++  put(u"%2!u!", b);
++  return text;
++}
++}  // namespace
++
++bool GuideOverlay::ComposeViewGamesPage(Page page, float ppu, Pixels& out) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  const std::vector<VgTitle> titles = vg_titles_;
++  const std::vector<VgAchievement> achs = vg_achs_;
++  const int game = vg_game_, game_top = vg_game_top_, ach = vg_ach_,
++            ach_top = vg_ach_top_, sort = vg_sort_;
++  const uint64_t xuid = gp_xuid_;
++  lock.unlock();
++  const VgTitle* title =
++      game >= 0 && game < int(titles.size()) ? &titles[game] : nullptr;
++  auto unlocked = [](const VgAchievement& a) { return (a.flags & 0x20000) != 0; };
++  auto shown = [&](const VgAchievement& a) { return unlocked(a) || (a.flags & 8); };
++  // the pictures: the title's icon, an achievement's (XamReadImage) or, locked,
++  // sharedres://unearnedAchievement.png
++  auto* tracker = emulator_->kernel_state()->xam_state()->user_tracker();
++  auto ach_picture = [&](const VgAchievement& a) -> const Pixels* {
++    if (!unlocked(a) || !title) return VgPicture("unearned", {});
++    auto icon = tracker->GetAchievementIcon(xuid, title->id, a.id);
++    return VgPicture(fmt::format("a{:08X}_{}", title->id, a.id),
++                     std::vector<uint8_t>(icon.begin(), icon.end()));
++  };
++  std::string base;
++  switch (page) {
++    case Page::kGpGames:
++      base = titles.empty() ? "gpgames_none" : "gpgames";
++      break;
++    case Page::kGpAchs:
++      base = achs.empty() ? "gpachs_none" : "gpachs";
++      break;
++    case Page::kGpAchDetail:
++      base = "gpachd";
++      break;
++    default:
++      base = "gpgsinfo";
++      break;
++  }
++  std::lock_guard<std::mutex> images_lock(prepare_mutex_);
++  if (!scaled_ready_ || scaled_ppu_ != ppu) return false;
++  auto it = scaled_.find(base);
++  if (it == scaled_.end()) return false;
++  out = it->second;
++  auto text = [&](const std::string& name, const std::u16string& value,
++                  float dx = 0, float dy = 0) {
++    auto t = vg_text_.find(name);
++    if (t == vg_text_.end()) return;
++    MessageBoxItem item = t->second;
++    item.x += dx;
++    item.y += dy;
++    RenderText(out, item, value, ppu);
++  };
++  auto picture = [&](const std::string& name, const Pixels* p, float dx = 0,
++                     float dy = 0) {
++    auto r = vg_image_.find(name);
++    if (p && r != vg_image_.end()) {
++      DrawPictureInto(out, *p, r->second[0] + dx, r->second[1] + dy,
++                      r->second[2], r->second[3], ppu);
++    }
++  };
++  // a list row: the item's visual, then its columns
++  auto row = [&](int v, int i, int top, bool focused,
++                 const std::u16string& l1, const std::u16string& l2,
++                 const std::u16string& l3, const Pixels* pic) {
++    const float x = vg_list_[v][0], y = vg_list_[v][1] + (i - top) * vg_list_[v][4];
++    const std::string state = focused ? "focus" : "normal";
++    auto img = scaled_.find(fmt::format("gp_grow_{}_{}", v, state));
++    if (img != scaled_.end()) {
++      const Pixels& p = img->second;
++      const int ox0 = int(std::lround(x * ppu)), oy0 = int(std::lround(y * ppu));
++      for (int yy = 0; yy < p.height; ++yy) {
++        int oy = oy0 + yy;
++        if (oy < 0 || oy >= out.height) continue;
++        for (int xx = 0; xx < p.width; ++xx) {
++          int ox = ox0 + xx;
++          if (ox < 0 || ox >= out.width) continue;
++          const uint8_t* c = &p.rgba[(size_t(yy) * p.width + xx) * 4];
++          BlendPixel(&out.rgba[(size_t(oy) * out.width + ox) * 4],
++                     c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f,
++                     c[3] / 255.0f);
++        }
++      }
++    }
++    const std::string key = fmt::format("row{}_{}_", v, state);
++    text(key + "l1", l1, x, y);
++    text(key + "l2", l2, x, y);
++    text(key + "l3", l3, x, y);
++    picture(key + "img", pic, x, y);
++  };
++  if (page == Page::kGpGames) {
++    const int visible = std::max(1, int(vg_list_[0][5]));
++    for (int i = game_top; i < int(titles.size()) && i < game_top + visible; ++i) {
++      const VgTitle& t = titles[i];
++      row(0, i, game_top, i == game, t.name,
++          FormatCount(vg_str_[0x27], t.earned, t.total),
++          xe::to_utf16(std::to_string(t.gamerscore)),
++          VgPicture(fmt::format("t{:08X}", t.id), t.icon));
++    }
++  } else if (page == Page::kGpAchs) {
++    uint32_t earned = 0;
++    for (const auto& a : achs) earned += unlocked(a) ? 1 : 0;
++    text("ach_header", title ? title->name : u"");
++    text("ach_sort", vg_str_[sort ? 0x44 : 0x45]);
++    text("ach_count", FormatCount(vg_str_[7], earned, uint32_t(achs.size())));
++    const int visible = std::max(1, int(vg_list_[1][5]));
++    for (int i = ach_top; i < int(achs.size()) && i < ach_top + visible; ++i) {
++      const VgAchievement& a = achs[i];
++      std::u16string line2 = vg_str_[6];  // "Locked"
++      if (unlocked(a)) {
++        if (a.unlocked_at) {
++          // XamFormatDateString of the local date
++          const int64_t secs = int64_t(a.unlocked_at / 10000000ull) - 11644473600ll;
++          std::time_t when = std::time_t(secs);
++          std::tm local = {};
++          localtime_s(&local, &when);
++          std::u16string date = xe::to_utf16(fmt::format(
++              "{}/{}/{}", local.tm_mon + 1, local.tm_mday, local.tm_year + 1900));
++          line2 = vg_str_[3];
++          size_t at = line2.find(u"%s");
++          if (at != std::u16string::npos) line2.replace(at, 2, date);
++        } else {
++          line2 = vg_str_[2];
++        }
++      }
++      row(1, i, ach_top, i == ach, shown(a) ? a.name : vg_str_[4], line2,
++          unlocked(a) ? xe::to_utf16(std::to_string(a.gamerscore)) : vg_str_[0x2C],
++          ach_picture(a));
++    }
++  } else if (page == Page::kGpAchDetail && ach >= 0 && ach < int(achs.size())) {
++    // 90104B28
++    const VgAchievement& a = achs[ach];
++    text("det_header", title ? title->name : u"");
++    if (shown(a)) {
++      text("det_title", a.name);
++      text("det_cred", xe::to_utf16(std::to_string(a.gamerscore)));
++      text("det_desc", unlocked(a) ? a.description : a.locked_description);
++    } else {
++      text("det_title", vg_str_[4]);
++      text("det_cred", vg_str_[0x2C]);
++      text("det_desc", vg_str_[5]);
++    }
++    picture("det_image", ach_picture(a));
++  }
++  return true;
++}
++
++// The lists' scroll ends (ScrollMore where they can scroll; the Scrolling
++// glow when they do).
++void GuideOverlay::DrawViewGames(float k, float ox, float oy, float up,
++                                 float alpha) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  const Page page = page_;
++  const bool games = page == Page::kGpGames;
++  const int count = games ? int(vg_titles_.size()) : int(vg_achs_.size());
++  const int top = games ? vg_game_top_ : vg_ach_top_;
++  const auto scroll_at = vg_scroll_at_;
++  const int dir = vg_scroll_dir_;
++  lock.unlock();
++  const int v = games ? 0 : 1;
++  const int visible = std::max(1, int(vg_list_[v][5]));
++  auto V = [up](float x, float y) { return ImVec2(x * up, y * up); };
++  ImDrawList* draw_list = ImGui::GetForegroundDrawList();
++  const float g =
++      std::chrono::duration<float>(Clock::now() - scroll_at).count() *
++      layout_.fps;
++  const float glow = g < 10.0f   ? g / 10.0f
++                     : g < 21.0f ? 1.0f - (g - 10.0f) / 11.0f
++                                 : 0.0f;
++  const bool more[2] = {top > 0, top + visible < count};
++  for (int side = 0; side < 2; ++side) {
++    const float* r = vg_scroll_[v][side];
++    const std::string name = side ? "gp_scroll_down" : "gp_scroll_up";
++    for (int layer = 0; layer < 2; ++layer) {
++      const float a = layer ? (dir == side ? glow : 0.0f) : (more[side] ? 1.0f : 0.0f);
++      if (a <= 0.0f) continue;
++      if (const Image* img = Texture(layer ? name + "_shade" : name, k)) {
++        const float x0 = ox + r[0] * k, y0 = oy + r[1] * k;
++        draw_list->AddImage(
++            reinterpret_cast<ImTextureID>(img->texture.get()), V(x0, y0),
++            V(x0 + r[2] * k, y0 + r[3] * k), ImVec2(0, 0), ImVec2(1, 1),
++            IM_COL32(255, 255, 255, int(a * alpha * 255.0f + 0.5f)));
++      }
++    }
++  }
++}
++
+ // Congratulations' gamerTileImage: the picture (xam's 64x64 PNG, read by
+ // the scene with XamReadTile) drawn into its box.
+ void GuideOverlay::DrawGamerPicture(Pixels& out, int picture, float ppu) {
+diff --git a/src/xenia/app/guide_overlay.h b/src/xenia/app/guide_overlay.h
+index 8224f135a..8d60a02ee 100644
+--- a/src/xenia/app/guide_overlay.h
++++ b/src/xenia/app/guide_overlay.h
+@@ -111,7 +111,13 @@ class GuideOverlay {
+     // 831_PreferenceSetting
+     kGpPrefs,
+     kGpPrefCat,
+-    kGpPrefSet
++    kGpPrefSet,
++    // View Games: 820_GameShowcaseMe, 821-2_GameAchievStatsMe,
++    // 828_AchievDetails, GamerscoreMoreInfo
++    kGpGames,
++    kGpAchs,
++    kGpAchDetail,
++    kGpGsInfo
+   };
+   // hudbkgnd.xur HalfToError (the Guide slides out, then the ErrorHUD in) and
+   // ErrorToHalf (the reverse), each 2 x 29 frames.
+@@ -432,6 +438,42 @@ class GuideOverlay {
+   std::chrono::steady_clock::time_point pref_focus_at_;   // 832 row focused
+   std::chrono::steady_clock::time_point pref_scroll_at_;  // a list scrolled
+   int pref_scroll_dir_ = -1;  // 0 up / left, 1 down / right
++  // View Games (viewgames.txt from make_viewgames_assets.py)
++  struct VgTitle {
++    uint32_t id = 0;
++    std::u16string name;
++    uint32_t earned = 0, total = 0, gamerscore = 0;
++    std::vector<uint8_t> icon;  // PNG
++  };
++  struct VgAchievement {
++    uint32_t id = 0, gamerscore = 0, flags = 0;
++    uint64_t unlocked_at = 0;  // FILETIME
++    std::u16string name, description, locked_description;
++    int order = 0;  // as the enumerator gave it
++  };
++  std::map<std::string, MessageBoxItem> vg_text_;
++  std::map<std::string, std::array<float, 4>> vg_image_;
++  float vg_list_[2][6] = {};        // x, y, w, h, row height, visible rows
++  float vg_scroll_[2][2][4] = {};   // list, up / down: x, y, w, h
++  std::map<int, std::u16string> vg_str_;
++  bool vg_ready_ = false;
++  std::map<std::string, Pixels> vg_pictures_;  // decoded (UI thread)
++  void LoadViewGamesLayout();
++  void LoadViewGames();     // mutex_ held
++  void LoadAchievements();  // mutex_ held
++  void SortAchievements();  // mutex_ held
++  void GpY();
++  bool ComposeViewGamesPage(Page page, float ppu, Pixels& out);
++  void DrawViewGames(float k, float ox, float oy, float up, float alpha);
++  const Pixels* VgPicture(const std::string& key,
++                          const std::vector<uint8_t>& png);
++  // Under mutex_:
++  std::vector<VgTitle> vg_titles_;
++  std::vector<VgAchievement> vg_achs_;
++  int vg_game_ = 0, vg_game_top_ = 0, vg_ach_ = 0, vg_ach_top_ = 0;
++  int vg_sort_ = 0;  // 0 by date (0x45), 1 by gamerscore (0x44)
++  std::chrono::steady_clock::time_point vg_scroll_at_;
++  int vg_scroll_dir_ = -1;
+   bool ComposeGamerProfilePage(Page page, float ppu, Pixels& out);
+   void DrawPictureInto(Pixels& out, const Pixels& picture, float x, float y,
+                        float w, float h, float ppu);
+-- 
+2.55.0.windows.3
+
