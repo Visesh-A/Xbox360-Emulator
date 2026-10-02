@@ -1,7 +1,7 @@
 From 4e5dbc2d05fdc060053b8a3c9b1345cbbcb62ca8 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 22:06:35 +0530
-Subject: [PATCH 51/55] XMP: the dashboard's music services (from xam 2858)
+Subject: [PATCH 51/56] XMP: the dashboard's music services (from xam 2858)
 
 XMPDashInIt (819A90E0) and XMPSetMediaSourceWorkspace (819A62B0) accept
 the dashboard; DashInIt broadcasts XN 0x8A000009 (1, then 0 once the

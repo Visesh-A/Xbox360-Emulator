@@ -1,7 +1,7 @@
 From fab70871070c74a48092568089e7c3d79e65aa4e Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 20:39:05 +0530
-Subject: [PATCH 37/55] Guide: View Games (820/821-2/828, Gamerscore info)
+Subject: [PATCH 37/56] Guide: View Games (820/821-2/828, Gamerscore info)
 
 The gamer card's View Games (9010C6E8) opens 820_GameShowcaseMe ("All
 Games"): the titles played (MeGameList) with icon, name, "%1 of %2

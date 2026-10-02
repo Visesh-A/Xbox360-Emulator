@@ -1,7 +1,7 @@
 From 17e2cf301bdef1a9c61108fc6187c9c74da847ae Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 21:49:49 +0530
-Subject: [PATCH 39/55] Guide: Sign In from the Guide (signin.xex, 1 pane)
+Subject: [PATCH 39/56] Guide: Sign In from the Guide (signin.xex, 1 pane)
 
 XamShowSigninUIp(user, 1, 0x10000) from the signed-out Guide menu (Sign In
 or X): signin1.xur's UserList with the console's profiles (gamertag, "Xbox

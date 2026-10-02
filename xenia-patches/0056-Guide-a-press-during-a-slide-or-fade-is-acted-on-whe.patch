@@ -1,0 +1,65 @@
+From 978e2a3919007e7db29d8d1a78f9d7ea017dcc7b Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 16:56:15 +0530
+Subject: [PATCH 56/56] Guide: a press during a slide or fade is acted on when
+ it ends
+
+The pages ignore presses while a transition runs, so a quick second press
+(e.g. B right after A) was lost. The latest press is kept and acted on once
+the transition ends (within 1 s). The Guide button is never held back.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/app/guide_overlay.cc | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index d5cfec172..155985360 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -346,6 +346,8 @@ void GuideOverlay::InputThread() {
+   Clock::time_point next_battery_check;
+   Clock::time_point guide_down, guide_up;
+   bool turn_off_shown = false;
++  uint16_t queued_pressed = 0;  // a press during a transition
++  Clock::time_point queued_at;
+ 
+   // Debug schedule (--blades_guide_test): "<delay ms>,<page>[,black][,+button
+   // [*hold ms]]...", page "closed" to leave the Guide shut; the buttons are
+@@ -505,6 +507,32 @@ void GuideOverlay::InputThread() {
+       pressed &= ~hid::X_INPUT_GAMEPAD_GUIDE;
+     }
+ 
++    // A press during a slide or a scene fade (which the pages ignore) is kept
++    // and acted on once it ends, so a quick second press is not lost. The
++    // Guide button itself is never held back.
++    {
++      bool busy;
++      {
++        std::lock_guard<std::mutex> lock(mutex_);
++        busy = mode_ == Mode::kOpen &&
++               (transition_ != Transition::kNone || opt_fading_);
++      }
++      const uint16_t kept = pressed & ~uint16_t(hid::X_INPUT_GAMEPAD_GUIDE);
++      if (busy && kept) {
++        queued_pressed = kept;  // the latest press wins
++        queued_at = now;
++        pressed &= hid::X_INPUT_GAMEPAD_GUIDE;
++      } else if (!busy && queued_pressed) {
++        if (now - queued_at < std::chrono::seconds(1)) {
++          pressed |= queued_pressed;
++          if (cvars::debug_input_log) {
++            XELOGI("input: Guide acts on {:04X}, pressed during a transition",
++                   queued_pressed);
++          }
++        }
++        queued_pressed = 0;
++      }
++    }
+     OnButtons(pressed, buttons, lx, ly, now);
+     prev = buttons;
+     std::this_thread::sleep_for(std::chrono::milliseconds(16));
+-- 
+2.55.0.windows.3
+
