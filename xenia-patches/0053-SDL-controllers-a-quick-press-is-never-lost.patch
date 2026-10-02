@@ -1,0 +1,112 @@
+From 07e404460c936d73c1553207ed979161fc54c34e Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 13:29:15 +0530
+Subject: [PATCH 53/53] SDL controllers: a quick press is never lost
+
+Button events are applied on the UI thread in batches (SDL_PumpEvents);
+while a game keeps that thread busy, a tap's press and release could land
+in the same batch and never be seen down by the game or the Guide. Each
+press now reads as held for at least 60 ms, with a new packet number when
+the reported buttons change.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/hid/sdl/sdl_input_driver.cc | 28 +++++++++++++++++++++++++--
+ src/xenia/hid/sdl/sdl_input_driver.h  |  8 ++++++++
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/src/xenia/hid/sdl/sdl_input_driver.cc b/src/xenia/hid/sdl/sdl_input_driver.cc
+index c5409f64d..da171e334 100644
+--- a/src/xenia/hid/sdl/sdl_input_driver.cc
++++ b/src/xenia/hid/sdl/sdl_input_driver.cc
+@@ -9,6 +9,8 @@
+ 
+ #include "xenia/hid/sdl/sdl_input_driver.h"
+ 
++#include <chrono>
++
+ #if XE_PLATFORM_WIN32
+ #include "xenia/base/platform_win.h"
+ #endif  // XE_PLATFORM_WIN32
+@@ -249,11 +251,14 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index,
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
+-  if (controller->state_changed) {
++  const uint16_t held = HeldButtons(*controller);
++  if (controller->state_changed || held != controller->reported_buttons) {
+     controller->state.packet_number++;
+     controller->state_changed = false;
++    controller->reported_buttons = held;
+   }
+   std::memcpy(out_state, &controller->state, sizeof(*out_state));
++  out_state->gamepad.buttons = held;
+   return X_ERROR_SUCCESS;
+ }
+ 
+@@ -357,7 +362,7 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
+     // If input is not active (e.g. due to a dialog overlay), force buttons to
+     // "unpressed". The algorithm will automatically send UP events when
+     // `is_active()` goes low and DOWN events when it goes high again.
+-    const uint64_t curr_butts = controller->state.gamepad.buttons |
++    const uint64_t curr_butts = HeldButtons(*controller) |
+                                 AnalogToKeyfield(controller->state.gamepad);
+     KeystrokeState& last = keystroke_states_.at(user_index);
+ 
+@@ -639,6 +644,12 @@ void SDLInputDriver::OnControllerDeviceButtonChanged(const SDL_Event& event) {
+       return;
+     }
+     xbuttons |= xbutton;
++    for (int bit = 0; bit < 16; ++bit) {
++      if (xbutton & (1u << bit)) {
++        controller.pressed_at[bit] =
++            std::chrono::steady_clock::now().time_since_epoch().count();
++      }
++    }
+   } else {
+     xbuttons &= ~xbutton;
+   }
+@@ -665,6 +676,19 @@ std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(
+   return std::nullopt;
+ }
+ 
++uint16_t SDLInputDriver::HeldButtons(const ControllerState& c) {
++  constexpr int64_t kMinPress =
++      std::chrono::nanoseconds(std::chrono::milliseconds(60)).count();
++  const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
++  uint16_t buttons = c.state.gamepad.buttons;
++  for (int bit = 0; bit < 16; ++bit) {
++    if (c.pressed_at[bit] && now - c.pressed_at[bit] < kMinPress) {
++      buttons |= uint16_t(1u << bit);
++    }
++  }
++  return buttons;
++}
++
+ SDLInputDriver::ControllerState* SDLInputDriver::GetControllerState(
+     uint32_t user_index) {
+   if (user_index >= controllers_.size()) {
+diff --git a/src/xenia/hid/sdl/sdl_input_driver.h b/src/xenia/hid/sdl/sdl_input_driver.h
+index cba32c9cd..8a425e59c 100644
+--- a/src/xenia/hid/sdl/sdl_input_driver.h
++++ b/src/xenia/hid/sdl/sdl_input_driver.h
+@@ -53,7 +53,15 @@ class SDLInputDriver final : public InputDriver {
+     X_INPUT_CAPABILITIES caps;
+     X_INPUT_STATE state;
+     bool state_changed;
++    // when each button (bit) was last pressed, steady_clock nanoseconds, and
++    // the buttons last reported (HeldButtons)
++    std::array<int64_t, 16> pressed_at{};
++    uint16_t reported_buttons = 0;
+   };
++  // The buttons, each held for at least kMinPress after its press: events
++  // are applied on the UI thread in batches, and a tap whose press and
++  // release land in the same batch would otherwise never be seen down.
++  static uint16_t HeldButtons(const ControllerState& c);
+ 
+   enum class RepeatState {
+     Idle,       // no buttons pressed or repeating has ended
+-- 
+2.55.0.windows.3
+

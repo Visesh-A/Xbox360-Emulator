@@ -1,7 +1,7 @@
 From b1d9d12ce292f0de05f18fc2598c056f4548d596 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Fri, 2 Oct 2026 11:32:08 +0530
-Subject: [PATCH 52/52] Input: PC-style keyboard and mouse, used together with
+Subject: [PATCH 52/53] Input: PC-style keyboard and mouse, used together with
  a controller
 
 The keyboard (keyboard_mode 1) gets PC-game defaults: W A S D left stick,

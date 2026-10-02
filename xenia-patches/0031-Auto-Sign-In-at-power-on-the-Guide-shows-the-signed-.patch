@@ -1,7 +1,7 @@
 From cf10af89cce392993b6514d252fa21515c9e2a41 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 18:07:02 +0530
-Subject: [PATCH 31/52] Auto Sign-In at power-on; the Guide shows the signed-in
+Subject: [PATCH 31/53] Auto Sign-In at power-on; the Guide shows the signed-in
  gamertag
 
 Power-on (new cvar power_on, set by the launcher for its first dashboard):

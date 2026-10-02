@@ -1,7 +1,7 @@
 From 18896622de0336d4f582f6402fb0a6db65e33954 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 15:18:48 +0530
-Subject: [PATCH 15/52] Profiles on the 2858 dashboard: 2858 xam, config kept
+Subject: [PATCH 15/53] Profiles on the 2858 dashboard: 2858 xam, config kept
  across hand-offs
 
 - The console's xam.xex (loaded for its resources) now gets the system

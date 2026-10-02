@@ -1,7 +1,7 @@
 From ddf5efcad4ee806904a15d41e512cdceb6712805 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 12:06:13 +0530
-Subject: [PATCH 26/52] Guide: legends, clock and page fade from hudbkgnd's
+Subject: [PATCH 26/53] Guide: legends, clock and page fade from hudbkgnd's
  keyframes
 
 The legends no longer vanish with Save Gamer Profile / the keyboard when

@@ -1,7 +1,7 @@
 From 374b53ae38f4d101419942cfdb078721539c368d Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 17:04:57 +0530
-Subject: [PATCH 12/52] Guide overlay: the clock sits at the top of its box
+Subject: [PATCH 12/53] Guide overlay: the clock sits at the top of its box
 
 DateTimeTextId's TextStyle 0x210 does not center vertically: on a 720p
 and a 480-line real frame the clock, like the legends, is 5.5 units above

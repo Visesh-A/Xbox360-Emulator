@@ -1,7 +1,7 @@
 From b608bf20765e686037ff3677f10938cc6a410f46 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 09:59:44 +0530
-Subject: [PATCH 22/52] Create profile: AddXboxLive status page, as
+Subject: [PATCH 22/53] Create profile: AddXboxLive status page, as
  createprofile.xex shows it
 
 Save Gamer Profile's buttons now open AddXboxLive.xur, a half-width Guide
