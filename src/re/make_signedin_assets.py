@@ -22,6 +22,9 @@ Writes into the Guide asset folder:
   signedin.txt            nav ("menusi <item> <up> <down> <left> <right>"),
                           the card's texts and picture, the profile count text
 """
+import json
+import os
+
 import numpy as np
 
 import make_guide_assets as G
@@ -151,54 +154,71 @@ def item_line(name, e):
 
 def main():
     G.apply_runtime_state()
-    lines = []
     no_legends = G.PAGE_HIDE + G.LEGENDS
     only_legends = G.CONTENT_HIDE + ("AppHostElementId",)
     # signed in
-    captured = False
-    for focus in SI_FOCUS:
+    for i, focus in enumerate(SI_FOCUS):
+        if not G.unit(f"menusi_{focus}"):
+            continue
         X.CAPTURE = {}
         img = X.render_guide(G.OPEN, "MainMenuSignedIn.xui",
                              "baseMetaPane" if focus == "ctlGamerCard" else focus,
                              hide=no_legends, scale=G.SCALE, app_state=si_state(focus), embeds=SI_EMBEDS)
         cap, X.CAPTURE = X.CAPTURE, None
         G.save(img, f"menusi_{focus}.png")
-        if not captured:
-            lines += [item_line(n, e) for n, e in sorted(cap.items())]
-            captured = True
+        if i == 0:
+            for n, e in sorted(cap.items()):
+                G.emit(item_line(n, e))
     for part, hide in G.LEGEND_PARTS:
-        G.save(X.render_guide(G.OPEN, "MainMenuSignedIn.xui", hide=only_legends + hide, scale=G.SCALE,
-                              app_state=si_state(None), embeds=SI_EMBEDS), f"menusi_legends_{part}.png")
-    nav = nav_graph("MainMenuSignedIn.xui", SI_EMBEDS, si_state(None), SI_FOCUS)
-    for item in SI_FOCUS:
-        lines.append(f"menusi {item} " + " ".join(nav[item][d] or "-" for d in ("up", "down", "left", "right")))
+        if G.unit(f"menusi_legends_{part}"):
+            G.save(X.render_guide(G.OPEN, "MainMenuSignedIn.xui", hide=only_legends + hide,
+                                  scale=G.SCALE, app_state=si_state(None), embeds=SI_EMBEDS),
+                   f"menusi_legends_{part}.png")
+    if G.unit("menusi_nav"):
+        nav = nav_graph("MainMenuSignedIn.xui", SI_EMBEDS, si_state(None), SI_FOCUS)
+        for item in SI_FOCUS:
+            G.emit(f"menusi {item} " + " ".join(nav[item][d] or "-" for d in ("up", "down", "left", "right")))
     # signed out: the same images without the profile count, which is captured
     st = {k: dict(v) for k, v in G.MENU_STATE.items()}
     st["labelProfiles"] = {"NavTabForward": "\x01profiles"}
-    for focus in G.MENU_FOCUS:
+    for i, focus in enumerate(G.MENU_FOCUS):
+        if not G.unit(f"menu_{focus}"):
+            continue
         X.CAPTURE = {}
         img = X.render_guide(G.OPEN, "MainMenuSignedOut.xui", focus, hide=no_legends, scale=G.SCALE,
                              app_state=st, embeds=G.MENU_EMBEDS)
         cap, X.CAPTURE = X.CAPTURE, None
-        # only the label may differ from the image made before
-        from PIL import Image
-        tmp = G.OUT.parent / "_menu_check.png"
-        img.save(str(tmp), G.skia.kPNG)
-        a = np.asarray(Image.open(G.OUT / f"menu_{focus}.png").convert("RGBA")).astype(int)
-        b = np.asarray(Image.open(tmp).convert("RGBA")).astype(int)
-        tmp.unlink()
-        diff = np.argwhere(np.abs(a - b).max(axis=2) > 2)
+        # replaces make_guide_assets' menu_<focus>.png once menus() has
+        # checked that only the label differs (so this can run alongside it)
         e = cap["profiles"]
         box = (e["tx"] / K * G.SCALE, e["ty"] / K * G.SCALE,
-               (e["tx"] / K + e["w"] * e["sx"] / K) * G.SCALE, (e["ty"] / K + e["h"] * e["sx"] / K) * G.SCALE)
+               (e["tx"] / K + e["w"] * e["sx"] / K) * G.SCALE,
+               (e["ty"] / K + e["h"] * e["sx"] / K) * G.SCALE)
+        (G.OUT / f"_signedout_menu_{focus}.json").write_text(json.dumps(box), encoding="utf-8")
+        G.save(img, f"_signedout_menu_{focus}.png")
+        if i == len(G.MENU_FOCUS) - 1:
+            G.emit(item_line("profiles", cap["profiles"]))
+    for line in G.finish("signedin.txt"):
+        print(line)
+
+
+def menus():
+    """After make_guide_assets: each signed-out menu image differs from its
+    menu_<focus>.png only in the profile count's label, then replaces it."""
+    from PIL import Image
+    for focus in G.MENU_FOCUS:
+        new = G.OUT / f"_signedout_menu_{focus}.png"
+        box_file = G.OUT / f"_signedout_menu_{focus}.json"
+        box = json.loads(box_file.read_text(encoding="utf-8"))
+        a = np.asarray(Image.open(G.OUT / f"menu_{focus}.png").convert("RGBA")).astype(int)
+        b = np.asarray(Image.open(new).convert("RGBA")).astype(int)
+        diff = np.argwhere(np.abs(a - b).max(axis=2) > 2)
         outside = [p for p in diff if not (box[0] - 2 <= p[1] <= box[2] + 2 and box[1] - 2 <= p[0] <= box[3] + 2)]
         print(f"   menu_{focus}: {len(diff)} px changed, {len(outside)} outside the label")
         if outside:
             raise SystemExit(f"menu_{focus}: pixels outside labelProfiles changed, e.g. {outside[:3]}")
-        G.save(img, f"menu_{focus}.png")
-    lines.append(item_line("profiles", cap["profiles"]))
-    (G.OUT / "signedin.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("\n".join(lines))
+        new.replace(G.OUT / f"menu_{focus}.png")
+        box_file.unlink()
 
 
 def sign_out_assets():
@@ -209,24 +229,33 @@ def sign_out_assets():
     G.apply_runtime_state()
     s = G.STRINGS
     # labelProfiles' strings (91449310)
-    (G.OUT / "signedin_strings.txt").write_text(
-        f"str 37 {s[37]}\nstr 38 {s[38]}\n", encoding="utf-8")
+    if G.unit("signedin_strings"):
+        (G.OUT / "signedin_strings.txt").write_text(
+            f"str 37 {s[37]}\nstr 38 {s[38]}\n", encoding="utf-8")
     scene = G.message_box("Sign Out", s[39], [s[41], s[40]])
     for i, choice in enumerate(("yes", "no")):
-        G.save(X.render_guide(G.ERROR, None, f"Button{i}", hide=("GamerTag",), scale=G.SCALE,
-                              error_scene=scene, size=(G.ERROR_W, 770), origin_x=G.ERROR_X),
-               f"error_signout_{choice}.png")
+        if G.unit(f"error_signout_{choice}"):
+            G.save(X.render_guide(G.ERROR, None, f"Button{i}", hide=("GamerTag",), scale=G.SCALE,
+                                  error_scene=scene, size=(G.ERROR_W, 770), origin_x=G.ERROR_X),
+                   f"error_signout_{choice}.png")
     no_legends = G.PAGE_HIDE + G.LEGENDS
     only_legends = G.CONTENT_HIDE + ("AppHostElementId",)
-    G.save(X.render_guide(G.OPEN, "Status.xui", None, hide=no_legends, scale=G.SCALE), "status_signout.png")
+    if G.unit("status_signout"):
+        G.save(X.render_guide(G.OPEN, "Status.xui", None, hide=no_legends, scale=G.SCALE),
+               "status_signout.png")
     for part, hide in G.LEGEND_PARTS:
-        G.save(X.render_guide(G.OPEN, "Status.xui", hide=only_legends + hide, scale=G.SCALE),
-               f"status_legends_{part}.png")
+        if G.unit(f"status_legends_{part}"):
+            G.save(X.render_guide(G.OPEN, "Status.xui", hide=only_legends + hide, scale=G.SCALE),
+                   f"status_legends_{part}.png")
 
 
 if __name__ == "__main__":
     import sys
-    if "--signout" in sys.argv:
+    if os.environ.get("SIGNEDIN_MENUS"):
+        menus()
+    elif os.environ.get("GUIDE_MERGE"):
+        G.merge("signedin.txt", int(os.environ["GUIDE_MERGE"]))
+    elif "--signout" in sys.argv:
         sign_out_assets()
     else:
         main()

@@ -108,7 +108,7 @@ def text_line(page, name, e, k):
 def main():
     G.apply_runtime_state()
     k = X.SUPERSAMPLE * G.SCALE
-    lines, strings = [], {}
+    strings = {}
     for page, p in PAGES.items():
         root = X.cached_canvas(X.ART / "xui" / p["scene"]).children[0]
         state = card_state(p["extended"])
@@ -119,61 +119,65 @@ def main():
                 if page not in ("gppics", "gppers") else [])
         default = (root.find(p["group"]).props.get("DefaultFocus") if p["group"]
                    else root.props.get("DefaultFocus"))
-        lines.append(f"page {page} {default}")
-        captured = False
-        for b in btns or [None]:
+        for i, b in enumerate(btns or [None]):
+            if not G.unit(f"{page}_{b.id if b else '-'}"):
+                continue
+            if i == 0:
+                G.emit(f"page {page} {default}")
             st = {kk: dict(v) for kk, v in state.items()}
             if page == "gpeditp" and b is not None:
                 st["Text1"] = {"NavTabForward": STR[EDITP_PANEL[b.id]]}
-                lines.append(f"panel {page} {b.id} s{EDITP_PANEL[b.id]:02x}")
+                G.emit(f"panel {page} {b.id} s{EDITP_PANEL[b.id]:02x}")
             X.CAPTURE = {}
             img = X.render_guide(G.FULL, p["scene"], b.id if b else None, hide=G.PAGE_HIDE,
                                  scale=G.SCALE, app_state=st, embeds=EMBED)
             cap, X.CAPTURE = X.CAPTURE, None
             G.save(img, f"{page}_{b.id}.png" if b else f"{page}.png")
-            if not captured:
+            if i == 0:
                 for name, e in sorted(cap.items()):
-                    lines.append(text_line(page, name, e, k))
-                captured = True
+                    G.emit(text_line(page, name, e, k))
             print(page, b.id if b else "-", flush=True)
-        ids = {b.id for b in btns}
-        for b in btns:
-            # an unlinked neighbour is no longer there to move to
-            up, down = b.props.get("NavUp"), b.props.get("NavDown")
-            lines.append(f"button {page} {b.id} {up if up in ids else '-'} "
-                         f"{down if down in ids else '-'}")
+        if G.unit(f"{page}_buttons"):
+            ids = {b.id for b in btns}
+            for b in btns:
+                # an unlinked neighbour is no longer there to move to
+                up, down = b.props.get("NavUp"), b.props.get("NavDown")
+                G.emit(f"button {page} {b.id} {up if up in ids else '-'} "
+                       f"{down if down in ids else '-'}")
     # legends alone (all four scenes: A "Select", B "Back"), for the slides
     only_legends = G.CONTENT_HIDE + ("AppHostElementId",)
     for name, hide in (("a", ("Legend_X", "Legend_Y", "Legend_B")),
                        ("b", ("Legend_X", "Legend_Y", "Legend_A")),
                        ("xy", ("Legend_A", "Legend_B"))):
-        G.save(X.render_guide(G.FULL, PAGES["gpcard"]["scene"], hide=only_legends + hide,
-                              scale=G.SCALE), f"gp_legends_{name}.png")
-    # the tile grid: List_tileGrid's items (btn_tileGrid, 105 x 103 cells) from
-    # the list's origin (145, 100), 3 columns in its 446 width: the scene's
-    # divider lines (x 240 / 345 / 450, y 195.6 / 298.7 / 401.7) fall in the
-    # gaps between the cells' 87 x 83 panels
-    skin = X.cached_canvas(X.ART / "xui" / "skin.xui")
-    item = next(c for c in skin.children if c.id == "btn_tileGrid")
-    for state, name in (("Normal", "gp_cell_normal"), ("Focus", "gp_cell_focus")):
-        surf = skia.Surface(int(105 * G.SCALE), int(104 * G.SCALE))
-        canvas = surf.getCanvas()
-        canvas.clear(skia.ColorTRANSPARENT)
-        canvas.scale(G.SCALE, G.SCALE)
-        X.Renderer(skin).render_children(canvas, item, X.Ctx(None), X.apply_timelines(item, state))
-        surf.makeImageSnapshot().save(str(G.OUT / f"{name}.png"), skia.kPNG)
-    presenter = item.find("XuiImagePresenter2")
-    tx, ty, _ = X.vec(presenter.props.get("Position"))
-    lines.append(f"cells 145 100 105 103 3 12 {tx} {ty} 105 104")
-    for key, idx in (("enable", 0x23), ("disable", 0x1D), ("editname", 0x22), ("s43", 0x43),
-                     ("s0a", 0x0A), ("s0b", 0x0B), ("s1f", 0x1F), ("s09", 0x09)):
-        strings[key] = STR[idx]
-    (G.OUT / "gamerprofile.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (G.OUT / "gamerprofile_strings.txt").write_text(
-        "\n".join(f"{kk} " + v.replace("\\", "\\\\").replace("\r", "").replace("\n", "\\n")
-                  for kk, v in strings.items()) + "\n", encoding="utf-8")
-    print("\n".join(lines))
+        if G.unit(f"gp_legends_{name}"):
+            G.save(X.render_guide(G.FULL, PAGES["gpcard"]["scene"], hide=only_legends + hide,
+                                  scale=G.SCALE), f"gp_legends_{name}.png")
+    if G.unit("cells"):
+        # the tile grid: List_tileGrid's items (btn_tileGrid, 105 x 103 cells) from
+        # the list's origin (145, 100), 3 columns in its 446 width: the scene's
+        # divider lines (x 240 / 345 / 450, y 195.6 / 298.7 / 401.7) fall in the
+        # gaps between the cells' 87 x 83 panels
+        skin = X.cached_canvas(X.ART / "xui" / "skin.xui")
+        item = next(c for c in skin.children if c.id == "btn_tileGrid")
+        for state, name in (("Normal", "gp_cell_normal"), ("Focus", "gp_cell_focus")):
+            surf = skia.Surface(int(105 * G.SCALE), int(104 * G.SCALE))
+            canvas = surf.getCanvas()
+            canvas.clear(skia.ColorTRANSPARENT)
+            canvas.scale(G.SCALE, G.SCALE)
+            X.Renderer(skin).render_children(canvas, item, X.Ctx(None), X.apply_timelines(item, state))
+            surf.makeImageSnapshot().save(str(G.OUT / f"{name}.png"), skia.kPNG)
+        presenter = item.find("XuiImagePresenter2")
+        tx, ty, _ = X.vec(presenter.props.get("Position"))
+        G.emit(f"cells 145 100 105 103 3 12 {tx} {ty} 105 104")
+        for key, idx in (("enable", 0x23), ("disable", 0x1D), ("editname", 0x22), ("s43", 0x43),
+                         ("s0a", 0x0A), ("s0b", 0x0B), ("s1f", 0x1F), ("s09", 0x09)):
+            strings[key] = STR[idx]
+        (G.OUT / "gamerprofile_strings.txt").write_text(
+            "\n".join(f"{kk} " + v.replace("\\", "\\\\").replace("\r", "").replace("\n", "\\n")
+                      for kk, v in strings.items()) + "\n", encoding="utf-8")
+    for line in G.finish("gamerprofile.txt"):
+        print(line)
 
 
 if __name__ == "__main__":
-    main()
+    G.run(main, "gamerprofile.txt")

@@ -43,32 +43,39 @@ def main():
     only_legends = G.CONTENT_HIDE + ("AppHostElementId",)
     state = {"statusText": {"NavTabForward": "\x01status"}}
 
-    # the page without the cursor, capturing the status line's box
+    # the page without the cursor, capturing the status line's box (every
+    # part: the cursor's frames are cropped against it)
     X.CAPTURE = {}
     base_img = X.render_guide(G.OPEN, SCENE, None, hide=no_legends, scale=G.SCALE,
                               app_state=dict(state, waitCursorControl={"Show": "false"}))
     cap, X.CAPTURE = X.CAPTURE, None
-    G.save(base_img, "axl_page.png")
-    lines = []
-    e = cap["status"]
-    s = e["sx"] / k
-    lines.append(f"text status {e['tx'] / k:.4f} {e['ty'] / k:.4f} {e['w'] * s:.4f} {e['h'] * s:.4f} "
-                 f"{e['size_px'] * s:.4f} {e['ascent'] * s:.4f} {e['line_h'] * s:.4f} "
-                 f"{e['style']} {e['color']:08X}")
+    if G.unit("page"):
+        G.save(base_img, "axl_page.png")
+        e = cap["status"]
+        s = e["sx"] / k
+        G.emit(f"text status {e['tx'] / k:.4f} {e['ty'] / k:.4f} {e['w'] * s:.4f} {e['h'] * s:.4f} "
+               f"{e['size_px'] * s:.4f} {e['ascent'] * s:.4f} {e['line_h'] * s:.4f} "
+               f"{e['style']} {e['color']:08X}")
 
     # legends, split: A and B move with the frame in FullToHalf (by -435 and
     # -432 units, hudbkgnd 120-145), X and Y stay
-    G.save(X.render_guide(G.OPEN, SCENE, hide=only_legends + ("Legend_X", "Legend_Y", "Legend_B"),
-                          scale=G.SCALE, app_state=state), "axl_legends_a.png")
-    G.save(X.render_guide(G.OPEN, SCENE, hide=only_legends + ("Legend_X", "Legend_Y", "Legend_A"),
-                          scale=G.SCALE, app_state=state), "axl_legends_b.png")
-    G.save(X.render_guide(G.OPEN, SCENE, hide=only_legends + ("Legend_A", "Legend_B"),
-                          scale=G.SCALE, app_state=state), "axl_legends_xy.png")
+    if G.unit("legends_a"):
+        G.save(X.render_guide(G.OPEN, SCENE, hide=only_legends + ("Legend_X", "Legend_Y", "Legend_B"),
+                              scale=G.SCALE, app_state=state), "axl_legends_a.png")
+    if G.unit("legends_b"):
+        G.save(X.render_guide(G.OPEN, SCENE, hide=only_legends + ("Legend_X", "Legend_Y", "Legend_A"),
+                              scale=G.SCALE, app_state=state), "axl_legends_b.png")
+    if G.unit("legends_xy"):
+        G.save(X.render_guide(G.OPEN, SCENE, hide=only_legends + ("Legend_A", "Legend_B"),
+                              scale=G.SCALE, app_state=state), "axl_legends_xy.png")
 
     # the wait cursor at each frame of its loop
     base = to_array(base_img)
     real_apply = X.apply_timelines
     for t in range(LAST_MOVE + 1):
+        if not G.unit(f"spin_{t}"):
+            continue
+
         def at_frame(visual, st, t=t):
             if visual.id == "Loading_Large":
                 return X.timelines_at(visual, t)
@@ -84,17 +91,18 @@ def main():
         diff = np.abs(arr - base).max(axis=2) > 0
         ys, xs = np.nonzero(diff)
         if not len(xs):
-            lines.append(f"spin {t} 0 0 0 0")
+            G.emit(f"spin {t} 0 0 0 0")
             continue
         box = (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
         save_crop(arr, box, f"axl_spin_{t}.png")
-        lines.append(f"spin {t} {box[0] / G.SCALE:.4f} {box[1] / G.SCALE:.4f} "
-                     f"{(box[2] - box[0]) / G.SCALE:.4f} {(box[3] - box[1]) / G.SCALE:.4f}")
+        G.emit(f"spin {t} {box[0] / G.SCALE:.4f} {box[1] / G.SCALE:.4f} "
+               f"{(box[2] - box[0]) / G.SCALE:.4f} {(box[3] - box[1]) / G.SCALE:.4f}")
         print("frame", t, box, flush=True)
-    lines.append(f"spin_frames {LOOP}")
-    (G.OUT / "axl.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if G.unit("frames"):
+        G.emit(f"spin_frames {LOOP}")
+    lines = G.finish("axl.txt")
     print("\n".join(lines[:2]))
 
 
 if __name__ == "__main__":
-    main()
+    G.run(main, "axl.txt")

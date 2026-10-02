@@ -847,9 +847,21 @@ def render_guide(frame, app_scene=None, focus=None, live_text=None, hide=(),
     if ss == 1:
         return img
     import numpy as np
-    a = img.toarray(colorType=skia.kRGBA_8888_ColorType, alphaType=skia.kPremul_AlphaType).astype(np.float32)
-    a = a.reshape(oh, ss, ow, ss, 4).mean(axis=(1, 3))
-    return skia.Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8),
+    # each output pixel = the rounded mean of its ss x ss samples, summed as
+    # integers: (sum + ss*ss/2) // (ss*ss), the same as the float mean + 0.5
+    # truncated (the sums are exact), about 4x faster
+    b = img.toarray(colorType=skia.kRGBA_8888_ColorType, alphaType=skia.kPremul_AlphaType)
+    b = b.reshape(oh, ss, ow * ss * 4)
+    rows = b[:, 0].astype(np.uint16)
+    for i in range(1, ss):
+        rows += b[:, i]
+    rows = rows.reshape(oh, ow, ss, 4)
+    a = rows[:, :, 0].copy()
+    for i in range(1, ss):
+        a += rows[:, :, i]
+    a += ss * ss // 2
+    a //= ss * ss
+    return skia.Image.fromarray(a.astype(np.uint8),
                                 colorType=skia.kRGBA_8888_ColorType, alphaType=skia.kPremul_AlphaType)
 
 

@@ -130,8 +130,9 @@ def main():
     # 830: the list is drawn at run time
     for c, cat in enumerate(cats):
         st = {"preferenceList": {"Show": "false"}, "Text1": {"NavTabForward": cat["desc"]}, **panel}
-        G.save(X.render_guide(G.FULL, "gp_830_GamerPreferences.xui", None, hide=G.PAGE_HIDE,
-                                scale=G.SCALE, app_state=st), f"gpprefs_{c}.png")
+        if G.unit(f"gpprefs_{c}"):
+            G.save(X.render_guide(G.FULL, "gp_830_GamerPreferences.xui", None, hide=G.PAGE_HIDE,
+                                  scale=G.SCALE, app_state=st), f"gpprefs_{c}.png")
     # 832: labels and spinners (their texts at run time)
     s_index = 0
     for c, cat in enumerate(cats):
@@ -146,55 +147,60 @@ def main():
                 else:  # rows past the category's settings are not shown
                     st[f"setting{i}Label"] = {"Show": "false"}
                     st[f"setting{i}Value"] = {"Show": "false"}
-            G.save(X.render_guide(G.FULL, "gp_832_PreferenceCategory.xui", f"setting{r + 1}Value",
-                                    hide=G.PAGE_HIDE, scale=G.SCALE, app_state=st),
-                   f"gpcat_{c}_{r}.png")
+            if G.unit(f"gpcat_{c}_{r}"):
+                G.save(X.render_guide(G.FULL, "gp_832_PreferenceCategory.xui", f"setting{r + 1}Value",
+                                      hide=G.PAGE_HIDE, scale=G.SCALE, app_state=st),
+                       f"gpcat_{c}_{r}.png")
     # 831: one page per setting
     for cat in cats:
         for s in cat["settings"]:
             st = {"valueList": {"Show": "false"}, "headerText": {"NavTabForward": s["name"]},
                   "Text1": {"NavTabForward": s["desc"]}, **panel}
-            G.save(X.render_guide(G.FULL, "gp_831_PreferenceSetting.xui", None, hide=G.PAGE_HIDE,
-                                    scale=G.SCALE, app_state=st), f"gpset_{s_index}.png")
+            if G.unit(f"gpset_{s_index}"):
+                G.save(X.render_guide(G.FULL, "gp_831_PreferenceSetting.xui", None, hide=G.PAGE_HIDE,
+                                      scale=G.SCALE, app_state=st), f"gpset_{s_index}.png")
             s_index += 1
-    # list rows and spinner texts
-    for state in ("Normal", "Focus"):
-        save_visual("XuiButton", state, f"gp_prow_{state.lower()}", (420, 45), (0, 0))
-        lines.append(item_line(f"rowtext {state.lower()}", capture_text("XuiButton", state)))
-        lines.append(item_line(f"spintext {state.lower()}",
-                               capture_text("btn_spinner", state, "ListItem")))
-    root = X.cached_canvas(X.ART / "xui" / "gp_832_PreferenceCategory.xui").children[0]
-    for i in range(1, 9):
-        x, y, _ = X.vec(root.find(f"setting{i}Value").props.get("Position"))
-        lines.append(f"spin {i - 1} {x:.4f} {y:.4f}")
-    # the list's scroll ends: XuiList visual 420x74, both anchored right and
-    # bottom (Anchor 12), so in the 480-high list they are 406 lower
-    _, lst = visual("XuiList")
-    dh = LIST_H - float(lst.props.get("Height"))
-    for cid, name in (("control_ScrollUp", "up"), ("control_ScrollDown", "down")):
-        node = lst.find(cid)
-        x, y, _ = X.vec(node.props.get("Position"))
-        ox, oy, w, h = scroll_end(node.props.get("Visual"), f"gp_scroll_{name}", 1.0)
-        lines.append(f"scroll {name} {LIST_X + x + ox:.4f} {LIST_Y + y + dh + oy:.4f} {w:.4f} {h:.4f}")
-    # btn_spinner's ScrollLeft / ScrollRight (scale 1.3, shown on focus: they
-    # fade in over the visual's Focus frames 2-8), from the spinner's origin
-    _, spin = visual("btn_spinner")
-    for cid, name in (("ScrollLeft", "left"), ("ScrollRight", "right")):
-        node = spin.find(cid)
-        x, y, _ = X.vec(node.props.get("Position"))
-        sc = X.vec(node.props.get("Scale"), (1.0, 1.0, 1.0))[0]
-        ox, oy, w, h = scroll_end(node.props.get("Visual"), f"gp_spin_{name}", sc)
-        lines.append(f"spinarrow {name} {x + ox:.4f} {y + oy:.4f} {w:.4f} {h:.4f}")
-    lines.append(f"list {LIST_X} {LIST_Y} 420 {ROW_H} {int(LIST_H // ROW_H)}")
-    for c, cat in enumerate(cats):
-        lines.append(f"cat {c} {esc(cat['name'])}")
-        for s in cat["settings"]:
-            lines.append(f"setting {c} {s['id']:08X} {s['flags']} {esc(s['name'])}")
-            for v, t in s["values"]:
-                lines.append(f"value {v} {esc(t)}")
-    (G.OUT / "prefs.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("\n".join(lines))
+    if G.unit("layout"):
+        # list rows and spinner texts
+        for state in ("Normal", "Focus"):
+            save_visual("XuiButton", state, f"gp_prow_{state.lower()}", (420, 45), (0, 0))
+            lines.append(item_line(f"rowtext {state.lower()}", capture_text("XuiButton", state)))
+            lines.append(item_line(f"spintext {state.lower()}",
+                                   capture_text("btn_spinner", state, "ListItem")))
+        root = X.cached_canvas(X.ART / "xui" / "gp_832_PreferenceCategory.xui").children[0]
+        for i in range(1, 9):
+            x, y, _ = X.vec(root.find(f"setting{i}Value").props.get("Position"))
+            lines.append(f"spin {i - 1} {x:.4f} {y:.4f}")
+        # the list's scroll ends: XuiList visual 420x74, both anchored right and
+        # bottom (Anchor 12), so in the 480-high list they are 406 lower
+        _, lst = visual("XuiList")
+        dh = LIST_H - float(lst.props.get("Height"))
+        for cid, name in (("control_ScrollUp", "up"), ("control_ScrollDown", "down")):
+            node = lst.find(cid)
+            x, y, _ = X.vec(node.props.get("Position"))
+            ox, oy, w, h = scroll_end(node.props.get("Visual"), f"gp_scroll_{name}", 1.0)
+            lines.append(f"scroll {name} {LIST_X + x + ox:.4f} {LIST_Y + y + dh + oy:.4f} {w:.4f} {h:.4f}")
+        # btn_spinner's ScrollLeft / ScrollRight (scale 1.3, shown on focus: they
+        # fade in over the visual's Focus frames 2-8), from the spinner's origin
+        _, spin = visual("btn_spinner")
+        for cid, name in (("ScrollLeft", "left"), ("ScrollRight", "right")):
+            node = spin.find(cid)
+            x, y, _ = X.vec(node.props.get("Position"))
+            sc = X.vec(node.props.get("Scale"), (1.0, 1.0, 1.0))[0]
+            ox, oy, w, h = scroll_end(node.props.get("Visual"), f"gp_spin_{name}", sc)
+            lines.append(f"spinarrow {name} {x + ox:.4f} {y + oy:.4f} {w:.4f} {h:.4f}")
+        lines.append(f"list {LIST_X} {LIST_Y} 420 {ROW_H} {int(LIST_H // ROW_H)}")
+        for c, cat in enumerate(cats):
+            lines.append(f"cat {c} {esc(cat['name'])}")
+            for s in cat["settings"]:
+                lines.append(f"setting {c} {s['id']:08X} {s['flags']} {esc(s['name'])}")
+                for v, t in s["values"]:
+                    lines.append(f"value {v} {esc(t)}")
+        for line in lines:
+            G.emit(line)
+    for line in G.finish("prefs.txt"):
+        print(line)
 
 
 if __name__ == "__main__":
-    main()
+    G.run(main, "prefs.txt")

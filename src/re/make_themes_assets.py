@@ -62,7 +62,6 @@ def row_node(template, x, y, text, rid):
 
 def main():
     G.apply_runtime_state()
-    lines = []
     no_legends = G.PAGE_HIDE + G.LEGENDS
     layer_hide = G.CONTENT_HIDE + G.LEGENDS
     for page, (scene, lid, rows, visible, shown, hidden) in LISTS.items():
@@ -72,10 +71,11 @@ def main():
         st = {e: {"Show": "true"} for e in shown}
         st.update({e: {"Show": "false"} for e in hidden})
         base_st = dict(st, **{lid: {"Show": "false"}})
-        G.save(X.render_guide(G.OPEN, root, None, hide=no_legends, scale=G.SCALE,
-                              app_state=base_st), f"{page}_base.png")
-        lines.append(f"page {page} {scene} -")
-        lines.append(f"row {page} {lid} {len(rows)} {visible}")
+        if G.unit(f"{page}_base"):
+            G.save(X.render_guide(G.OPEN, root, None, hide=no_legends, scale=G.SCALE,
+                                  app_state=base_st), f"{page}_base.png")
+            G.emit(f"page {page} {scene} -")
+            G.emit(f"row {page} {lid} {len(rows)} {visible}")
         if LOOK:
             rows, max_top = [], 0
         template = root.find("btnA")
@@ -85,21 +85,25 @@ def main():
         for r, text in enumerate(rows):
             for slot in sorted({r - top for top in range(max_top + 1) if 0 <= r - top < visible}):
                 rid = f"row{r}s{slot}"
-                node = row_node(template, lx, ly + slot * ROW_H, text, rid)
-                root.children.append(node)
                 for s in ("n", "f"):
+                    if not G.unit(f"{page}_{rid}_{s}"):
+                        continue
+                    node = row_node(template, lx, ly + slot * ROW_H, text, rid)
+                    root.children.append(node)
                     hide_all = {e: {"Show": "false"} for e in everything}
                     img = X.render_guide(G.OPEN, root, rid if s == "f" else None, hide=layer_hide,
                                          scale=G.SCALE, app_state=hide_all)
+                    root.children.remove(node)
                     sub, x0, y0 = O.crop(img)
                     G.save(sub, f"{page}_{rid}_{s}.png")
-                    lines.append(f"layer {page} {rid} {s} {x0} {y0}")
-                root.children.remove(node)
+                    G.emit(f"layer {page} {rid} {s} {x0} {y0}")
         if max_top > 0:
             # the list's scroll ends (its visual's control_ScrollUp / Down),
             # each alone: the list drawn without its template item
             for part, other in (("control_ScrollUp", "control_ScrollDown"),
                                 ("control_ScrollDown", "control_ScrollUp")):
+                if not G.unit(f"{page}_{part}"):
+                    continue
                 X.EXTRA_VISUAL_OVERRIDES = {lst.props.get("Visual") or "XuiList": {
                     "control_ListItem": {"Show": "false"}, other: {"Show": "false"}}}
                 hide_all = {e: {"Show": "false"} for e in everything if e != lid}
@@ -109,12 +113,14 @@ def main():
                 sub, x0, y0 = O.crop(img)
                 if sub is not None:
                     G.save(sub, f"{page}_{part}_n.png")
-                    lines.append(f"layer {page} {part} n {x0} {y0}")
+                    G.emit(f"layer {page} {part} n {x0} {y0}")
         if page == "opttile" and not LOOK:
             # PreviewId: the focused row's tile (rows 2..: TILES; row 1, the
             # default background)
             prev = root.find("PreviewId")
             for r in range(1, len(rows)):
+                if not G.unit(f"opttile_preview{r}"):
+                    continue
                 fill = dict(prev.props.get("Fill") or {})
                 if r == 1:
                     fill = {}
@@ -128,21 +134,23 @@ def main():
                 sub, x0, y0 = O.crop(img)
                 if sub is not None:
                     G.save(sub, f"opttile_preview{r}_n.png")
-                    lines.append(f"layer opttile preview{r} n {x0} {y0}")
+                    G.emit(f"layer opttile preview{r} n {x0} {y0}")
         only_legends = G.CONTENT_HIDE + ("AppHostElementId",)
         for part, hide in G.LEGEND_PARTS:
-            G.save(X.render_guide(G.OPEN, root, hide=only_legends + hide, scale=G.SCALE),
-                   f"{page}_legends_{part}.png")
+            if G.unit(f"{page}_legends_{part}"):
+                G.save(X.render_guide(G.OPEN, root, hide=only_legends + hide, scale=G.SCALE),
+                       f"{page}_legends_{part}.png")
 
     # ColorSelect
     scene = "ColorSelect.xui"
     root = copy.deepcopy(X.cached_canvas(X.ART / "xui" / scene).children[0])
     sliders = ["sliderRed", "sliderGreen", "sliderBlue"]
     everything = O.all_ids(root, [])
-    G.save(X.render_guide(G.OPEN, root, None, hide=no_legends, scale=G.SCALE,
-                          app_state={**{s: {"Show": "false"} for s in sliders},
-                                     "PreviewId": {"Show": "false"}}), "optcolor_base.png")
-    lines.append(f"page optcolor {scene} sliderRed")
+    if G.unit("optcolor_base"):
+        G.save(X.render_guide(G.OPEN, root, None, hide=no_legends, scale=G.SCALE,
+                              app_state={**{s: {"Show": "false"} for s in sliders},
+                                         "PreviewId": {"Show": "false"}}), "optcolor_base.png")
+        G.emit(f"page optcolor {scene} sliderRed")
     if LOOK:
         only_legends = G.CONTENT_HIDE + ("AppHostElementId",)
         for part, hide in G.LEGEND_PARTS:
@@ -151,56 +159,63 @@ def main():
         print("look: bases and legends only")
         return
     # the preview's box and each value's text box (captured)
-    cap_root = copy.deepcopy(root)
-    prev = cap_root.find("PreviewId")
-    prev.cls = "XuiImage"
-    prev.props["ImagePath"] = "\x01cpreview"
-    X.CAPTURE = {}
-    X.render_guide(G.OPEN, cap_root, None, hide=no_legends, scale=G.SCALE,
-                   app_state={s: {"_columns": {1: f"\x01val_{s}"}} for s in sliders})
-    cap, X.CAPTURE = X.CAPTURE, None
-    e = cap["cpreview"]
-    s_ = e["sx"] / K
-    lines.append(f"rect optcolor cpreview {e['tx'] / K:.4f} {e['ty'] / K:.4f} "
-                 f"{e['w'] * s_:.4f} {e['h'] * s_:.4f}")
-    for s in sliders:
-        lines.append(O_item(f"val_{s}", cap[f"val_{s}"]))
+    if G.unit("optcolor_capture"):
+        cap_root = copy.deepcopy(root)
+        prev = cap_root.find("PreviewId")
+        prev.cls = "XuiImage"
+        prev.props["ImagePath"] = "\x01cpreview"
+        X.CAPTURE = {}
+        X.render_guide(G.OPEN, cap_root, None, hide=no_legends, scale=G.SCALE,
+                       app_state={s: {"_columns": {1: f"\x01val_{s}"}} for s in sliders})
+        cap, X.CAPTURE = X.CAPTURE, None
+        e = cap["cpreview"]
+        s_ = e["sx"] / K
+        G.emit(f"rect optcolor cpreview {e['tx'] / K:.4f} {e['ty'] / K:.4f} "
+               f"{e['w'] * s_:.4f} {e['h'] * s_:.4f}")
+        for s in sliders:
+            G.emit(O_item(f"val_{s}", cap[f"val_{s}"]))
     # each slider without its bar and value (its label, panel, focus look)
     for s in sliders:
-        X.EXTRA_VISUAL_OVERRIDES = {"XuiSlider": {"SliderBody": {"Show": "false"},
-                                                  "Text_Slider": {"Show": "false"}}}
         for state in ("n", "f"):
+            if not G.unit(f"optcolor_{s}_{state}"):
+                continue
+            X.EXTRA_VISUAL_OVERRIDES = {"XuiSlider": {"SliderBody": {"Show": "false"},
+                                                      "Text_Slider": {"Show": "false"}}}
             st = {e: {"Show": "false"} for e in everything if e != s}
             img = X.render_guide(G.OPEN, root, s if state == "f" else None, hide=layer_hide,
                                  scale=G.SCALE, app_state=st)
+            X.EXTRA_VISUAL_OVERRIDES = {}
             sub, x0, y0 = O.crop(img)
             G.save(sub, f"optcolor_{s}_{state}.png")
-            lines.append(f"layer optcolor {s} {state} {x0} {y0}")
-        X.EXTRA_VISUAL_OVERRIDES = {}
+            G.emit(f"layer optcolor {s} {state} {x0} {y0}")
     # the bar (SliderBody) at each of its 101 frames, on sliderRed; the
     # overlay places it under the other sliders by their offset (89 units)
-    X.EXTRA_VISUAL_OVERRIDES = {"XuiSlider": {e: {"Show": "false"} for e in (
-        "BG_panel", "XuiNineGrid1", "Text_Slider", "text_Label", "Diabled")}}
     for state in ("n", "f"):
         for frame in range(101):
+            if not G.unit(f"optcolor_bar_{state}{frame}"):
+                continue
+            X.EXTRA_VISUAL_OVERRIDES = {"XuiSlider": {e: {"Show": "false"} for e in (
+                "BG_panel", "XuiNineGrid1", "Text_Slider", "text_Label", "Diabled")}}
             st = {e: {"Show": "false"} for e in everything if e != "sliderRed"}
             st["sliderRed"] = {"RangeMin": "0", "RangeMax": "100", "Value": str(frame)}
             img = X.render_guide(G.OPEN, root, "sliderRed" if state == "f" else None,
                                  hide=layer_hide, scale=G.SCALE, app_state=st)
+            X.EXTRA_VISUAL_OVERRIDES = {}
             sub, x0, y0 = O.crop(img)
             if sub is None:
                 continue
             G.save(sub, f"optcolor_bar_{state}{frame}.png")
-            lines.append(f"layer optcolor bar {state}{frame} {x0} {y0}")
-    X.EXTRA_VISUAL_OVERRIDES = {}
-    for s in sliders:
-        y = X.vec(root.find(s).props.get("Position"))[1]
-        lines.append(f"sliderpos optcolor {s} {y:.4f}")
+            G.emit(f"layer optcolor bar {state}{frame} {x0} {y0}")
+    if G.unit("optcolor_sliderpos"):
+        for s in sliders:
+            y = X.vec(root.find(s).props.get("Position"))[1]
+            G.emit(f"sliderpos optcolor {s} {y:.4f}")
     only_legends = G.CONTENT_HIDE + ("AppHostElementId",)
     for part, hide in G.LEGEND_PARTS:
-        G.save(X.render_guide(G.OPEN, root, hide=only_legends + hide, scale=G.SCALE),
-               f"optcolor_legends_{part}.png")
-    (G.OUT / "themes.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if G.unit(f"optcolor_legends_{part}"):
+            G.save(X.render_guide(G.OPEN, root, hide=only_legends + hide, scale=G.SCALE),
+                   f"optcolor_legends_{part}.png")
+    lines = G.finish("themes.txt")
     print("\n".join(l for l in lines if not l.startswith("layer")))
 
 
@@ -212,4 +227,4 @@ def O_item(name, e):
 
 
 if __name__ == "__main__":
-    main()
+    G.run(main, "themes.txt")

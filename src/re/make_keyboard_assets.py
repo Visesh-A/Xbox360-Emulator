@@ -170,11 +170,41 @@ def main():
         lines.append(f"nav {key} " + " ".join(dirs[d] or "-" for d in ("Up", "Down", "Left", "Right")))
     lines.append(f"default {root.props.get('DefaultFocus')}")
     if parts > 1:
+        # this part's lines, for merge() to put kbd.txt together (setup)
+        head = lines[:next(i for i, l in enumerate(lines) if l.startswith("caret ")) + 1]
+        keys, tail = {}, []
+        for l in lines[len(head):]:
+            kind, name = l.split(" ", 2)[:2]
+            if kind == "focus":
+                keys.setdefault(name, []).append(l)
+            elif kind == "text" and name.startswith("capf."):
+                keys.setdefault(name[5:], []).append(l)
+            else:
+                tail.append(l)
+        (G.OUT / f"kbd_part{part}.json").write_text(
+            json.dumps({"head": head, "keys": keys, "tail": tail}), encoding="utf-8")
         print("part", part, "of", parts, "done")
         return
     (G.OUT / "kbd.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("wrote", len(lines), "lines")
 
 
+def merge(parts):
+    """kbd.txt from the parts' lines, in the single run's order."""
+    data = [json.loads((G.OUT / f"kbd_part{i}.json").read_text(encoding="utf-8"))
+            for i in range(parts)]
+    keys = {}
+    for d in data:
+        keys.update(d["keys"])
+    lines = data[0]["head"] + [l for k in sorted(keys) for l in keys[k]] + data[0]["tail"]
+    (G.OUT / "kbd.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    for i in range(parts):
+        (G.OUT / f"kbd_part{i}.json").unlink()
+    print("wrote", len(lines), "lines")
+
+
 if __name__ == "__main__":
-    main()
+    if os.environ.get("KBD_MERGE"):
+        merge(int(os.environ["KBD_MERGE"]))
+    else:
+        main()

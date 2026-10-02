@@ -9,6 +9,7 @@ Output (next to xenia-dash, loaded by the overlay):
 The other images are the 1120x770 Guide canvas rendered at SCALE.
 """
 import copy
+import json
 import os
 import sys
 from pathlib import Path
@@ -98,6 +99,62 @@ MENU_FOCUS = ["btnSignIn", "btnNewProfile", "btnRecoverProfile", "btnOptions",
 def save(img, name):
     img.save(str(OUT / name), skia.kPNG)
     print("  ", name)
+
+
+# Parts (setup runs a slow script as several processes at once): the script
+# calls unit(name) before each block of work - images and the layout lines
+# they give - and does the block only when unit() says it is this part's
+# (GUIDE_PART "i/n": every n-th unit from i). emit() keeps a line for the
+# block. finish(file) writes the layout file (one part: at once; several:
+# each part's lines, then merge(file, n) puts them together in unit order).
+# A single run (no GUIDE_PART) does every unit and writes the file directly.
+PART, PARTS = (int(v) for v in os.environ.get("GUIDE_PART", "0/1").split("/"))
+_units, _unit_lines, _current = [], {}, None
+
+
+def unit(name):
+    global _current
+    _units.append(name)
+    _current = name if (len(_units) - 1) % PARTS == PART else None
+    return _current is not None
+
+
+def emit(line):
+    assert _current is not None, "emit() outside a unit of this part"
+    _unit_lines.setdefault(_current, []).append(line)
+
+
+def finish(file):
+    if PARTS == 1:
+        lines = [l for u in _units for l in _unit_lines.get(u, [])]
+        (OUT / file).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return lines
+    (OUT / f"{file}.part{PART}.json").write_text(
+        json.dumps({"units": _units, "lines": _unit_lines}), encoding="utf-8")
+    return []
+
+
+def merge(file, parts):
+    units, lines = None, {}
+    for i in range(parts):
+        part = OUT / f"{file}.part{i}.json"
+        d = json.loads(part.read_text(encoding="utf-8"))
+        assert units in (None, d["units"]), f"{file}: the parts ran different units"
+        units = d["units"]
+        lines.update(d["lines"])
+        part.unlink()
+    out = [l for u in units for l in lines.get(u, [])]
+    (OUT / file).write_text("\n".join(out) + "\n", encoding="utf-8")
+    print(f"{file}: {len(out)} lines from {parts} parts")
+
+
+def run(main, *files):
+    """A script's entry: GUIDE_MERGE=n merges its layout files' n parts."""
+    if os.environ.get("GUIDE_MERGE"):
+        for file in files:
+            merge(file, int(os.environ["GUIDE_MERGE"]))
+    else:
+        main()
 
 
 def message_box(title, text, buttons):
@@ -229,8 +286,11 @@ def save_hud_parts():
     """
     for elem, name in HUD_PARTS.items():
         others = tuple(e for e in CONTENT_HIDE if e != elem)
-        save(X.render_guide(FULL, None, hide=others + LEGENDS + ("AppHostElementId", "ErrorHUD"),
-                            scale=SCALE), f"{name}.png")
+        if unit("image"):
+            save(X.render_guide(FULL, None, hide=others + LEGENDS + ("AppHostElementId", "ErrorHUD"),
+                                scale=SCALE), f"{name}.png")
+    if not unit("hud_keys.txt"):
+        return
     root = X.cached_canvas(X.ART / "xui" / "xam_hudbkgnd.xui").children[0]
     lines = []
     for elem_id, props, keys in root.timelines:
@@ -256,6 +316,15 @@ def save_gamertag():
     (m: canvas units per box unit; point (u, v) of the box goes to
     tx + m00 u + m01 v, ty + m10 u + m11 v)."""
     k = X.SUPERSAMPLE * SCALE
+    if unit("gamertag.txt"):
+        save_gamertag_layout(k)
+    # reference: the Guide as xam draws it with a sample gamertag
+    if unit("image"):
+        save(X.render_guide(OPEN, None, hide=LEGENDS, live_text={"GamerTag": "Player1"}, scale=SCALE),
+             "ref_gamertag.png")
+
+
+def save_gamertag_layout(k):
     X.CAPTURE = {}
     X.render_guide(OPEN, None, hide=LEGENDS, live_text={"GamerTag": "\x01gamertag"}, scale=SCALE)
     e, X.CAPTURE = X.CAPTURE["gamertag"], None
@@ -268,9 +337,6 @@ def save_gamertag():
         f"gamertag {key_x:.6f} {e['tx'] / k:.4f} {e['ty'] / k:.4f} {e['sx'] / k:.6f} {kx / k:.6f} "
         f"{ky / k:.6f} {e['sy'] / k:.6f} {e['w']:.4f} {e['h']:.4f} {e['size_px']:.4f} "
         f"{e['ascent']:.4f} {e['line_h']:.4f} {e['style']} {e['color']:08X}\n", encoding="utf-8")
-    # reference: the Guide as xam draws it with a sample gamertag
-    save(X.render_guide(OPEN, None, hide=LEGENDS, live_text={"GamerTag": "Player1"}, scale=SCALE),
-         "ref_gamertag.png")
 
 
 def main():
@@ -280,8 +346,9 @@ def main():
     save_hud_parts()
     save_gamertag()
     print("chrome")
-    save(X.render_guide(OPEN, None, hide=PAGE_HIDE + ("Legend_A", "Legend_B", "Legend_X", "Legend_Y"),
-                        scale=SCALE), "chrome.png")
+    if unit("image"):
+        save(X.render_guide(OPEN, None, hide=PAGE_HIDE + ("Legend_A", "Legend_B", "Legend_X", "Legend_Y"),
+                            scale=SCALE), "chrome.png")
     # Menu/dialog pages (fade in, hide at once on close) and legends (fade in,
     # slide out with the chrome on close) are separate layers, like the timeline.
     # The pages are rendered *on* the chrome, in one pass like the console:
@@ -292,13 +359,16 @@ def main():
     menu = dict(app_state=MENU_STATE, embeds=MENU_EMBEDS)
     print("menu")
     for focus in MENU_FOCUS:
-        save(X.render_guide(OPEN, "MainMenuSignedOut.xui", focus, hide=no_legends, scale=SCALE, **menu),
-             f"menu_{focus}.png")
-    save(X.render_guide(OPEN, "MainMenuSignedOut.xui", hide=only_legends, scale=SCALE, **menu),
-         "legends_menu.png")
+        if unit("image"):
+            save(X.render_guide(OPEN, "MainMenuSignedOut.xui", focus, hide=no_legends, scale=SCALE, **menu),
+                 f"menu_{focus}.png")
+    if unit("image"):
+        save(X.render_guide(OPEN, "MainMenuSignedOut.xui", hide=only_legends, scale=SCALE, **menu),
+             "legends_menu.png")
     for part, hide in LEGEND_PARTS:
-        save(X.render_guide(OPEN, "MainMenuSignedOut.xui", hide=only_legends + hide, scale=SCALE,
-                            **menu), f"menu_legends_{part}.png")
+        if unit("image"):
+            save(X.render_guide(OPEN, "MainMenuSignedOut.xui", hide=only_legends + hide, scale=SCALE,
+                                **menu), f"menu_legends_{part}.png")
     print("message boxes (ErrorHUD)")
     # hud.xex: Y "Xbox Dashboard" in a game -> XamShowMessageBox(title = the
     # legend's caption, Strings.xus 15, [Yes, No], focus 1 = No, icon 2);
@@ -309,31 +379,41 @@ def main():
     for kind, title, text in boxes:
         scene = message_box(title, text, [YES, NO])
         for i, choice in enumerate(("yes", "no")):
-            save(X.render_guide(ERROR, None, f"Button{i}", hide=("GamerTag",), scale=SCALE,
-                                error_scene=scene, size=(ERROR_W, 770), origin_x=ERROR_X),
-                 f"error_{kind}_{choice}.png")
+            if unit("image"):
+                save(X.render_guide(ERROR, None, f"Button{i}", hide=("GamerTag",), scale=SCALE,
+                                    error_scene=scene, size=(ERROR_W, 770), origin_x=ERROR_X),
+                     f"error_{kind}_{choice}.png")
     # full composite for comparison with real footage
-    save(X.render_guide(ERROR, None, "Button1", hide=("GamerTag",), scale=SCALE,
-                        error_scene=message_box(*boxes[0][1:], [YES, NO]), size=(ERROR_X + ERROR_W, 770)),
-         "ref_error_exit.png")
+    if unit("image"):
+        save(X.render_guide(ERROR, None, "Button1", hide=("GamerTag",), scale=SCALE,
+                            error_scene=message_box(*boxes[0][1:], [YES, NO]), size=(ERROR_X + ERROR_W, 770)),
+             "ref_error_exit.png")
     # full composites of the open Guide for pixel comparison with the overlay
-    save(X.render_guide(OPEN, "MainMenuSignedOut.xui", "btnSignIn", hide=("GamerTag",),
-                        live_text={"DateTimeTextId": CLOCK_SAMPLE}, scale=SCALE, **menu), "ref_menu_open.png")
+    if unit("image"):
+        save(X.render_guide(OPEN, "MainMenuSignedOut.xui", "btnSignIn", hide=("GamerTag",),
+                            live_text={"DateTimeTextId": CLOCK_SAMPLE}, scale=SCALE, **menu), "ref_menu_open.png")
     print("xbox live upsell (full-width guide)")
     # XamShowLiveUpsellUI: InfoUpsellLive.xur opens the Guide full width
     # (OpenType 2: hudbkgnd.xur ClosedToFull 164-193 / FullToClosed 194-223).
     upsell = dict(app_state=DIALOG_STATE)
-    save(X.render_guide(FULL, None, hide=PAGE_HIDE + LEGENDS, scale=SCALE), "chrome_full.png")
-    save(X.render_guide(FULL, "InfoUpsellLive.xui", "btnJoinLive", hide=no_legends, scale=SCALE, **upsell),
-         "upsell_live.png")
-    save(X.render_guide(FULL, "InfoUpsellLive.xui", hide=only_legends, scale=SCALE, **upsell),
-         "legends_upsell.png")
+    if unit("image"):
+        save(X.render_guide(FULL, None, hide=PAGE_HIDE + LEGENDS, scale=SCALE), "chrome_full.png")
+    if unit("image"):
+        save(X.render_guide(FULL, "InfoUpsellLive.xui", "btnJoinLive", hide=no_legends, scale=SCALE, **upsell),
+             "upsell_live.png")
+    if unit("image"):
+        save(X.render_guide(FULL, "InfoUpsellLive.xui", hide=only_legends, scale=SCALE, **upsell),
+             "legends_upsell.png")
     for part, hide in LEGEND_PARTS:
-        save(X.render_guide(FULL, "InfoUpsellLive.xui", hide=only_legends + hide, scale=SCALE,
-                            **upsell), f"upsell_legends_{part}.png")
-    save(X.render_guide(FULL, "InfoUpsellLive.xui", "btnJoinLive", hide=("GamerTag",),
-                        live_text={"DateTimeTextId": CLOCK_SAMPLE}, scale=SCALE, **upsell),
-         "ref_upsell_open.png")
+        if unit("image"):
+            save(X.render_guide(FULL, "InfoUpsellLive.xui", hide=only_legends + hide, scale=SCALE,
+                                **upsell), f"upsell_legends_{part}.png")
+    if unit("image"):
+        save(X.render_guide(FULL, "InfoUpsellLive.xui", "btnJoinLive", hide=("GamerTag",),
+                            live_text={"DateTimeTextId": CLOCK_SAMPLE}, scale=SCALE, **upsell),
+             "ref_upsell_open.png")
+    if not unit("layout.txt"):
+        return
     print("battery icons")
     battery_lines = make_battery_icons()
     print("clock atlas")
