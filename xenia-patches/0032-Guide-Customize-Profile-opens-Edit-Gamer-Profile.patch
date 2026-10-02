@@ -1,7 +1,7 @@
 From e4db880e47bbae9f4321802555a77a99fd3dd824 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 18:47:09 +0530
-Subject: [PATCH 32/54] Guide: Customize Profile opens Edit Gamer Profile
+Subject: [PATCH 32/55] Guide: Customize Profile opens Edit Gamer Profile
 
 createprofile's Customize (90104AA8) loads gamerprofile.xex with mode 3
 and ends. gamerprofile's start scene for mode 3 (0x9011B360[6]) is

@@ -1,7 +1,7 @@
 From c72a93118f8d216a47c0a98fe879d3a4656ae41c Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 18:53:23 +0530
-Subject: [PATCH 33/54] Guide: Join Xbox Live from the gamer card
+Subject: [PATCH 33/55] Guide: Join Xbox Live from the gamer card
  (XamShowLiveSignupUI)
 
 The gamer card's Join Xbox Live (9010CB28) closes gamerprofile and calls

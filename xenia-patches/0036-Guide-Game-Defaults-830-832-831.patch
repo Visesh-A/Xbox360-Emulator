@@ -1,7 +1,7 @@
 From 69abde6a8d8364be23f3e36bd30163711992a861 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 20:20:10 +0530
-Subject: [PATCH 36/54] Guide: Game Defaults (830/832/831)
+Subject: [PATCH 36/55] Guide: Game Defaults (830/832/831)
 
 The gamer card's Game Defaults (9010C718) opens 830_GamerPreferences: the
 categories General, Action and Racing (gamerprofile's table at 0x901018C8),

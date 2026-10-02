@@ -1,7 +1,7 @@
 From 85d6830a07fb5815a61fc0e83f3f05f28989d2ab Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 22:15:00 +0530
-Subject: [PATCH 40/54] Auto Sign-In: keep default_profile_xuid as a hex string
+Subject: [PATCH 40/55] Auto Sign-In: keep default_profile_xuid as a hex string
 
 It was a uint64 cvar, saved as a decimal TOML integer. Profile XUIDs
 (E0...) are past INT64_MAX, so once Auto Sign-In was enabled the config

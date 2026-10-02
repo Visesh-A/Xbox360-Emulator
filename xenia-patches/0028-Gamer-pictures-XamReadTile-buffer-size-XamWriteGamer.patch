@@ -1,7 +1,7 @@
 From 75a6343272eab2c8e05c066e89a06cfeb82382b2 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 14:27:14 +0530
-Subject: [PATCH 28/54] Gamer pictures: XamReadTile buffer size,
+Subject: [PATCH 28/55] Gamer pictures: XamReadTile buffer size,
  XamWriteGamerTile, createprofile's pick
 
 - XamReadTile/Ex copied the whole picture into the caller's buffer

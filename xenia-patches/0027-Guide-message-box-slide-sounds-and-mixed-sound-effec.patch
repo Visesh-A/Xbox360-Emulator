@@ -1,7 +1,7 @@
 From c458e209638473796aaccf2fd7331c4ee6a21e5f Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 13:51:07 +0530
-Subject: [PATCH 27/54] Guide: message box slide sounds and mixed sound effects
+Subject: [PATCH 27/55] Guide: message box slide sounds and mixed sound effects
 
 - hudbkgnd's GuideSound plays HUD_close as a Guide <-> message box slide
   starts and HUD_open 30 frames later as its second half comes in

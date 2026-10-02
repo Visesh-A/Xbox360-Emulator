@@ -1,7 +1,7 @@
 From 3a896035ff907402a0f58f45ec645cc18343d49b Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 10:32:40 +0530
-Subject: [PATCH 23/54] Guide: xam's keyframe easing; AddXboxLive's Back and
+Subject: [PATCH 23/55] Guide: xam's keyframe easing; AddXboxLive's Back and
  box hand-offs
 
 - Easing: xam turns a key's EaseIn/EaseOut/EaseScale into a cubic Bezier

@@ -1,0 +1,84 @@
+From d6a179798f387d0044fe1350d034ce4320de182d Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 16:43:52 +0530
+Subject: [PATCH 55/55] Debug: debug_input_log (controller events, UI thread
+ delivery delay, what the Guide sees)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/app/guide_overlay.cc        |  6 ++++++
+ src/xenia/hid/sdl/sdl_input_driver.cc | 19 ++++++++++++++++++-
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 23c70cd07..d5cfec172 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -52,6 +52,7 @@ DECLARE_bool(blades_guide);
+ DECLARE_bool(dashboard_handoff);
+ DECLARE_uint32(retail_flags);
+ DECLARE_int32(draw_resolution_scale_y);
++DECLARE_bool(debug_input_log);
+ DEFINE_string(blades_guide_test, "",
+               "Debug: open the Guide by itself, \"<delay ms>[,<menu item 0-4>"
+               "|exit|off[,yes]]\", for screenshots.",
+@@ -468,6 +469,11 @@ void GuideOverlay::InputThread() {
+       prev |= hid::X_INPUT_GAMEPAD_GUIDE;
+     }
+     uint16_t pressed = buttons & ~prev;
++    if (pressed && cvars::debug_input_log) {
++      std::lock_guard<std::mutex> lock(mutex_);
++      XELOGI("input: Guide sees {:04X} (mode {}, page {}, transition {}, fading {})",
++             pressed, int(mode_), int(page_), int(transition_), opt_fading_);
++    }
+     if (pressed && !cvars::blades_guide_test.empty()) {
+       XELOGI("Guide: test input {:04X}", pressed);
+     }
+diff --git a/src/xenia/hid/sdl/sdl_input_driver.cc b/src/xenia/hid/sdl/sdl_input_driver.cc
+index da171e334..1f13f935b 100644
+--- a/src/xenia/hid/sdl/sdl_input_driver.cc
++++ b/src/xenia/hid/sdl/sdl_input_driver.cc
+@@ -25,6 +25,9 @@
+ #include "xenia/ui/windowed_app_context.h"
+ 
+ // TODO(joellinn) make this path relative to the config folder.
++DEFINE_bool(debug_input_log, false,
++            "Debug: log controller button events and their delivery delays.",
++            "HID");
+ DEFINE_path(mappings_file, "gamecontrollerdb.txt",
+             "Filename of a database with custom game controller mappings.",
+             "SDL");
+@@ -655,6 +658,12 @@ void SDLInputDriver::OnControllerDeviceButtonChanged(const SDL_Event& event) {
+   }
+   controller.state.gamepad.buttons = xbuttons;
+   controller.state_changed = true;
++  if (cvars::debug_input_log) {
++    // event timestamp (SDL ms) vs now: how late the UI thread delivered it
++    XELOGI("input: SDL button {:04X} {} (event {} ms, now {} ms)", xbutton,
++           event.cbutton.state == SDL_PRESSED ? "down" : "up",
++           event.cbutton.timestamp, SDL_GetTicks());
++  }
+ }
+ 
+ std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(
+@@ -777,7 +786,15 @@ void SDLInputDriver::QueueControllerUpdate() {
+   bool is_queued = false;
+   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
+   if (!is_queued) {
+-    window()->app_context().CallInUIThread([this]() {
++    const auto queued_at = std::chrono::steady_clock::now();
++    window()->app_context().CallInUIThread([this, queued_at]() {
++      if (cvars::debug_input_log) {
++        const auto late = std::chrono::duration_cast<std::chrono::milliseconds>(
++            std::chrono::steady_clock::now() - queued_at);
++        if (late.count() >= 30) {
++          XELOGI("input: UI thread pumped SDL {} ms late", late.count());
++        }
++      }
+       SDL_PumpEvents();
+       sdl_pumpevents_queued_ = false;
+     });
+-- 
+2.55.0.windows.3
+

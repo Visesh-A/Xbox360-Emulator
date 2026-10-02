@@ -1,7 +1,7 @@
 From cb565888cc5296a869375cb9fed7fe89298dd088 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 16:46:33 +0530
-Subject: [PATCH 11/54] Guide overlay: confirmations as xam message boxes in
+Subject: [PATCH 11/55] Guide overlay: confirmations as xam message boxes in
  the ErrorHUD
 
 hud.xex (2.0.2858) answers Y "Xbox Dashboard" in a game and "Shut Down"
