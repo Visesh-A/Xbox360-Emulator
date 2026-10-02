@@ -337,31 +337,31 @@ vibration = true                                  	# Toggle controller vibration
 
 
 [HID.WinKey]
-keybind_a = "0xBA"                                	# List of keys to bind to A, separated by spaces
-keybind_b = "0xDE"                                	# List of keys to bind to B, separated by spaces
-keybind_back = "Z"                                	# List of keys to bind to BACK, separated by spaces
-keybind_dpad_down = "^S"                          	# List of keys to bind to DPAD_DOWN, separated by spaces
-keybind_dpad_left = "^A"                          	# List of keys to bind to DPAD_LEFT, separated by spaces
-keybind_dpad_right = "^D"                         	# List of keys to bind to DPAD_RIGHT, separated by spaces
-keybind_dpad_up = "^W"                            	# List of keys to bind to DPAD_UP, separated by spaces
-keybind_guide = "0x08"                            	# List of keys to bind to GUIDE, separated by spaces
-keybind_left_shoulder = "1"                       	# List of keys to bind to LEFT_SHOULDER, separated by spaces
-keybind_left_thumb = "F"                          	# List of keys to bind to LEFT_THUMB_PRESSED, separated by spaces
-keybind_left_thumb_down = "_S"                    	# List of keys to bind to LEFT_THUMB_DOWN, separated by spaces
-keybind_left_thumb_left = "_A"                    	# List of keys to bind to LEFT_THUMB_LEFT, separated by spaces
-keybind_left_thumb_right = "_D"                   	# List of keys to bind to LEFT_THUMB_RIGHT, separated by spaces
-keybind_left_thumb_up = "_W"                      	# List of keys to bind to LEFT_THUMB_UP, separated by spaces
-keybind_left_trigger = "Q I"                      	# List of keys to bind to LEFT_TRIGGER, separated by spaces
-keybind_right_shoulder = "3"                      	# List of keys to bind to RIGHT_SHOULDER, separated by spaces
-keybind_right_thumb = "K"                         	# List of keys to bind to RIGHT_THUMB_PRESSED, separated by spaces
-keybind_right_thumb_down = "0x28"                 	# List of keys to bind to RIGHT_THUMB_DOWN, separated by spaces
-keybind_right_thumb_left = "0x25"                 	# List of keys to bind to RIGHT_THUMB_LEFT, separated by spaces
-keybind_right_thumb_right = "0x27"                	# List of keys to bind to RIGHT_THUMB_RIGHT, separated by spaces
-keybind_right_thumb_up = "0x26"                   	# List of keys to bind to RIGHT_THUMB_UP, separated by spaces
-keybind_right_trigger = "E O"                     	# List of keys to bind to RIGHT_TRIGGER, separated by spaces
-keybind_start = "X"                               	# List of keys to bind to START, separated by spaces
-keybind_x = "L"                                   	# List of keys to bind to X, separated by spaces
-keybind_y = "P"                                   	# List of keys to bind to Y, separated by spaces
+keybind_a = "0x20 0x0D"                           	# List of keys to bind to A, separated by spaces
+keybind_b = "C 0x08"                              	# List of keys to bind to B, separated by spaces
+keybind_back = "0x09"                             	# List of keys to bind to BACK, separated by spaces
+keybind_dpad_down = "0x28"                        	# List of keys to bind to DPAD_DOWN, separated by spaces
+keybind_dpad_left = "0x25"                        	# List of keys to bind to DPAD_LEFT, separated by spaces
+keybind_dpad_right = "0x27"                       	# List of keys to bind to DPAD_RIGHT, separated by spaces
+keybind_dpad_up = "0x26"                          	# List of keys to bind to DPAD_UP, separated by spaces
+keybind_guide = "0x24"                            	# List of keys to bind to GUIDE, separated by spaces
+keybind_left_shoulder = "G"                       	# List of keys to bind to LEFT_SHOULDER, separated by spaces
+keybind_left_thumb = "0x10"                       	# List of keys to bind to LEFT_THUMB_PRESSED, separated by spaces
+keybind_left_thumb_down = "S"                     	# List of keys to bind to LEFT_THUMB_DOWN, separated by spaces
+keybind_left_thumb_left = "A"                     	# List of keys to bind to LEFT_THUMB_LEFT, separated by spaces
+keybind_left_thumb_right = "D"                    	# List of keys to bind to LEFT_THUMB_RIGHT, separated by spaces
+keybind_left_thumb_up = "W"                       	# List of keys to bind to LEFT_THUMB_UP, separated by spaces
+keybind_left_trigger = "MOUSE2"                   	# List of keys to bind to LEFT_TRIGGER, separated by spaces
+keybind_right_shoulder = "F"                      	# List of keys to bind to RIGHT_SHOULDER, separated by spaces
+keybind_right_thumb = "V MOUSE3"                  	# List of keys to bind to RIGHT_THUMB_PRESSED, separated by spaces
+keybind_right_thumb_down = ""                     	# List of keys to bind to RIGHT_THUMB_DOWN, separated by spaces
+keybind_right_thumb_left = ""                     	# List of keys to bind to RIGHT_THUMB_LEFT, separated by spaces
+keybind_right_thumb_right = ""                    	# List of keys to bind to RIGHT_THUMB_RIGHT, separated by spaces
+keybind_right_thumb_up = ""                       	# List of keys to bind to RIGHT_THUMB_UP, separated by spaces
+keybind_right_trigger = "MOUSE1"                  	# List of keys to bind to RIGHT_TRIGGER, separated by spaces
+keybind_start = "0x1B"                            	# List of keys to bind to START, separated by spaces
+keybind_x = "R E"                                 	# List of keys to bind to X, separated by spaces
+keybind_y = "Q WHEEL"                             	# List of keys to bind to Y, separated by spaces
 
 
 [Kernel]

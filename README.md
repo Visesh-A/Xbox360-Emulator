@@ -59,28 +59,36 @@ below. Games and personal saves are yours to add.
 
 ## Controls
 
-A real Xbox 360 has no mouse, and neither does this: the mouse is not used.
+A controller, or keyboard and mouse like a PC game, or both at once: everything on player 1
+works together, so you can switch at any moment.
 
 - **Xbox 360 controller** (wired, or wireless with the PC receiver) works as is, including
   the Guide button.
 - **Other controllers** (DualSense, DualShock, …) through SDL. The DualSense's Create button
   is mapped to Guide and the PS button to Back (`xenia-dash\gamecontrollerdb.txt`).
-- **Keyboard** (on by default, `keyboard_mode = 1`), as player 1's controller:
+- **Keyboard and mouse**, laid out like a PC shooter:
 
-  | Controller | Key | Controller | Key |
+  | Action (controller) | Key / mouse | Action (controller) | Key / mouse |
   |---|---|---|---|
-  | A | `;` | B | `'` |
-  | X | `L` | Y | `P` |
-  | Start | `X` | Back | `Z` |
-  | Guide | `Backspace` | LB / RB | `1` / `3` |
-  | LT / RT | `Q` or `I` / `E` or `O` | Left stick | `W A S D` |
-  | D-pad | `Shift` + `W A S D` | Right stick | arrow keys |
-  | Left / right stick click | `F` / `K` | | |
+  | Move (left stick) | `W A S D` | Aim / look (right stick) | **mouse** |
+  | Fire (RT) | **left click** | Aim down sights (LT) | **right click** |
+  | Jump / confirm (A) | `Space`, `Enter` | Crouch / back (B) | `C`, `Backspace` |
+  | Reload / use (X) | `R`, `E` | Switch weapon (Y) | `Q`, **mouse wheel** |
+  | Grenade (LB) | `G` | RB | `F` |
+  | Sprint (left stick click) | `Shift` | Melee (right stick click) | `V`, **middle click** |
+  | Pause (Start) | `Esc` | Back | `Tab` |
+  | Xbox Guide | `Home` | D-pad / menus | arrow keys |
 
-  Change them with the `keybind_*` settings in `xenia-dash\xenia-canary.config.toml`.
-  While a controller is connected as player 1, it takes priority and the keyboard is not
-  read for player 1. To use both at once, make the keyboard player 2: set
-  `keyboard_user_index = 1` in that file.
+  - **Mouse aim:** click in the game window to capture the mouse (the cursor hides and
+    stays in the window). Press `F8`, or switch to another window, to release it.
+  - Xbox 360 games have no mouse support, so the mouse drives the right stick: moving it
+    faster turns faster. Tune it in `xenia-dash\xenia-canary.config.toml`:
+    `mouse_sensitivity` (1.0 = full stick at 600 pixels per second), `mouse_invert_y`,
+    `mouse_deadzone_offset`, or `mouse_aim = false` to turn it off.
+  - Every key can be changed with the `keybind_*` settings in the same file. Games lay out
+    their buttons differently, so a game may put an action on another button than the
+    names above.
+  - `Esc` is the game's pause button, so it no longer leaves fullscreen: use `F11`.
 
 ## Using it
 
@@ -104,7 +112,7 @@ A real Xbox 360 has no mouse, and neither does this: the mouse is not used.
 | `Setup-Xbox360.ps1` / `.cmd` | builds everything from the system files |
 | `Start-Xbox360.ps1` / `.cmd` | the launcher: boot animation, dashboard, games |
 | `xenia-dash\xenia_canary.exe` | the modified Xenia Canary (Windows x64 build) |
-| `xenia-patches\` | its source: 51 patches on Xenia Canary `02d2cb5` (below) |
+| `xenia-patches\` | its source: 52 patches on Xenia Canary `02d2cb5` (below) |
 | `src\re\` | the Guide's asset scripts (XUI renderer, `make_*_assets.py`) and research tools |
 | `setup\` | setup's steps, pinned packages, config templates, checksums |
 | `Tools\Extract-Stfs.ps1` | extracts the system update package |

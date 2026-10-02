@@ -1,7 +1,7 @@
 From a29d29de482f80d4d0ceb96fab8d9e41d1455f50 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 13:54:07 +0530
-Subject: [PATCH 14/51] Disc picker: highlight the last disc played
+Subject: [PATCH 14/52] Disc picker: highlight the last disc played
 
 Closing the tray with a disc records it in last_disc.txt (replacing
 dvd_drive.txt); the picker highlights it when the tray is empty.

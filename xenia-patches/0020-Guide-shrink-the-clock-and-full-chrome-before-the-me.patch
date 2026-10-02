@@ -1,7 +1,7 @@
 From a0f4ca43b03ec96176e61b4bb45b7d4bed0bdcca Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 23:56:36 +0530
-Subject: [PATCH 20/51] Guide: shrink the clock and full chrome before the menu
+Subject: [PATCH 20/52] Guide: shrink the clock and full chrome before the menu
  images
 
 On the first open after boot the clock was prepared after every menu

@@ -1,7 +1,7 @@
 From 6e418563d840375ab5c4f200edb9da400983b671 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 18:35:44 +0530
-Subject: [PATCH 47/51] Guide: Personal Settings > Themes
+Subject: [PATCH 47/52] Guide: Personal Settings > Themes
 
 hud.xex's SkinSelect / OptionsPersonalization / DashStyleSelect /
 TileSelect / ColorSelect scenes as half-width Guide pages: built-in

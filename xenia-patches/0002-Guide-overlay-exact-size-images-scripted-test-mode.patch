@@ -1,7 +1,7 @@
 From d9dc1689f92d5e4e10a7f7916859fbf0e8981843 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Sun, 27 Sep 2026 23:50:00 +0530
-Subject: [PATCH 02/51] Guide overlay: exact-size images, scripted test mode
+Subject: [PATCH 02/52] Guide overlay: exact-size images, scripted test mode
 
 Resample the Guide images (rendered at 2 px/unit) to the on-screen size on a
 background thread with an area filter and draw them one texel per pixel, instead

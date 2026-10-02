@@ -1,7 +1,7 @@
 From 8e14deca27b852df2b3de1df9a1bd651fd418659 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 13:36:26 +0530
-Subject: [PATCH 45/51] Guide: Recover Gamertag; a new profile becomes the
+Subject: [PATCH 45/52] Guide: Recover Gamertag; a new profile becomes the
  default profile
 
 The signed-out menu's Recover Gamertag (hud 91449490 code 4) calls XamShowLiveSignupUI(user, 1): xam 818EDD78 sends createprofile mode 2 (the second argument picks mode 2, else 1). createprofile's +0x74 is that mode, so like Join Xbox Live it goes to 90103278 (storage device, Family Settings, the Xbox Live question, Checking network status) with nobody signed in; offline that ends at Can't Connect / Exit Session and no profile is made.

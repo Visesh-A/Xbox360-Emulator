@@ -1,7 +1,7 @@
 From 4fa83f9c4ce3bdc7a6b13f12b6ec41b1d01e41e9 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 10:36:03 +0530
-Subject: [PATCH 06/51] XEX patches for XEX1-keyed modules; resource-only XEX;
+Subject: [PATCH 06/52] XEX patches for XEX1-keyed modules; resource-only XEX;
  patched dumps
 
 ApplyPatch derived the patched module's keys with the XEX2 retail/devkit

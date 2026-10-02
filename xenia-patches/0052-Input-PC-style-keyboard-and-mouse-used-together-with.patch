@@ -1,0 +1,475 @@
+From b1d9d12ce292f0de05f18fc2598c056f4548d596 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 11:32:08 +0530
+Subject: [PATCH 52/52] Input: PC-style keyboard and mouse, used together with
+ a controller
+
+The keyboard (keyboard_mode 1) gets PC-game defaults: W A S D left stick,
+Space / Enter A, C / Backspace B, R / E X, Q / wheel Y, G / F bumpers,
+right / left mouse button LT / RT, Shift and V / middle button stick
+clicks, Esc Start, Tab Back, Home Guide, arrows D-pad. MOUSE1-3 and WHEEL
+are binding tokens.
+
+Mouse aim (mouse_aim, mouse_sensitivity, mouse_deadzone_offset,
+mouse_invert_y): a click in the window captures the mouse (hidden, kept
+in the window) and its speed becomes the right stick, past the games'
+dead zone; F8 (mouse_release_key) or losing focus releases it.
+
+InputSystem::GetState combines every device on a player's slot (buttons
+together, each trigger / stick from whichever pushes it further), so a
+controller no longer hides the keyboard and mouse. Esc no longer leaves
+fullscreen while the keyboard is a controller (F11 does).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/app/emulator_window.cc              |   6 +-
+ src/xenia/hid/input_system.cc                 |  50 +++++-
+ src/xenia/hid/winkey/winkey_binding_table.inc |  56 +++---
+ src/xenia/hid/winkey/winkey_input_driver.cc   | 164 +++++++++++++++++-
+ src/xenia/hid/winkey/winkey_input_driver.h    |  19 ++
+ 5 files changed, 258 insertions(+), 37 deletions(-)
+
+diff --git a/src/xenia/app/emulator_window.cc b/src/xenia/app/emulator_window.cc
+index 2060ff8f0..099e2801f 100644
+--- a/src/xenia/app/emulator_window.cc
++++ b/src/xenia/app/emulator_window.cc
+@@ -54,6 +54,7 @@ DECLARE_bool(debug);
+ DECLARE_string(hid);
+ 
+ DECLARE_bool(guide_button);
++DECLARE_int32(keyboard_mode);
+ 
+ DECLARE_bool(clear_memory_page_state);
+ 
+@@ -1057,8 +1058,9 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
+     } break;
+ 
+     case ui::VirtualKey::kEscape: {
+-      // Allow users to escape fullscreen (but not enter it).
+-      if (!window_->IsFullscreen()) {
++      // Allow users to escape fullscreen (but not enter it). Not while the
++      // keyboard is a controller: Esc is its Start (pause); F11 still works.
++      if (!window_->IsFullscreen() || cvars::keyboard_mode == 1) {
+         return;
+       }
+       SetFullscreen(false);
+diff --git a/src/xenia/hid/input_system.cc b/src/xenia/hid/input_system.cc
+index 5a4ed6f41..13838f924 100644
+--- a/src/xenia/hid/input_system.cc
++++ b/src/xenia/hid/input_system.cc
+@@ -11,6 +11,8 @@
+ 
+ #include "xenia/hid/input_system.h"
+ 
++#include <algorithm>
++
+ #include "xenia/base/profiling.h"
+ #include "xenia/hid/hid_flags.h"
+ #include "xenia/hid/input_driver.h"
+@@ -131,17 +133,49 @@ X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
++  // Every device on this player's slot together (a controller and the
++  // keyboard + mouse can be used at once): buttons combined, each trigger and
++  // stick from whichever device pushes it further.
++  InputDriver* first = nullptr;
++  X_INPUT_STATE merged = {};
+   for (auto& driver : filtered_drivers) {
+-    X_RESULT result = driver->GetState(user_index, out_state);
+-    if (result == X_ERROR_SUCCESS) {
+-      UpdateUsedSlot(driver, user_index, true);
+-      AdjustDeadzoneLevels(user_index, &out_state->gamepad);
++    X_INPUT_STATE state = {};
++    if (driver->GetState(user_index, &state) != X_ERROR_SUCCESS) {
++      continue;
++    }
++    if (!first) {
++      first = driver;
++      merged = state;
++      continue;
++    }
++    auto& m = merged.gamepad;
++    const auto& g = state.gamepad;
++    m.buttons = uint16_t(m.buttons) | uint16_t(g.buttons);
++    m.left_trigger = std::max(m.left_trigger, g.left_trigger);
++    m.right_trigger = std::max(m.right_trigger, g.right_trigger);
++    auto further = [](int16_t x, int16_t y, int16_t ox, int16_t oy) {
++      return int64_t(ox) * ox + int64_t(oy) * oy > int64_t(x) * x + int64_t(y) * y;
++    };
++    if (further(m.thumb_lx, m.thumb_ly, g.thumb_lx, g.thumb_ly)) {
++      m.thumb_lx = int16_t(g.thumb_lx);
++      m.thumb_ly = int16_t(g.thumb_ly);
++    }
++    if (further(m.thumb_rx, m.thumb_ry, g.thumb_rx, g.thumb_ry)) {
++      m.thumb_rx = int16_t(g.thumb_rx);
++      m.thumb_ry = int16_t(g.thumb_ry);
++    }
++    // a new packet whenever any device's packet changes
++    merged.packet_number = uint32_t(merged.packet_number) + uint32_t(state.packet_number);
++  }
++  if (first) {
++    *out_state = merged;
++    UpdateUsedSlot(first, user_index, true);
++    AdjustDeadzoneLevels(user_index, &out_state->gamepad);
+ 
+-      if (out_state->gamepad.buttons != 0) {
+-        last_used_slot = user_index;
+-      }
+-      return result;
++    if (out_state->gamepad.buttons != 0) {
++      last_used_slot = user_index;
+     }
++    return X_ERROR_SUCCESS;
+   }
+   UpdateUsedSlot(nullptr, user_index, false);
+   return X_ERROR_DEVICE_NOT_CONNECTED;
+diff --git a/src/xenia/hid/winkey/winkey_binding_table.inc b/src/xenia/hid/winkey/winkey_binding_table.inc
+index 253f8fdae..0574f5ce3 100644
+--- a/src/xenia/hid/winkey/winkey_binding_table.inc
++++ b/src/xenia/hid/winkey/winkey_binding_table.inc
+@@ -9,31 +9,37 @@
+ 
+ // This is a partial file designed to be included by other files when
+ // constructing various tables.
++//
++// PC-game style defaults: W A S D move (left stick), the mouse aims (right
++// stick, mouse_aim), left / right mouse button fire / aim (RT / LT). Keys are
++// Windows virtual-key codes ("0x.."), letters or digits; MOUSE1 / MOUSE2 /
++// MOUSE3 are the left / right / middle buttons and WHEEL the mouse wheel.
++// Several keys may be given, separated by spaces.
+ 
+ // clang-format off
+-XE_HID_WINKEY_BINDING(Guide,       "GUIDE"              , keybind_guide            , "0x08")
+-XE_HID_WINKEY_BINDING(DpadLeft,    "DPAD_LEFT"          , keybind_dpad_left        , "^A"  )
+-XE_HID_WINKEY_BINDING(DpadRight,   "DPAD_RIGHT"         , keybind_dpad_right       , "^D"  )
+-XE_HID_WINKEY_BINDING(DpadDown,    "DPAD_DOWN"          , keybind_dpad_down        , "^S"  )
+-XE_HID_WINKEY_BINDING(DpadUp,      "DPAD_UP"            , keybind_dpad_up          , "^W"  )
+-XE_HID_WINKEY_BINDING(LThumbLeft,  "LEFT_THUMB_LEFT"    , keybind_left_thumb_left  , "_A"  )
+-XE_HID_WINKEY_BINDING(LThumbRight, "LEFT_THUMB_RIGHT"   , keybind_left_thumb_right , "_D"  )
+-XE_HID_WINKEY_BINDING(LThumbDown,  "LEFT_THUMB_DOWN"    , keybind_left_thumb_down  , "_S"  )
+-XE_HID_WINKEY_BINDING(LThumbUp,    "LEFT_THUMB_UP"      , keybind_left_thumb_up    , "_W"  )
+-XE_HID_WINKEY_BINDING(LThumbPress, "LEFT_THUMB_PRESSED" , keybind_left_thumb       , "F"   )
+-XE_HID_WINKEY_BINDING(RThumbUp,    "RIGHT_THUMB_UP"     , keybind_right_thumb_up   , "0x26")
+-XE_HID_WINKEY_BINDING(RThumbDown,  "RIGHT_THUMB_DOWN"   , keybind_right_thumb_down , "0x28")
+-XE_HID_WINKEY_BINDING(RThumbRight, "RIGHT_THUMB_RIGHT"  , keybind_right_thumb_right, "0x27")
+-XE_HID_WINKEY_BINDING(RThumbLeft,  "RIGHT_THUMB_LEFT"   , keybind_right_thumb_left , "0x25")
+-XE_HID_WINKEY_BINDING(RThumbPress, "RIGHT_THUMB_PRESSED", keybind_right_thumb      , "K"   )
+-XE_HID_WINKEY_BINDING(X,           "X"                  , keybind_x                , "L"   )
+-XE_HID_WINKEY_BINDING(B,           "B"                  , keybind_b                , "0xDE")
+-XE_HID_WINKEY_BINDING(A,           "A"                  , keybind_a                , "0xBA")
+-XE_HID_WINKEY_BINDING(Y,           "Y"                  , keybind_y                , "P"   )
+-XE_HID_WINKEY_BINDING(LTrigger,    "LEFT_TRIGGER"       , keybind_left_trigger     , "Q I" )
+-XE_HID_WINKEY_BINDING(RTrigger,    "RIGHT_TRIGGER"      , keybind_right_trigger    , "E O" )
+-XE_HID_WINKEY_BINDING(Back,        "BACK"               , keybind_back             , "Z"   )
+-XE_HID_WINKEY_BINDING(Start,       "START"              , keybind_start            , "X"   )
+-XE_HID_WINKEY_BINDING(LShoulder,   "LEFT_SHOULDER"      , keybind_left_shoulder    , "1"   )
+-XE_HID_WINKEY_BINDING(RShoulder,   "RIGHT_SHOULDER"     , keybind_right_shoulder   , "3"   )
++XE_HID_WINKEY_BINDING(Guide,       "GUIDE"              , keybind_guide            , "0x24"        ) // Home
++XE_HID_WINKEY_BINDING(DpadLeft,    "DPAD_LEFT"          , keybind_dpad_left        , "0x25"        ) // arrows
++XE_HID_WINKEY_BINDING(DpadRight,   "DPAD_RIGHT"         , keybind_dpad_right       , "0x27"        )
++XE_HID_WINKEY_BINDING(DpadDown,    "DPAD_DOWN"          , keybind_dpad_down        , "0x28"        )
++XE_HID_WINKEY_BINDING(DpadUp,      "DPAD_UP"            , keybind_dpad_up          , "0x26"        )
++XE_HID_WINKEY_BINDING(LThumbLeft,  "LEFT_THUMB_LEFT"    , keybind_left_thumb_left  , "A"           )
++XE_HID_WINKEY_BINDING(LThumbRight, "LEFT_THUMB_RIGHT"   , keybind_left_thumb_right , "D"           )
++XE_HID_WINKEY_BINDING(LThumbDown,  "LEFT_THUMB_DOWN"    , keybind_left_thumb_down  , "S"           )
++XE_HID_WINKEY_BINDING(LThumbUp,    "LEFT_THUMB_UP"      , keybind_left_thumb_up    , "W"           )
++XE_HID_WINKEY_BINDING(LThumbPress, "LEFT_THUMB_PRESSED" , keybind_left_thumb       , "0x10"        ) // Shift: sprint
++XE_HID_WINKEY_BINDING(RThumbUp,    "RIGHT_THUMB_UP"     , keybind_right_thumb_up   , ""            ) // the mouse
++XE_HID_WINKEY_BINDING(RThumbDown,  "RIGHT_THUMB_DOWN"   , keybind_right_thumb_down , ""            )
++XE_HID_WINKEY_BINDING(RThumbRight, "RIGHT_THUMB_RIGHT"  , keybind_right_thumb_right, ""            )
++XE_HID_WINKEY_BINDING(RThumbLeft,  "RIGHT_THUMB_LEFT"   , keybind_right_thumb_left , ""            )
++XE_HID_WINKEY_BINDING(RThumbPress, "RIGHT_THUMB_PRESSED", keybind_right_thumb      , "V MOUSE3"    ) // melee
++XE_HID_WINKEY_BINDING(X,           "X"                  , keybind_x                , "R E"         ) // reload / use
++XE_HID_WINKEY_BINDING(B,           "B"                  , keybind_b                , "C 0x08"      ) // crouch, Backspace
++XE_HID_WINKEY_BINDING(A,           "A"                  , keybind_a                , "0x20 0x0D"   ) // Space, Enter
++XE_HID_WINKEY_BINDING(Y,           "Y"                  , keybind_y                , "Q WHEEL"     ) // switch weapon
++XE_HID_WINKEY_BINDING(LTrigger,    "LEFT_TRIGGER"       , keybind_left_trigger     , "MOUSE2"      ) // aim
++XE_HID_WINKEY_BINDING(RTrigger,    "RIGHT_TRIGGER"      , keybind_right_trigger    , "MOUSE1"      ) // fire
++XE_HID_WINKEY_BINDING(Back,        "BACK"               , keybind_back             , "0x09"        ) // Tab
++XE_HID_WINKEY_BINDING(Start,       "START"              , keybind_start            , "0x1B"        ) // Esc
++XE_HID_WINKEY_BINDING(LShoulder,   "LEFT_SHOULDER"      , keybind_left_shoulder    , "G"           ) // grenade
++XE_HID_WINKEY_BINDING(RShoulder,   "RIGHT_SHOULDER"     , keybind_right_shoulder   , "F"           )
+ // clang-format on
+diff --git a/src/xenia/hid/winkey/winkey_input_driver.cc b/src/xenia/hid/winkey/winkey_input_driver.cc
+index 3ff5beaff..82c126932 100644
+--- a/src/xenia/hid/winkey/winkey_input_driver.cc
++++ b/src/xenia/hid/winkey/winkey_input_driver.cc
+@@ -9,12 +9,17 @@
+ 
+ #include "xenia/hid/winkey/winkey_input_driver.h"
+ 
++#include <algorithm>
++#include <cmath>
++
+ #include "xenia/base/logging.h"
+ #include "xenia/base/platform_win.h"
+ #include "xenia/hid/hid_flags.h"
+ #include "xenia/hid/input_system.h"
+ #include "xenia/ui/virtual_key.h"
+ #include "xenia/ui/window.h"
++#include "xenia/ui/window_win.h"
++#include "xenia/ui/windowed_app_context.h"
+ 
+ #define XE_HID_WINKEY_BINDING(button, description, cvar_name, \
+                               cvar_default_value)             \
+@@ -37,6 +42,23 @@ DEFINE_int32(
+     "selected slot. Passthrough does not require assigning slot.",
+     "HID");
+ 
++DEFINE_bool(mouse_aim, true,
++            "Keyboard as a controller: the mouse moves the right stick (aim / "
++            "look). Click in the window to capture the mouse.",
++            "HID");
++DEFINE_double(mouse_sensitivity, 1.0,
++              "Mouse aim speed (1 = full stick at 600 pixels per second).",
++              "HID");
++DEFINE_double(mouse_deadzone_offset, 0.25,
++              "Smallest right stick deflection a mouse movement gives (games "
++              "ignore small stick movements; 0.25 skips the usual dead zone).",
++              "HID");
++DEFINE_bool(mouse_invert_y, false, "Invert the mouse's vertical aim.", "HID");
++DEFINE_string(mouse_release_key, "0x77",
++              "Key (virtual-key code) that releases the captured mouse "
++              "(default F8); click in the window to capture it again.",
++              "HID");
++
+ namespace xe {
+ namespace hid {
+ namespace winkey {
+@@ -85,6 +107,19 @@ void WinKeyInputDriver::ParseKeyBinding(ui::VirtualKey output_key,
+       token = token.substr(1);
+     }
+ 
++    if (token == "WHEEL") {
++      key_binding.wheel = true;
++      key_bindings_.push_back(key_binding);
++      continue;
++    }
++    if (token == "MOUSE1") {
++      token = "0x01";  // VK_LBUTTON
++    } else if (token == "MOUSE2") {
++      token = "0x02";  // VK_RBUTTON
++    } else if (token == "MOUSE3") {
++      token = "0x04";  // VK_MBUTTON
++    }
++
+     if (utf8::starts_with(token, "0x")) {
+       token = token.substr(2);
+       key_binding.input_key = static_cast<ui::VirtualKey>(
+@@ -122,6 +157,90 @@ WinKeyInputDriver::WinKeyInputDriver(xe::ui::Window* window,
+ 
+ WinKeyInputDriver::~WinKeyInputDriver() {
+   window()->RemoveInputListener(&window_input_listener_);
++  if (mouse_captured_) {
++    ClipCursor(nullptr);
++  }
++}
++
++void WinKeyInputDriver::CaptureMouse(bool capture) {
++  if (capture == mouse_captured_) {
++    return;
++  }
++  auto* win32 = static_cast<ui::Win32Window*>(window());
++  if (capture) {
++    RECT rect;
++    GetClientRect(win32->hwnd(), &rect);
++    POINT corners[2] = {{rect.left, rect.top}, {rect.right, rect.bottom}};
++    MapWindowPoints(win32->hwnd(), nullptr, corners, 2);
++    RECT screen = {corners[0].x, corners[0].y, corners[1].x, corners[1].y};
++    ClipCursor(&screen);
++    SetCursorPos((screen.left + screen.right) / 2,
++                 (screen.top + screen.bottom) / 2);
++    while (ShowCursor(FALSE) >= 0) {
++    }
++    mouse_acc_x_ = mouse_acc_y_ = 0;
++    mouse_stick_x_ = mouse_stick_y_ = 0;
++    mouse_updated_ = std::chrono::steady_clock::now();
++  } else {
++    ClipCursor(nullptr);
++    while (ShowCursor(TRUE) < 0) {
++    }
++  }
++  mouse_captured_ = capture;
++  XELOGI("winkey: mouse {}", capture ? "captured (aim)" : "released");
++}
++
++// Mouse speed (pixels per second, over at least 8 ms) as the stick's
++// deflection: a look rate, like a stick held over. The cursor goes back to
++// the window's centre each time.
++void WinKeyInputDriver::UpdateMouse(int16_t& thumb_rx, int16_t& thumb_ry) {
++  auto* win32 = static_cast<ui::Win32Window*>(window());
++  RECT rect;
++  GetClientRect(win32->hwnd(), &rect);
++  POINT center = {(rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2};
++  ClientToScreen(win32->hwnd(), &center);
++  POINT cursor;
++  if (GetCursorPos(&cursor)) {
++    mouse_acc_x_ += cursor.x - center.x;
++    mouse_acc_y_ += cursor.y - center.y;
++    if (cursor.x != center.x || cursor.y != center.y) {
++      SetCursorPos(center.x, center.y);
++    }
++  }
++  const auto now = std::chrono::steady_clock::now();
++  const double seconds =
++      std::chrono::duration<double>(now - mouse_updated_).count();
++  if (seconds >= 0.008) {
++    const double full = 600.0 / std::max(0.01, cvars::mouse_sensitivity);
++    double x = mouse_acc_x_ / seconds / full;
++    double y = -mouse_acc_y_ / seconds / full;
++    if (cvars::mouse_invert_y) {
++      y = -y;
++    }
++    const double length = std::sqrt(x * x + y * y);
++    if (length > 0.0001) {
++      // past the game's dead zone at once, full at length 1
++      const double offset = std::clamp(cvars::mouse_deadzone_offset, 0.0, 0.9);
++      const double scaled =
++          std::min(1.0, offset + (1.0 - offset) * std::min(1.0, length));
++      x = x / length * scaled;
++      y = y / length * scaled;
++    }
++    // a little smoothing: mouse reports arrive unevenly between polls
++    mouse_stick_x_ = 0.5 * mouse_stick_x_ + 0.5 * x;
++    mouse_stick_y_ = 0.5 * mouse_stick_y_ + 0.5 * y;
++    if (length <= 0.0001 && std::abs(mouse_stick_x_) < 0.02 &&
++        std::abs(mouse_stick_y_) < 0.02) {
++      mouse_stick_x_ = mouse_stick_y_ = 0;
++    }
++    mouse_acc_x_ = mouse_acc_y_ = 0;
++    mouse_updated_ = now;
++  }
++  auto add = [](int16_t& axis, double value) {
++    axis = int16_t(std::clamp(axis + value * 32767.0, -32768.0, 32767.0));
++  };
++  add(thumb_rx, mouse_stick_x_);
++  add(thumb_ry, mouse_stick_y_);
+ }
+ 
+ X_STATUS WinKeyInputDriver::Setup() { return X_STATUS_SUCCESS; }
+@@ -169,12 +288,29 @@ X_RESULT WinKeyInputDriver::GetState(uint32_t user_index,
+   int16_t thumb_rx = 0;
+   int16_t thumb_ry = 0;
+ 
+-  if (window()->HasFocus()) {
++  const bool focused = window()->HasFocus();
++  if (mouse_captured_ && !release_requested_) {
++    // focus lost (another window, the disc picker) or the release key
++    const uint8_t release_key = uint8_t(
++        std::strtoul(cvars::mouse_release_key.c_str(), nullptr, 16));
++    const bool release_down = release_key && IsKeyDown(release_key);
++    if (!focused || (release_down && !release_key_was_down_)) {
++      release_requested_ = true;
++      window()->app_context().CallInUIThread([this]() {
++        CaptureMouse(false);
++        release_requested_ = false;
++      });
++    }
++    release_key_was_down_ = release_down;
++  }
++  const bool wheel = std::chrono::steady_clock::now().time_since_epoch().count() <
++                     wheel_until_;
++  if (focused) {
+     bool capital = IsKeyToggled(VK_CAPITAL) || IsKeyDown(VK_SHIFT);
+     for (const KeyBinding& b : key_bindings_) {
+       if (((b.lowercase == b.uppercase) || (b.lowercase && !capital) ||
+            (b.uppercase && capital)) &&
+-          IsKeyDown(b.input_key)) {
++          (b.wheel ? wheel : IsKeyDown(b.input_key))) {
+         switch (b.output_key) {
+           case ui::VirtualKey::kXInputPadA:
+             buttons |= X_INPUT_GAMEPAD_A;
+@@ -256,6 +392,10 @@ X_RESULT WinKeyInputDriver::GetState(uint32_t user_index,
+     }
+   }
+ 
++  if (focused && mouse_captured_ && !release_requested_) {
++    UpdateMouse(thumb_rx, thumb_ry);
++  }
++
+   out_state->packet_number = packet_number_;
+   out_state->gamepad.buttons = buttons;
+   out_state->gamepad.left_trigger = left_trigger;
+@@ -377,6 +517,26 @@ void WinKeyInputDriver::WinKeyWindowInputListener::OnKeyUp(ui::KeyEvent& e) {
+   driver_.OnKey(e, false);
+ }
+ 
++void WinKeyInputDriver::WinKeyWindowInputListener::OnMouseDown(
++    ui::MouseEvent& e) {
++  if (cvars::mouse_aim &&
++      static_cast<KeyboardMode>(cvars::keyboard_mode) ==
++          KeyboardMode::Enabled &&
++      e.button() == ui::MouseEvent::Button::kLeft) {
++    driver_.CaptureMouse(true);
++  }
++}
++
++void WinKeyInputDriver::WinKeyWindowInputListener::OnMouseWheel(
++    ui::MouseEvent& e) {
++  if (e.scroll_y() != 0) {
++    driver_.wheel_until_ =
++        (std::chrono::steady_clock::now() + std::chrono::milliseconds(120))
++            .time_since_epoch()
++            .count();
++  }
++}
++
+ void WinKeyInputDriver::OnKey(ui::KeyEvent& e, bool is_down) {
+   if (static_cast<KeyboardMode>(cvars::keyboard_mode) ==
+       KeyboardMode::Disabled) {
+diff --git a/src/xenia/hid/winkey/winkey_input_driver.h b/src/xenia/hid/winkey/winkey_input_driver.h
+index 7bdba0a31..c9645c7a2 100644
+--- a/src/xenia/hid/winkey/winkey_input_driver.h
++++ b/src/xenia/hid/winkey/winkey_input_driver.h
+@@ -13,6 +13,9 @@
+ #include <queue>
+ 
+ #include "xenia/base/mutex.h"
++#include <atomic>
++#include <chrono>
++
+ #include "xenia/hid/input_driver.h"
+ #include "xenia/ui/virtual_key.h"
+ 
+@@ -50,6 +53,7 @@ class WinKeyInputDriver final : public InputDriver {
+     ui::VirtualKey output_key = ui::VirtualKey::kNone;
+     bool uppercase = false;
+     bool lowercase = false;
++    bool wheel = false;  // the mouse wheel (a short press per notch)
+   };
+ 
+   class WinKeyWindowInputListener final : public ui::WindowInputListener {
+@@ -59,6 +63,8 @@ class WinKeyInputDriver final : public InputDriver {
+ 
+     void OnKeyDown(ui::KeyEvent& e) override;
+     void OnKeyUp(ui::KeyEvent& e) override;
++    void OnMouseDown(ui::MouseEvent& e) override;
++    void OnMouseWheel(ui::MouseEvent& e) override;
+ 
+    private:
+     WinKeyInputDriver& driver_;
+@@ -70,6 +76,19 @@ class WinKeyInputDriver final : public InputDriver {
+ 
+   void OnKey(ui::KeyEvent& e, bool is_down);
+ 
++  // Mouse aim (mouse_aim): a click in the window captures the mouse (cursor
++  // hidden, kept in the window); its movement becomes the right stick.
++  // Released when the window loses focus or with mouse_release_key.
++  void CaptureMouse(bool capture);  // UI thread
++  void UpdateMouse(int16_t& thumb_rx, int16_t& thumb_ry);
++  std::atomic<bool> mouse_captured_{false};
++  std::atomic<bool> release_requested_{false};
++  bool release_key_was_down_ = false;
++  double mouse_acc_x_ = 0, mouse_acc_y_ = 0;  // pixels since the last update
++  double mouse_stick_x_ = 0, mouse_stick_y_ = 0;
++  std::chrono::steady_clock::time_point mouse_updated_;
++  std::atomic<int64_t> wheel_until_{0};  // steady_clock ticks
++
+   WinKeyWindowInputListener window_input_listener_;
+ 
+   xe::global_critical_region global_critical_region_;
+-- 
+2.55.0.windows.3
+
