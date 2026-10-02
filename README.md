@@ -50,7 +50,7 @@ below. Games and personal saves are yours to add.
    (e.g. `D:\Xbox360`).
 2. Put the two `.rar` files in `setup\downloads`.
 3. Run **`Setup-Xbox360.cmd`**. Most of the time goes into rendering every Guide screen
-   (about 1,400 images) from the console's art: about 25 minutes on a 24-thread CPU,
+   (about 1,400 images) from the console's art: about 10 minutes on a 24-thread CPU,
    longer on fewer cores. At the end it compares every built file with the reference
    setup's checksums (`setup\manifests\expected.sha256`). "1423 of 1423 files identical"
    means your copy matches the original exactly.
