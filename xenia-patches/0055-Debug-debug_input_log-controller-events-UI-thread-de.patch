@@ -1,7 +1,7 @@
 From d6a179798f387d0044fe1350d034ce4320de182d Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Fri, 2 Oct 2026 16:43:52 +0530
-Subject: [PATCH 55/56] Debug: debug_input_log (controller events, UI thread
+Subject: [PATCH 55/58] Debug: debug_input_log (controller events, UI thread
  delivery delay, what the Guide sees)
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>

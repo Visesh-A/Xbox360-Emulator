@@ -1,7 +1,7 @@
 From 3fae1a66be7558c555e1826888df3800cb735dbc Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 19:56:30 +0530
-Subject: [PATCH 18/56] Guide: authentic gamer profile creation
+Subject: [PATCH 18/58] Guide: authentic gamer profile creation
  (createprofile.xex flow)
 
 XamShowCreateProfileUIEx is routed to the Guide overlay: vk's gamertag

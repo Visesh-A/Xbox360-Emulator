@@ -112,7 +112,7 @@ works together, so you can switch at any moment.
 | `Setup-Xbox360.ps1` / `.cmd` | builds everything from the system files |
 | `Start-Xbox360.ps1` / `.cmd` | the launcher: boot animation, dashboard, games |
 | `xenia-dash\xenia_canary.exe` | the modified Xenia Canary (Windows x64 build) |
-| `xenia-patches\` | its source: 56 patches on Xenia Canary `02d2cb5` (below) |
+| `xenia-patches\` | its source: 58 patches on Xenia Canary `02d2cb5` (below) |
 | `src\re\` | the Guide's asset scripts (XUI renderer, `make_*_assets.py`) and research tools |
 | `setup\` | setup's steps, pinned packages, config templates, checksums |
 | `Tools\Extract-Stfs.ps1` | extracts the system update package |

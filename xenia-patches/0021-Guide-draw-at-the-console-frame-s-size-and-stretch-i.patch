@@ -1,7 +1,7 @@
 From 25ee7e677d05173f7c54b3066135a09bd6de475d Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 09:01:08 +0530
-Subject: [PATCH 21/56] Guide: draw at the console frame's size and stretch it
+Subject: [PATCH 21/58] Guide: draw at the console frame's size and stretch it
  like the dashboard
 
 The Guide was drawn at the window's full resolution, sharper and thinner

@@ -1,7 +1,7 @@
 From 3e32da7acfdbc8a13de0a1213679a914010f7671 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 11:29:54 +0530
-Subject: [PATCH 24/56] Guide: frame base, blade and ring of light placed by
+Subject: [PATCH 24/58] Guide: frame base, blade and ring of light placed by
  hudbkgnd's keyframes
 
 The Guide's frame pieces now move by their own keyframes (hud_keys.txt,

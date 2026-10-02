@@ -1,7 +1,7 @@
 From 02dbfb8f658fa299df2b1d3b26bbe883848743bb Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 00:38:32 +0530
-Subject: [PATCH 43/56] Guide: Personal Settings (hud.xex Options.xur and its
+Subject: [PATCH 43/58] Guide: Personal Settings (hud.xex Options.xur and its
  scenes)
 
 btnOptions' PressPath on both main menus opens Options.xur (OptionsScene 9144AC80): signed out (HUD state 6) Voice, Vibration, Themes and Active Downloads are disabled (message 0x7D3 = the control's Enabled flag, xam 81926524); a profile without an Xbox Live account (state 9) has Online Status disabled. Vibration (0x10040003), Notifications (XNotifyUISetOptions, kept in the config), Online Status (preset presence, then back), Voice (volume 0x1004000E, mute 0x1004000C, output 0x1004000D) and Shut Down (the Turn Off box, No returns to Options), with the scenes' trans_FadeOut / trans_FadeIn. Pages are a base image plus a layer per control state (make_options_assets.py). xam's default profile settings (table 0x818856E4): voice volume 100 and auto aim 1 added. Themes and Active Downloads are not built yet.

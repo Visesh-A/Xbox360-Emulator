@@ -1,7 +1,7 @@
 From 384dad079e23d81c092fe105d8e8f2f6bf57d99e Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 21:20:37 +0530
-Subject: [PATCH 38/56] Guide: signed-in menu, Sign Out, profile count, menu
+Subject: [PATCH 38/58] Guide: signed-in menu, Sign Out, profile count, menu
  actions
 
 The Guide shows hud.xex's MainMenuSignedIn when its controller has a

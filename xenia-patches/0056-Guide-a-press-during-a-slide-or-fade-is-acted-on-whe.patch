@@ -1,7 +1,7 @@
 From 978e2a3919007e7db29d8d1a78f9d7ea017dcc7b Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Fri, 2 Oct 2026 16:56:15 +0530
-Subject: [PATCH 56/56] Guide: a press during a slide or fade is acted on when
+Subject: [PATCH 56/58] Guide: a press during a slide or fade is acted on when
  it ends
 
 The pages ignore presses while a transition runs, so a quick second press

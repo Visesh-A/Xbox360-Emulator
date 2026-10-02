@@ -1,0 +1,87 @@
+From b2f05603b2519625398bf21d7058e35c23f9b6b1 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 17:14:31 +0530
+Subject: [PATCH 58/58] Debug: debug_input_log shows what the title gets
+
+Keystrokes delivered to the title, when a dialog holds them back, and
+gaps of 40 ms or more between the title's keystroke polls.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/hid/input_system.cc     | 10 ++++++++++
+ src/xenia/kernel/xam/xam_input.cc | 23 ++++++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/src/xenia/hid/input_system.cc b/src/xenia/hid/input_system.cc
+index 13838f924..fcabe7abc 100644
+--- a/src/xenia/hid/input_system.cc
++++ b/src/xenia/hid/input_system.cc
+@@ -22,6 +22,8 @@
+ #include "xenia/hid/portal/hardware_portal.h"
+ #endif  // XE_PLATFORM_WIN32
+ 
++DECLARE_bool(debug_input_log);
++
+ namespace xe {
+ namespace hid {
+ 
+@@ -213,6 +215,14 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+ 
+     if (result == X_ERROR_SUCCESS) {
+       last_used_slot = user_index;
++      if (::cvars::debug_input_log &&
++          !(out_keystroke->flags & X_INPUT_KEYSTROKE_REPEAT)) {
++        XELOGI("input: title gets key {:04X} {} (user {})",
++               uint16_t(out_keystroke->virtual_key),
++               (out_keystroke->flags & X_INPUT_KEYSTROKE_KEYDOWN) ? "down"
++                                                                  : "up",
++               user_index);
++      }
+       return result;
+     }
+ 
+diff --git a/src/xenia/kernel/xam/xam_input.cc b/src/xenia/kernel/xam/xam_input.cc
+index 1be291290..956c1a700 100644
+--- a/src/xenia/kernel/xam/xam_input.cc
++++ b/src/xenia/kernel/xam/xam_input.cc
+@@ -24,6 +24,8 @@
+ #include "xenia/kernel/xam/xam_private.h"
+ #include "xenia/xbox.h"
+ 
++DECLARE_bool(debug_input_log);
++
+ DEFINE_bool(blades_guide, false,
+             "Show the 2006 Xbox Guide overlay on the Guide button (images in "
+             "the 'guide' folder next to the executable). The Guide button is "
+@@ -361,7 +363,26 @@ dword_result_t XamInputGetKeystrokeEx_entry(
+ 
+   keystroke.Zero();
+ 
+-  if (kernel_state()->xam_state()->IsUIActive()) {
++  // debug_input_log: what the title gets (and when a dialog holds it back)
++  if (cvars::debug_input_log) {
++    // how often the title asks: a gap longer than a quick tap can miss it
++    static std::chrono::steady_clock::time_point last_poll;
++    const auto poll = std::chrono::steady_clock::now();
++    const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(
++                         poll - last_poll)
++                         .count();
++    if (last_poll.time_since_epoch().count() && gap >= 40) {
++      XELOGI("input: title asked for keystrokes after {} ms", gap);
++    }
++    last_poll = poll;
++  }
++  static std::atomic<bool> was_blocked{false};
++  const bool blocked = kernel_state()->xam_state()->IsUIActive();
++  if (cvars::debug_input_log && was_blocked.exchange(blocked) != blocked) {
++    XELOGI("input: title keystrokes {}", blocked ? "held back (UI active)"
++                                                  : "delivered again");
++  }
++  if (blocked) {
+     return X_ERROR_SUCCESS;
+   }
+ 
+-- 
+2.55.0.windows.3
+

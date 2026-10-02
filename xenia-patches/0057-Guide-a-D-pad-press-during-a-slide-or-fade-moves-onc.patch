@@ -1,0 +1,41 @@
+From 9445dffbb6f2a5d040c67f59c0aa1ebb19742d43 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 17:14:31 +0530
+Subject: [PATCH 57/58] Guide: a D-pad press during a slide or fade moves once
+ it ends
+
+The D-pad moves on its own path (held, with repeat), so the queued press
+replays its move too.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/app/guide_overlay.cc | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/xenia/app/guide_overlay.cc b/src/xenia/app/guide_overlay.cc
+index 155985360..cd700a337 100644
+--- a/src/xenia/app/guide_overlay.cc
++++ b/src/xenia/app/guide_overlay.cc
+@@ -525,6 +525,18 @@ void GuideOverlay::InputThread() {
+       } else if (!busy && queued_pressed) {
+         if (now - queued_at < std::chrono::seconds(1)) {
+           pressed |= queued_pressed;
++          // the D-pad moves on its own path (held, with repeat), not pressed
++          static const std::pair<uint16_t, Direction> kDpad[] = {
++              {hid::X_INPUT_GAMEPAD_DPAD_UP, kUp},
++              {hid::X_INPUT_GAMEPAD_DPAD_DOWN, kDown},
++              {hid::X_INPUT_GAMEPAD_DPAD_LEFT, kLeft},
++              {hid::X_INPUT_GAMEPAD_DPAD_RIGHT, kRight}};
++          for (auto& [bit, direction] : kDpad) {
++            if (queued_pressed & bit) {
++              Move(direction);
++              break;
++            }
++          }
+           if (cvars::debug_input_log) {
+             XELOGI("input: Guide acts on {:04X}, pressed during a transition",
+                    queued_pressed);
+-- 
+2.55.0.windows.3
+

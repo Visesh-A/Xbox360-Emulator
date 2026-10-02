@@ -1,7 +1,7 @@
 From 0d18efffe27208ae654ed414112151b1c2f15552 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 11:49:35 +0530
-Subject: [PATCH 25/56] Create profile: createprofile's first scene and the
+Subject: [PATCH 25/58] Create profile: createprofile's first scene and the
  keyboard's frame changes
 
 From the code: createprofile starts with CreateGamerProfile.xur (90105388,

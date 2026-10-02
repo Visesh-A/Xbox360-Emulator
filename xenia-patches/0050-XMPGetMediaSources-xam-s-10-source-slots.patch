@@ -1,7 +1,7 @@
 From e7eca47c13dc341554876cdf9a62ce0351ec93cb Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 20:39:19 +0530
-Subject: [PATCH 50/56] XMPGetMediaSources: xam's 10 source slots
+Subject: [PATCH 50/58] XMPGetMediaSources: xam's 10 source slots
 
 The count query returns 10; each slot's 0xB4-byte record as xam
 81A3FE68 fills it (slot, id, type, flags, state, name): the hard

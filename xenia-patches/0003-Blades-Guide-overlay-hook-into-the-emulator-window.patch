@@ -1,7 +1,7 @@
 From 08bb7d15c557b04feb857dc8bf1984521d6d8757 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Sun, 27 Sep 2026 23:50:09 +0530
-Subject: [PATCH 03/56] Blades Guide overlay: hook into the emulator window
+Subject: [PATCH 03/58] Blades Guide overlay: hook into the emulator window
 
 --blades_guide creates the GuideOverlay once the emulator is initialized and
 keeps the Guide button from reaching titles (the overlay owns it, like xam on
