@@ -1,7 +1,7 @@
 From c381c07fc5e097d2e1ef2d85f6341c99ef9ac511 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 00:25:29 +0530
-Subject: [PATCH 04/53] Guide overlay: eased slide like hudbkgnd.xur
+Subject: [PATCH 04/54] Guide overlay: eased slide like hudbkgnd.xur
 
 The frame scene's slide keys use interpolation 2 (ease): EaseOut 100 when the
 Guide opens, EaseIn 100 when it closes. Approximated as quadratic.

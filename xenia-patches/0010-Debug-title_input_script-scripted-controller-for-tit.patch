@@ -1,7 +1,7 @@
 From d75b271d8a086b07846fd6267befbc0967934901 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 15:14:42 +0530
-Subject: [PATCH 10/53] Debug: --title_input_script scripted controller for
+Subject: [PATCH 10/54] Debug: --title_input_script scripted controller for
  titles
 
 Presses for player 1 ("down,a,wait2000,b,...") as button state and as

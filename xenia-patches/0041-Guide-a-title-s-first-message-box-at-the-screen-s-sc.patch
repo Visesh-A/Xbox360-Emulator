@@ -1,7 +1,7 @@
 From 1cb924dfefa6e523ab881b4547f9597df64daa03 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 22:40:08 +0530
-Subject: [PATCH 41/53] Guide: a title's first message box at the screen's
+Subject: [PATCH 41/54] Guide: a title's first message box at the screen's
  scale
 
 ShowTitleMessageBox took the size from the last Guide frame drawn. When a

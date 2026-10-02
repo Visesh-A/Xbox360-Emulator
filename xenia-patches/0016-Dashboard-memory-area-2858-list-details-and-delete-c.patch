@@ -1,7 +1,7 @@
 From 6efb879cb72714baaa5b93f4a34f2874a9a69f2f Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 16:26:53 +0530
-Subject: [PATCH 16/53] Dashboard memory area (2858): list, details and delete
+Subject: [PATCH 16/54] Dashboard memory area (2858): list, details and delete
  content and profiles
 
 Read from 2858 xam and the dashboard:

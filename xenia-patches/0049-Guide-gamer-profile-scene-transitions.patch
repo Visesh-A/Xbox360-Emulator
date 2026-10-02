@@ -1,7 +1,7 @@
 From 0becce95dbf57d35af7cc6eeb3abe7d7e7a30cfd Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 20:21:40 +0530
-Subject: [PATCH 49/53] Guide: gamer profile scene transitions
+Subject: [PATCH 49/54] Guide: gamer profile scene transitions
 
 gamerprofile.xex's scenes play the skin's transition visuals (TransFrom /
 trans_FadeOut 0-15, TransTo / trans_FadeIn 25-40) on forward and back

@@ -1,0 +1,135 @@
+From 7eb838d0bc9d89975aa2273cd67fb4daae574583 Mon Sep 17 00:00:00 2001
+From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 15:32:15 +0530
+Subject: [PATCH 54/54] Kernel: XMsgCancelIORequest cancels deferred requests
+
+A deferred overlapped request ran even after its caller cancelled it,
+writing into memory the caller may already have freed. The 2858
+dashboard, with a profile signed in at power on, reads title tiles with
+XamReadTileEx and cancels / reissues them in a loop: the late writes
+corrupted its heap and it hung on the boot screen. Each deferred request
+now has a token; cancelling completes it as cancelled at once, and it
+runs only while its token is current.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8Y8uNNBmKZ7J6MZXNhzHq
+---
+ src/xenia/kernel/kernel_state.cc | 36 ++++++++++++++++++++++++++++----
+ src/xenia/kernel/kernel_state.h  | 12 +++++++++++
+ src/xenia/kernel/xam/xam_msg.cc  |  2 ++
+ 3 files changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/src/xenia/kernel/kernel_state.cc b/src/xenia/kernel/kernel_state.cc
+index 3f5d25fb7..37e596446 100644
+--- a/src/xenia/kernel/kernel_state.cc
++++ b/src/xenia/kernel/kernel_state.cc
+@@ -1026,6 +1026,18 @@ void KernelState::CompleteOverlappedImmediateEx(uint32_t overlapped_ptr,
+   CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+ }
+ 
++bool KernelState::CancelOverlapped(uint32_t overlapped_ptr) {
++  std::lock_guard<std::recursive_mutex> lock(overlapped_mutex_);
++  auto it = pending_overlapped_.find(overlapped_ptr);
++  if (it == pending_overlapped_.end()) {
++    return false;
++  }
++  pending_overlapped_.erase(it);
++  CompleteOverlappedEx(overlapped_ptr, X_ERROR_CANCELLED,
++                       X_HRESULT_FROM_WIN32(X_ERROR_CANCELLED), 0);
++  return true;
++}
++
+ void KernelState::CompleteOverlappedDeferred(
+     std::function<void()> completion_callback, uint32_t overlapped_ptr,
+     X_RESULT result, std::function<void()> pre_callback,
+@@ -1079,17 +1091,33 @@ void KernelState::CompleteOverlappedDeferredEx(
+       ev.get<XEvent>()->Reset();
+     }
+   }
++  uint64_t token;
++  {
++    std::lock_guard<std::recursive_mutex> lock(overlapped_mutex_);
++    token = ++overlapped_token_;
++    pending_overlapped_[overlapped_ptr] = token;
++  }
+   auto global_lock = global_critical_region_.Acquire();
+   dispatch_queue_.push_back([this, completion_callback, overlapped_ptr,
+-                             pre_callback, post_callback]() {
++                             pre_callback, post_callback, token]() {
+     if (pre_callback) {
+       pre_callback();
+     }
+     // 5454082B infinitely loads free roam in netplay without sleep.
+     xe::threading::Sleep(kDeferredOverlappedDelayMillis);
+-    uint32_t extended_error, length;
+-    auto result = completion_callback(extended_error, length);
+-    CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
++    {
++      // cancelled (or replaced by a newer request on the same overlapped):
++      // nothing of it may touch guest memory any more
++      std::lock_guard<std::recursive_mutex> lock(overlapped_mutex_);
++      auto it = pending_overlapped_.find(overlapped_ptr);
++      if (it == pending_overlapped_.end() || it->second != token) {
++        return;
++      }
++      pending_overlapped_.erase(it);
++      uint32_t extended_error, length;
++      auto result = completion_callback(extended_error, length);
++      CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
++    }
+     if (post_callback) {
+       post_callback();
+     }
+diff --git a/src/xenia/kernel/kernel_state.h b/src/xenia/kernel/kernel_state.h
+index 3b532cdc0..21d231efa 100644
+--- a/src/xenia/kernel/kernel_state.h
++++ b/src/xenia/kernel/kernel_state.h
+@@ -14,6 +14,8 @@
+ #include <condition_variable>
+ #include <functional>
+ #include <list>
++#include <mutex>
++#include <unordered_map>
+ #include <vector>
+ 
+ #include "xenia/base/bit_map.h"
+@@ -309,6 +311,11 @@ class KernelState {
+       uint32_t overlapped_ptr, std::function<void()> pre_callback = nullptr,
+       std::function<void()> post_callback = nullptr);
+ 
++  // XMsgCancelIORequest: a deferred request still pending for this
++  // overlapped completes as cancelled now and never runs (its buffers may be
++  // freed as soon as the caller returns). False if none is pending.
++  bool CancelOverlapped(uint32_t overlapped_ptr);
++
+   bool Save(ByteStream* stream);
+   bool Restore(ByteStream* stream);
+ 
+@@ -384,6 +391,11 @@ class KernelState {
+   util::NativeList dpc_list_;
+   std::condition_variable_any dispatch_cond_;
+   std::list<std::function<void()>> dispatch_queue_;
++  // deferred overlapped requests not yet run: overlapped -> request token;
++  // a request runs only while its token is current (CancelOverlapped)
++  std::recursive_mutex overlapped_mutex_;
++  std::unordered_map<uint32_t, uint64_t> pending_overlapped_;
++  uint64_t overlapped_token_ = 0;
+ 
+   BitMap tls_bitmap_;
+   uint32_t ke_timestamp_bundle_ptr_ = 0;
+diff --git a/src/xenia/kernel/xam/xam_msg.cc b/src/xenia/kernel/xam/xam_msg.cc
+index 6c2b95106..f27a71a73 100644
+--- a/src/xenia/kernel/xam/xam_msg.cc
++++ b/src/xenia/kernel/xam/xam_msg.cc
+@@ -90,6 +90,8 @@ DECLARE_XAM_EXPORT1(XMsgStartIORequest, kNone, kImplemented);
+ 
+ dword_result_t XMsgCancelIORequest_entry(
+     pointer_t<XAM_OVERLAPPED> overlapped_ptr, dword_t wait) {
++  // a request still pending ends now as cancelled, without running
++  kernel_state()->CancelOverlapped(overlapped_ptr.guest_address());
+   X_HANDLE event_handle = XOverlappedGetEvent(overlapped_ptr);
+   if (event_handle && wait) {
+     auto ev =
+-- 
+2.55.0.windows.3
+

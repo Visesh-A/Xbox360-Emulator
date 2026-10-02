@@ -1,7 +1,7 @@
 From f6ca926845cd9ad0ed4d77d232a5aaa0e9171283 Mon Sep 17 00:00:00 2001
 From: Xbox360 Blades <xbox360-blades@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 17:01:56 +0530
-Subject: [PATCH 17/53] Message boxes as the console draws them
+Subject: [PATCH 17/54] Message boxes as the console draws them
  (XamShowMessageBoxUI)
 
 Games' and the dashboard's message boxes are xam's XuiMessageBox<n+1> in
