@@ -157,6 +157,15 @@ Focus-Window $current $ch
 $onDashboard = $true
 while ($true) {
     $current.WaitForExit()
+    # Each Xenia start rewrites xenia.log: keep this session's (the last 10)
+    $logs = Join-Path $root "logs"
+    New-Item -ItemType Directory -Force $logs | Out-Null
+    $log = Join-Path (Split-Path $xenia) "xenia.log"
+    if (Test-Path -LiteralPath $log) {
+        Copy-Item -LiteralPath $log (Join-Path $logs ("xenia-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))) -Force
+        Get-ChildItem $logs -Filter "xenia-*.log" | Sort-Object Name -Descending | Select-Object -Skip 10 |
+            Remove-Item -Force
+    }
     $request = Read-Handoff
     if ($request -eq "off") { break }   # Guide: "Turn off console"
     if ($onDashboard) {
