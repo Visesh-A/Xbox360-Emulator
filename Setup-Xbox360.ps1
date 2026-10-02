@@ -7,8 +7,8 @@
 #
 # Everything else is downloaded or built here: Python 3.12 and .NET 8 (winget, if missing),
 # the pinned Python packages, XUIHelper, ffmpeg and the boot animation build. The Guide's
-# images are then rendered from the system files (this takes a while; about an hour on an
-# 8-core PC) and checked against the reference setup's checksums.
+# images are then rendered from the system files (this takes a while; about 25 minutes on a
+# 24-thread CPU) and checked against the reference setup's checksums.
 param(
     [string]$Downloads = (Join-Path $PSScriptRoot "setup\downloads"),
     [switch]$SkipVerify

@@ -39,3 +39,7 @@
 !/xenia-dash/xenia_canary.exe
 !/xenia-dash/LICENSE
 !/xenia-dash/gamecontrollerdb.txt
+
+!/Games/
+/Games/*
+!/Games/README.txt

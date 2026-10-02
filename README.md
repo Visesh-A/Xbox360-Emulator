@@ -49,18 +49,41 @@ below. Games and personal saves are yours to add.
 1. Clone or download this repository into a folder **without spaces** in its path
    (e.g. `D:\Xbox360`).
 2. Put the two `.rar` files in `setup\downloads`.
-3. Run **`Setup-Xbox360.cmd`**. It takes about an hour, mostly rendering the Guide. At the
-   end it compares every built file with the reference setup's checksums
-   (`setup\manifests\expected.sha256`). "1431 of 1431 files identical" means your copy
-   matches the original exactly.
-4. Put your own game discs (`.iso`) in `Games`.
+3. Run **`Setup-Xbox360.cmd`**. Most of the time goes into rendering every Guide screen
+   (about 1,400 images) from the console's art: about 25 minutes on a 24-thread CPU,
+   longer on fewer cores. At the end it compares every built file with the reference
+   setup's checksums (`setup\manifests\expected.sha256`). "1423 of 1423 files identical"
+   means your copy matches the original exactly.
+4. Put your own game discs (`.iso`) in the `Games` folder.
 5. Run **`Start-Xbox360.cmd`** (720p), or `Start-Xbox360-2K.cmd` (rendered at 2x).
+
+## Controls
+
+A real Xbox 360 has no mouse, and neither does this: the mouse is not used.
+
+- **Xbox 360 controller** (wired, or wireless with the PC receiver) works as is, including
+  the Guide button.
+- **Other controllers** (DualSense, DualShock, …) through SDL. The DualSense's Create button
+  is mapped to Guide and the PS button to Back (`xenia-dash\gamecontrollerdb.txt`).
+- **Keyboard** (on by default, `keyboard_mode = 1`), as player 1's controller:
+
+  | Controller | Key | Controller | Key |
+  |---|---|---|---|
+  | A | `;` | B | `'` |
+  | X | `L` | Y | `P` |
+  | Start | `X` | Back | `Z` |
+  | Guide | `Backspace` | LB / RB | `1` / `3` |
+  | LT / RT | `Q` or `I` / `E` or `O` | Left stick | `W A S D` |
+  | D-pad | `Shift` + `W A S D` | Right stick | arrow keys |
+  | Left / right stick click | `F` / `K` | | |
+
+  Change them with the `keybind_*` settings in `xenia-dash\xenia-canary.config.toml`.
+  While a controller is connected as player 1, it takes priority and the keyboard is not
+  read for player 1. To use both at once, make the keyboard player 2: set
+  `keyboard_user_index = 1` in that file.
 
 ## Using it
 
-- **Guide button:** opens the Guide. On a DualSense, the Create button is mapped to Guide
-  and the PS button to Back (`xenia-dash\gamecontrollerdb.txt`). Keyboard: Xenia's
-  keyboard controller mode.
 - **Profiles:** create your own from the dashboard or the Guide. None is pre-made, as on a
   new console.
 - **Games:** Games blade → Open Tray → pick a disc in the small window → Close Tray. The
@@ -88,7 +111,10 @@ below. Games and personal saves are yours to add.
 
 ## Building Xenia from source (optional)
 
-The prebuilt `xenia-dash\xenia_canary.exe` is all you need. To build it yourself (Visual
+The prebuilt `xenia-dash\xenia_canary.exe` is all you need; building is only for changing
+Xenia itself. The patches are made against one fixed Xenia Canary commit (`02d2cb5`, 2026)
+so they always apply cleanly; newer Xenia versions are not needed and may not take the
+patches unchanged. To build it yourself (Visual
 Studio 2022 Build Tools, CMake, Python 3.12, Vulkan SDK; see Xenia's
 [Building](https://github.com/xenia-canary/xenia-canary/blob/canary_experimental/docs/building.md)):
 
